@@ -40,4 +40,4 @@ AlignOperands: Align
 
 BreakConstructorInitializers: BeforeComma
 
-ReflowComments: Always
+ReflowComments: true
