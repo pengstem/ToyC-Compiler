@@ -1,4 +1,5 @@
 #include <iostream>
+#include <string>
 #include <string_view>
 
 #include "ast_nodes.h"
@@ -18,49 +19,53 @@ using namespace toycc;
 
 namespace {
 
-void printUsage(std::string_view prog) {
-    std::cerr << "Usage: " << prog << " [options] <input.c>\n"
-              << "Options:\n"
-              << "  --emit-ir      输出 IR（三地址码）\n"
-              << "  --help         显示帮助信息\n";
-}
-
 [[maybe_unused]] void printIR(const std::vector<IRInst>& ir) {
     for (const auto& inst : ir) {
         std::cout << inst << "\n";
     }
 }
 
+/// 从 stdin 读取全部内容
+std::string readStdin() {
+    std::string content;
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        content += line + "\n";
+    }
+    return content;
+}
+
+bool hasStdinInput() {
+    // 检查 stdin 是否有数据（非管道/重定向时可能阻塞，仅用于 CI 环境）
+    return !std::cin.eof() && std::cin.peek() != std::char_traits<char>::eof();
+}
+
 }  // anonymous namespace
 
 int main(int argc, char* argv[]) {
+    // 无参数时：检查是否有 stdin 输入（CI 集成测试通过管道传入源码）
     if (argc < 2) {
-        // 无参数时运行冒烟测试（CI 使用）
-        std::cout << "ToyC Compiler v0.0.1 — Middle-end ready.\n";
-        std::cout << "Run with --help for usage.\n";
+        if (hasStdinInput()) {
+            // CI 集成测试模式：读取源码，但前端尚未实现
+            std::string source = readStdin();
+            std::cerr << "Front-end not yet integrated. "
+                      << "Received " << source.size() << " bytes from stdin.\n";
+            return 1;
+        }
+        // 冒烟测试（CI 使用）
         return 0;
     }
 
     std::string_view arg = argv[1];
     if (arg == "--help" || arg == "-h") {
-        printUsage(argv[0]);
+        std::cerr << "Usage: " << argv[0] << " [options] <input.c>\n"
+                  << "Options:\n"
+                  << "  --emit-ir      输出 IR（三地址码）\n"
+                  << "  --help         显示帮助信息\n";
         return 0;
     }
 
     // TODO: 前端完成后，从 argv[1] 读取源文件进行解析
-    // CompUnit ast = parse(inputFile);
-    //
-    // SemanticAnalyzer sema;
-    // if (!sema.analyze(ast)) {
-    //     for (auto& err : sema.getErrors()) {
-    //         std::cerr << "Error at line " << err.line << ": " << err.message << "\n";
-    //     }
-    //     return 1;
-    // }
-    //
-    // std::vector<IRInst> ir = IRGenerator(sema.getSymbolTable()).generate(ast);
-    // printIR(ir);
-
     std::cerr << "Front-end not yet integrated. AST construction is required.\n";
     return 1;
 }
