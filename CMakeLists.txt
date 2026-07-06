@@ -235,9 +235,46 @@ if(TOYCC_BUILD_TESTS)
     COMMAND $<TARGET_FILE:toycc>
   )
 
+  # 中端单元测试
+  add_executable(toycc-test-middle-end
+    tests/unit/test_middle_end.cpp
+    src/semantic_analyzer.cpp
+    src/ir_generator.cpp
+  )
+  target_include_directories(toycc-test-middle-end
+    PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  )
+  target_compile_options(toycc-test-middle-end PRIVATE
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:
+      -Wall -Wextra -Wpedantic
+      -Wconversion -Wshadow -Wnon-virtual-dtor
+      -Wold-style-cast -Woverloaded-virtual
+      -Wnull-dereference -Wdouble-promotion -Wformat=2
+    >
+  )
+  if(TOYCC_WARNINGS_AS_ERRORS)
+    target_compile_options(toycc-test-middle-end PRIVATE
+      $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Werror>
+    )
+  endif()
+  if(NOT MSVC)
+    target_compile_options(toycc-test-middle-end PRIVATE
+      -O0 -g3 -fno-omit-frame-pointer
+    )
+  endif()
+  if(TOYCC_ENABLE_NATIVE_ARCH AND NOT MSVC)
+    target_compile_options(toycc-test-middle-end PRIVATE -march=native)
+  endif()
+
+  add_test(
+    NAME toycc-middle-end-tests
+    COMMAND $<TARGET_FILE:toycc-test-middle-end>
+  )
+
   add_custom_target(check
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS toycc
+    DEPENDS toycc toycc-test-middle-end
     USES_TERMINAL
   )
 
