@@ -48,8 +48,7 @@ int main(int argc, char* argv[]) {
     if (hasStdinInput()) {
       // CI 集成测试模式：读取源码，但前端尚未实现
       std::string source = readStdin();
-      std::cerr << "Front-end not yet integrated. "
-                << "Received " << source.size() << " bytes from stdin.\n";
+      std::cerr << "Front-end not integrated. Got " << source.size() << " bytes from stdin.\n";
       return 1;
     }
     // 冒烟测试（CI 使用）
