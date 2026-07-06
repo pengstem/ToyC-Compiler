@@ -1,0 +1,15 @@
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+*.s
+*.log
+
+.cache/
+.ccls-cache/
+.clangd/
+build/

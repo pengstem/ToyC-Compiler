@@ -1,0 +1,74 @@
+# Strict ToyC-compatible subset of the imported SysY test cases.
+#
+# Excluded for now:
+# - lv1 octal/hex literals: ToyC NUMBER is decimal only.
+# - lv4-lv8 cases with uninitialized or multi-name declarations.
+# - lv8 cases using SysY runtime I/O functions.
+# - lv9 and perf cases using arrays and SysY runtime helpers.
+lv1/0_main.c
+lv1/1_comments.c
+lv1/2_int_dec.c
+lv1/5_compact.c
+lv1/6_whitespaces.c
+lv3/00_pos.c
+lv3/01_neg_0.c
+lv3/02_neg_2.c
+lv3/03_neg_max.c
+lv3/04_not_0.c
+lv3/05_not_10.c
+lv3/06_complex_unary.c
+lv3/07_add.c
+lv3/08_add_neg.c
+lv3/09_sub.c
+lv3/10_sub_neg.c
+lv3/11_mul.c
+lv3/12_mul_neg.c
+lv3/13_div.c
+lv3/14_div_neg.c
+lv3/15_mod.c
+lv3/16_mod_neg.c
+lv3/17_lt.c
+lv3/18_gt.c
+lv3/19_le.c
+lv3/20_ge.c
+lv3/21_eq.c
+lv3/22_ne.c
+lv3/23_lor.c
+lv3/24_land.c
+lv3/25_int_min.c
+lv3/26_parentheses.c
+lv3/27_complex_binary.c
+lv4/00_const.c
+lv4/01_const_expr.c
+lv4/03_complex_const.c
+lv4/05_var_init.c
+lv4/06_var_expr.c
+lv4/07_var_main.c
+lv4/09_complex_vars.c
+lv4/11_assign_read.c
+lv5/0_block.c
+lv5/1_ret_from_block.c
+lv5/2_blocks.c
+lv5/3_exp.c
+lv5/4_empty_exp.c
+lv5/5_scope.c
+lv6/0_if.c
+lv6/1_if_else.c
+lv6/2_multiple_if_else.c
+lv6/5_more_logical.c
+lv6/6_multiple_returns.c
+lv7/00_while.c
+lv7/02_while_false.c
+lv7/03_while_true.c
+lv7/05_if_while.c
+lv7/07_break.c
+lv7/08_if_break.c
+lv7/09_continue.c
+lv8/00_int_func.c
+lv8/01_void_func.c
+lv8/02_params.c
+lv8/03_more_params.c
+lv8/04_param_name.c
+lv8/05_func_name.c
+lv8/06_complex_call.c
+lv8/07_recursion.c

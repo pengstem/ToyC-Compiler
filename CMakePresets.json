@@ -1,0 +1,147 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "debug",
+      "displayName": "Debug",
+      "description": "Debug build with warnings enabled",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "TOYCC_ENABLE_WARNINGS": "ON",
+        "TOYCC_WARNINGS_AS_ERRORS": "OFF",
+        "TOYCC_ENABLE_SANITIZERS": "OFF",
+        "TOYCC_ENABLE_LTO": "OFF",
+        "TOYCC_BUILD_TESTS": "ON",
+        "TOYCC_ENABLE_IMPORTED_TESTS": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release",
+      "description": "Optimized release build",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "TOYCC_ENABLE_WARNINGS": "ON",
+        "TOYCC_WARNINGS_AS_ERRORS": "OFF",
+        "TOYCC_ENABLE_SANITIZERS": "OFF",
+        "TOYCC_ENABLE_LTO": "ON",
+        "TOYCC_BUILD_TESTS": "ON",
+        "TOYCC_ENABLE_IMPORTED_TESTS": "ON"
+      }
+    },
+    {
+      "name": "relwithdebinfo",
+      "displayName": "RelWithDebInfo",
+      "description": "Optimized build with debug info",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/relwithdebinfo",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "TOYCC_ENABLE_WARNINGS": "ON",
+        "TOYCC_WARNINGS_AS_ERRORS": "OFF",
+        "TOYCC_ENABLE_SANITIZERS": "OFF",
+        "TOYCC_ENABLE_LTO": "OFF",
+        "TOYCC_BUILD_TESTS": "ON",
+        "TOYCC_ENABLE_IMPORTED_TESTS": "ON"
+      }
+    },
+    {
+      "name": "sanitize",
+      "displayName": "Sanitize",
+      "description": "Debug build with AddressSanitizer and UBSan",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/sanitize",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "TOYCC_ENABLE_WARNINGS": "ON",
+        "TOYCC_WARNINGS_AS_ERRORS": "OFF",
+        "TOYCC_ENABLE_SANITIZERS": "ON",
+        "TOYCC_ENABLE_LTO": "OFF",
+        "TOYCC_BUILD_TESTS": "ON",
+        "TOYCC_ENABLE_IMPORTED_TESTS": "ON"
+      }
+    },
+    {
+      "name": "strict",
+      "displayName": "Strict",
+      "description": "Debug build with warnings as errors",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/strict",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "TOYCC_ENABLE_WARNINGS": "ON",
+        "TOYCC_WARNINGS_AS_ERRORS": "ON",
+        "TOYCC_ENABLE_SANITIZERS": "OFF",
+        "TOYCC_ENABLE_LTO": "OFF",
+        "TOYCC_BUILD_TESTS": "ON",
+        "TOYCC_ENABLE_IMPORTED_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "relwithdebinfo",
+      "configurePreset": "relwithdebinfo"
+    },
+    {
+      "name": "sanitize",
+      "configurePreset": "sanitize"
+    },
+    {
+      "name": "strict",
+      "configurePreset": "strict"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "sanitize",
+      "configurePreset": "sanitize",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "strict",
+      "configurePreset": "strict",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
