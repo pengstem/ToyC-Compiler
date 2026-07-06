@@ -4,7 +4,6 @@
 #include <string>
 #include <vector>
 #include <ostream>
-#include "ast_nodes.h"
 
 namespace toycc {
 
