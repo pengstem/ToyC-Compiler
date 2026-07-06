@@ -4,8 +4,8 @@
 
 namespace toycc {
 
-IRGenerator::IRGenerator(SymbolTable& symTable)
-    : symTable(symTable) {}
+IRGenerator::IRGenerator(SymbolTable& st)
+    : symTable(st) {}
 
 // ============================================================
 // 工具方法

@@ -26,7 +26,7 @@ struct LoopContext {
 
 class IRGenerator {
 public:
-  IRGenerator(SymbolTable& symTable);
+  IRGenerator(SymbolTable& st);
 
   // 生成 IR，返回指令序列
   std::vector<IRInst> generate(CompUnit& compUnit);
