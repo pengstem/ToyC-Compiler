@@ -18,9 +18,7 @@ PointerAlignment: Left
 ReferenceAlignment: Left
 DerivePointerAlignment: false
 
-SortIncludes:
-  Enabled: true
-  IgnoreCase: false
+SortIncludes: true
 IncludeBlocks: Regroup
 
 AccessModifierOffset: -2
@@ -40,4 +38,4 @@ AlignOperands: Align
 
 BreakConstructorInitializers: BeforeComma
 
-ReflowComments: Always
+ReflowComments: true
