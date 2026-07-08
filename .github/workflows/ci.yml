@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang-format \
+            cmake \
+            gcc-riscv64-linux-gnu \
+            python3 \
+            qemu-user
+
+      - name: Show tool versions
+        run: |
+          cmake --version
+          c++ --version
+          clang-format --version
+          python3 --version
+          riscv64-linux-gnu-gcc --version
+          qemu-riscv32 --version
+
+      - name: Configure debug build
+        run: cmake --preset debug
+
+      - name: Build debug
+        run: cmake --build --preset debug
+
+      - name: Check formatting
+        run: cmake --build --preset debug --target check-format
+
+      - name: List registered tests
+        run: ctest --preset debug -N
+
+      - name: Run smoke test
+        run: ctest --preset debug -R '^toycc-smoke-test$' --output-on-failure
+
+      - name: Check RISC-V runner toolchain
+        run: |
+          cat > /tmp/toycc-ci-rv32.s <<'ASM'
+              .section .text
+              .globl _start
+          _start:
+              call main
+              li a7, 93
+              ecall
+              .globl main
+          main:
+              li a0, 42
+              ret
+          ASM
+          riscv64-linux-gnu-gcc \
+            -x assembler \
+            -nostdlib \
+            -nostartfiles \
+            -static \
+            -march=rv32im \
+            -mabi=ilp32 \
+            /tmp/toycc-ci-rv32.s \
+            -o /tmp/toycc-ci-rv32
+          set +e
+          qemu-riscv32 /tmp/toycc-ci-rv32
+          exit_code="$?"
+          set -e
+          test "$exit_code" -eq 42
+
+      - name: Configure strict build
+        run: cmake --preset strict
+
+      - name: Build strict
+        run: cmake --build --preset strict
+
+  imported-tests-preview:
+    name: Imported ToyC tests preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang-format \
+            cmake \
+            gcc-riscv64-linux-gnu \
+            python3 \
+            qemu-user
+
+      - name: Configure debug build
+        run: cmake --preset debug
+
+      - name: Build debug
+        run: cmake --build --preset debug
+
+      - name: Run imported tests
+        run: ctest --preset debug --label-regex strict --output-on-failure
