@@ -24,7 +24,8 @@ int alignTo(int value, int alignment) {
 
 int CodeGenerator::StackFrame::frameSizeBytes() const {
   const int reservedWords = 2 + static_cast<int>(usedCalleeSavedRegisters.size());
-  const int localBytes = std::max(this->localBytes, static_cast<int>(localOffsets.size()) * kWordBytes);
+  const int localBytes =
+      std::max(this->localBytes, static_cast<int>(localOffsets.size()) * kWordBytes);
   return alignTo((reservedWords * kWordBytes) + localBytes + outgoingArgumentBytes,
                  kStackAlignmentBytes);
 }
@@ -163,8 +164,8 @@ void CodeGenerator::generateInstruction(const IRInst& inst, std::ostream& out) {
     if (inst.dest.type == OperandType::LOCAL_VAR) {
       ensureLocalOffset(inst.dest);
       if (inst.src1.type == OperandType::PARAM) {
-        const std::string reg = currentParamIndex_ < 8 ? ("a" + std::to_string(currentParamIndex_))
-                                                     : "a7";
+        const std::string reg =
+            currentParamIndex_ < 8 ? ("a" + std::to_string(currentParamIndex_)) : "a7";
         emit(out, "mv", "t0, " + reg);
         storeOperand("t0", inst.dest, out);
         currentParamIndex_ += 1;
@@ -429,7 +430,8 @@ int CodeGenerator::ensureLocalOffset(const Operand& operand) {
   return localOffset(operand);
 }
 
-void CodeGenerator::emit(std::ostream& out, std::string_view opcode, std::string_view operands) const {
+void CodeGenerator::emit(std::ostream& out, std::string_view opcode,
+                         std::string_view operands) const {
   out << "    " << opcode;
   if (!operands.empty()) {
     out << ' ' << operands;
