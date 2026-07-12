@@ -24,9 +24,9 @@ int alignTo(int value, int alignment) {
 
 int CodeGenerator::StackFrame::frameSizeBytes() const {
   const int reservedWords = 2 + static_cast<int>(usedCalleeSavedRegisters.size());
-  const int localBytes =
+  const int computedLocalBytes =
       std::max(this->localBytes, static_cast<int>(localOffsets.size()) * kWordBytes);
-  return alignTo((reservedWords * kWordBytes) + localBytes + outgoingArgumentBytes,
+  return alignTo((reservedWords * kWordBytes) + computedLocalBytes + outgoingArgumentBytes,
                  kStackAlignmentBytes);
 }
 
