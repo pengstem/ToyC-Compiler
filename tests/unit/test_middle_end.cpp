@@ -1,4 +1,5 @@
 #include "ast_nodes.h"
+#include "code_generator.h"
 #include "ir_generator.h"
 #include "semantic_analyzer.h"
 
@@ -1220,6 +1221,130 @@ void testIR_exprAsStmt() {
 }
 
 // ============================================================
+// 中端 → 后端接口测试
+// ============================================================
+
+void testIntegration_simpleReturn() {
+  testHeader("Integration: simple return 42 → RISC-V");
+  auto comp = makeCompUnit();
+  comp->globalDecls.push_back(
+      makeFuncDef(Type::INT, "main", {}, makeBlock({makeReturn(makeInt(42))})));
+  SemanticAnalyzer sema;
+  sema.analyze(*comp);
+  IRGenerator irGen(sema.getSymbolTable());
+  auto ir = irGen.generate(*comp);
+
+  CodeGenerator cg;
+  std::ostringstream out;
+  cg.generate(ir, out);
+  std::string asmOutput = out.str();
+
+  if (asmOutput.find("main:") != std::string::npos && asmOutput.find("ret") != std::string::npos &&
+      asmOutput.find("li") != std::string::npos) {
+    testPass();
+  } else {
+    testFail("RISC-V asm missing key instructions:\n" + asmOutput);
+  }
+}
+
+void testIntegration_arithmetic() {
+  testHeader("Integration: arithmetic (1+2)*3 → RISC-V");
+  auto comp = makeCompUnit();
+  comp->globalDecls.push_back(
+      makeFuncDef(Type::INT, "main", {},
+                  makeBlock({makeReturn(makeBinary(
+                      BinOp::MUL, makeBinary(BinOp::ADD, makeInt(1), makeInt(2)), makeInt(3)))})));
+  SemanticAnalyzer sema;
+  sema.analyze(*comp);
+  IRGenerator irGen(sema.getSymbolTable());
+  auto ir = irGen.generate(*comp);
+
+  CodeGenerator cg;
+  std::ostringstream out;
+  cg.generate(ir, out);
+  std::string asmOutput = out.str();
+
+  if (asmOutput.find("add") != std::string::npos && asmOutput.find("mul") != std::string::npos) {
+    testPass();
+  } else {
+    testFail("arithmetic RISC-V mismatch:\n" + asmOutput);
+  }
+}
+
+void testIntegration_functionCall() {
+  testHeader("Integration: function call → RISC-V");
+  auto comp = makeCompUnit();
+  comp->globalDecls.push_back(
+      makeFuncDef(Type::INT, "add", {makeParam(Type::INT, "a"), makeParam(Type::INT, "b")},
+                  makeBlock({makeReturn(makeBinary(BinOp::ADD, makeVar("a"), makeVar("b")))})));
+  comp->globalDecls.push_back(makeFuncDef(
+      Type::INT, "main", {}, makeBlock({makeReturn(makeCall("add", {makeInt(3), makeInt(4)}))})));
+  SemanticAnalyzer sema;
+  sema.analyze(*comp);
+  IRGenerator irGen(sema.getSymbolTable());
+  auto ir = irGen.generate(*comp);
+
+  CodeGenerator cg;
+  std::ostringstream out;
+  cg.generate(ir, out);
+  std::string asmOutput = out.str();
+
+  if (asmOutput.find("add:") != std::string::npos && asmOutput.find("main:") != std::string::npos &&
+      asmOutput.find("call") != std::string::npos) {
+    testPass();
+  } else {
+    testFail("function call RISC-V mismatch:\n" + asmOutput);
+  }
+}
+
+void testIntegration_ifElse() {
+  testHeader("Integration: if-else → RISC-V");
+  auto comp = makeCompUnit();
+  comp->globalDecls.push_back(
+      makeFuncDef(Type::INT, "main", {},
+                  makeBlock({makeIf(makeInt(1), makeReturn(makeInt(100)), makeReturn(makeInt(200))),
+                             makeReturn(makeInt(0))})));
+  SemanticAnalyzer sema;
+  sema.analyze(*comp);
+  IRGenerator irGen(sema.getSymbolTable());
+  auto ir = irGen.generate(*comp);
+
+  CodeGenerator cg;
+  std::ostringstream out;
+  cg.generate(ir, out);
+  std::string asmOutput = out.str();
+
+  if (asmOutput.find("beqz") != std::string::npos && asmOutput.find("j") != std::string::npos) {
+    testPass();
+  } else {
+    testFail("if-else RISC-V mismatch:\n" + asmOutput);
+  }
+}
+
+void testIntegration_shortCircuit() {
+  testHeader("Integration: short-circuit && → RISC-V");
+  auto comp = makeCompUnit();
+  comp->globalDecls.push_back(
+      makeFuncDef(Type::INT, "main", {},
+                  makeBlock({makeReturn(makeBinary(BinOp::AND, makeInt(1), makeInt(0)))})));
+  SemanticAnalyzer sema;
+  sema.analyze(*comp);
+  IRGenerator irGen(sema.getSymbolTable());
+  auto ir = irGen.generate(*comp);
+
+  CodeGenerator cg;
+  std::ostringstream out;
+  cg.generate(ir, out);
+  std::string asmOutput = out.str();
+
+  if (asmOutput.find("beqz") != std::string::npos) {
+    testPass();
+  } else {
+    testFail("short-circuit RISC-V mismatch:\n" + asmOutput);
+  }
+}
+
+// ============================================================
 // main 入口
 // ============================================================
 
@@ -1309,6 +1434,13 @@ int main() {
   testIR_multiParams();
   testIR_recursion();
   testIR_voidFunction();
+
+  std::cout << "\n--- 中端→后端接口 ---\n";
+  testIntegration_simpleReturn();
+  testIntegration_arithmetic();
+  testIntegration_functionCall();
+  testIntegration_ifElse();
+  testIntegration_shortCircuit();
 
   std::cout << "\n=== 结果: " << g_passCount << "/" << g_testCount << " 通过 ===\n";
 

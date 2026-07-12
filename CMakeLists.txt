@@ -145,7 +145,6 @@ if(TOYCC_WARNINGS_AS_ERRORS)
 endif()
 
 # ================================
-<<<<<<< HEAD
 # MSVC UTF-8 encoding
 # ================================
 
@@ -154,8 +153,6 @@ if(MSVC)
 endif()
 
 # ================================
-=======
->>>>>>> f729edc9519e2598f7e7a22384d045f99f08b39a
 # Build-type flags
 # ================================
 
@@ -251,10 +248,7 @@ if(TOYCC_BUILD_TESTS)
     tests/unit/test_middle_end.cpp
     src/semantic_analyzer.cpp
     src/ir_generator.cpp
-<<<<<<< HEAD
     src/code_generator.cpp
-=======
->>>>>>> f729edc9519e2598f7e7a22384d045f99f08b39a
   )
   target_include_directories(toycc-test-middle-end
     PRIVATE
@@ -282,13 +276,10 @@ if(TOYCC_BUILD_TESTS)
     target_compile_options(toycc-test-middle-end PRIVATE -march=native)
   endif()
 
-<<<<<<< HEAD
   if(MSVC)
     target_compile_options(toycc-test-middle-end PRIVATE /utf-8)
   endif()
 
-=======
->>>>>>> f729edc9519e2598f7e7a22384d045f99f08b39a
   add_test(
     NAME toycc-middle-end-tests
     COMMAND $<TARGET_FILE:toycc-test-middle-end>
