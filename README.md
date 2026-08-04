@@ -10,7 +10,8 @@
 - 支持 C++20 的 C++ 编译器
 - 使用当前 `Unix Makefiles` presets 时需要 Make
 - clang-format，可选但建议安装
-
+- flex 2.6.4
+- bison 3.8.2
 导入测试依赖：
 
 - Python 3

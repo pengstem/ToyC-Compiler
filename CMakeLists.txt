@@ -132,6 +132,7 @@ if(TOYCC_ENABLE_WARNINGS)
       -Wnull-dereference
       -Wdouble-promotion
       -Wformat=2
+      -Wno-old-style-cast
     )
   endif()
 endif()

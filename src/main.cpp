@@ -1,8 +1,12 @@
 #include "ast_nodes.h"
+#include "code_generator.h"
 #include "ir_generator.h"
+#include "parser_driver.h"
 #include "semantic_analyzer.h"
 
+#include <fstream>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -25,33 +29,62 @@ namespace {
   }
 }
 
-/// 从 stdin 读取全部内容
-std::string readStdin() {
+std::string readAll(std::istream& input) {
   std::string content;
   std::string line;
-  while (std::getline(std::cin, line)) {
+  while (std::getline(input, line)) {
     content += line + "\n";
   }
   return content;
 }
 
 bool hasStdinInput() {
-  // 检查 stdin 是否有数据（非管道/重定向时可能阻塞，仅用于 CI 环境）
   return !std::cin.eof() && std::cin.peek() != std::char_traits<char>::eof();
+}
+
+int compileSource(const std::string& source, std::ostream& out, bool emitIR) {
+  ParserDriver driver;
+  if (!driver.parse(source)) {
+    std::cerr << "Parse error: " << driver.getError() << "\n";
+    return 1;
+  }
+
+  auto ast = driver.getAST();
+  if (!ast) {
+    std::cerr << "No AST produced.\n";
+    return 1;
+  }
+
+  SemanticAnalyzer sema;
+  if (!sema.analyze(*ast)) {
+    std::cerr << "Semantic analysis failed:\n";
+    for (const auto& err : sema.getErrors()) {
+      std::cerr << "  line " << err.line << ":" << err.col << " " << err.message << "\n";
+    }
+    return 1;
+  }
+
+  IRGenerator irGen(sema.getSymbolTable());
+  auto ir = irGen.generate(*ast);
+
+  if (emitIR) {
+    printIR(ir);
+    return 0;
+  }
+
+  CodeGenerator codeGen;
+  codeGen.generate(ir, out);
+  return 0;
 }
 
 } // anonymous namespace
 
 int main(int argc, char* argv[]) {
-  // 无参数时：检查是否有 stdin 输入（CI 集成测试通过管道传入源码）
   if (argc < 2) {
     if (hasStdinInput()) {
-      // CI 集成测试模式：读取源码，但前端尚未实现
-      std::string source = readStdin();
-      std::cerr << "Front-end not integrated. Got " << source.size() << " bytes from stdin.\n";
-      return 1;
+      std::string source = readAll(std::cin);
+      return compileSource(source, std::cout, false);
     }
-    // 冒烟测试（CI 使用）
     return 0;
   }
 
@@ -64,7 +97,28 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
-  // TODO: 前端完成后，从 argv[1] 读取源文件进行解析
-  std::cerr << "Front-end not yet integrated. AST construction is required.\n";
-  return 1;
+  bool emitIR = false;
+  std::string inputPath;
+  for (int i = 1; i < argc; ++i) {
+    std::string_view option = argv[i];
+    if (option == "--emit-ir") {
+      emitIR = true;
+    } else if (!option.starts_with("-")) {
+      inputPath = argv[i];
+    }
+  }
+
+  if (inputPath.empty()) {
+    std::cerr << "No input file provided.\n";
+    return 1;
+  }
+
+  std::ifstream input(inputPath);
+  if (!input.is_open()) {
+    std::cerr << "Failed to read input file: " << inputPath << "\n";
+    return 1;
+  }
+
+  std::string source = readAll(input);
+  return compileSource(source, std::cout, emitIR);
 }
