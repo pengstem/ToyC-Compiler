@@ -68,7 +68,7 @@ void CodeGenerator::emitGlobalData(std::ostream& out) {
       emittedData = true;
     }
     out << globalSymbol(inst.dest.name) << ":\n";
-    out << "    .word 0\n";
+    out << "    .word " << inst.src1.immVal << "\n";
   }
   if (emittedData) {
     out << '\n';
@@ -329,7 +329,8 @@ void CodeGenerator::loadOperand(const Operand& operand, std::string_view reg, st
   }
 
   if (operand.type == OperandType::GLOBAL_VAR) {
-    emit(out, "lw", std::string(reg) + ", " + globalSymbol(operand.name));
+    emit(out, "la", "t1, " + globalSymbol(operand.name));
+    emit(out, "lw", std::string(reg) + ", 0(t1)");
     return;
   }
 
@@ -352,7 +353,8 @@ void CodeGenerator::storeOperand(std::string_view reg, const Operand& operand, s
   }
 
   if (operand.type == OperandType::GLOBAL_VAR) {
-    emit(out, "sw", std::string(reg) + ", " + globalSymbol(operand.name));
+    emit(out, "la", "t1, " + globalSymbol(operand.name));
+    emit(out, "sw", std::string(reg) + ", 0(t1)");
     return;
   }
 }

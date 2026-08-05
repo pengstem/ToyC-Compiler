@@ -124,13 +124,9 @@ void IRGenerator::genDecl(Decl* decl) {
   }
 
   if (decl->isGlobalDecl) {
-    // 全局变量
-    int initVal = 0;
-    emit(IROp::GLOBAL_VAR_DECL, Operand::globalVar(decl->name), Operand::imm(initVal));
-    if (decl->initExpr) {
-      Operand val = genExpr(decl->initExpr.get());
-      emit(IROp::ASSIGN, Operand::globalVar(decl->name), val);
-    }
+    // 全局变量：初值已在语义分析阶段常量折叠到 decl->constValue，
+    // 直接作为 GLOBAL_VAR_DECL 的立即数携带，由代码生成器写入 .data 段
+    emit(IROp::GLOBAL_VAR_DECL, Operand::globalVar(decl->name), Operand::imm(decl->constValue));
     return;
   }
 

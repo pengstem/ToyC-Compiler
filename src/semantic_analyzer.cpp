@@ -225,6 +225,15 @@ void SemanticAnalyzer::analyzeDecl(Decl* decl) {
         error(decl->line, decl->col,
               "const variable '" + decl->name + "' must be initialized with a constant expression");
       }
+    } else if (decl->isGlobalDecl) {
+      // 全局变量初始化必须是常量表达式，折叠后供代码生成阶段写入 .data 段
+      int foldedValue = 0;
+      if (tryConstFold(decl->initExpr.get(), foldedValue)) {
+        decl->constValue = foldedValue;
+      } else {
+        error(decl->line, decl->col,
+              "global variable '" + decl->name + "' must be initialized with a constant expression");
+      }
     }
   }
 
