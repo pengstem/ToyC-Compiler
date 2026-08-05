@@ -100,10 +100,22 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
   frame.usedCalleeSavedRegisters = {"s1"};
   frame.localOffsets.clear();
   frame.localBytes = 0;
+  frame.outgoingArgumentBytes = 0;
 
   int localIndex = 0;
+  int maxOverflowArgs = 0;
+
   for (std::size_t i = function.begin; i < function.end; ++i) {
     const auto& inst = ir_[i];
+
+    // 跟踪每个 CALL 之前的 PARAM 数量，计算溢出参数空间
+    if (inst.op == IROp::PARAM) {
+      const int argIndex = inst.src1.immVal;
+      if (argIndex >= 8) {
+        maxOverflowArgs = std::max(maxOverflowArgs, argIndex - 7);
+      }
+    }
+
     if (inst.op == IROp::LOCAL_VAR_DECL) {
       if (inst.dest.type == OperandType::LOCAL_VAR) {
         if (frame.localOffsets.find(inst.dest.name) == frame.localOffsets.end()) {
@@ -130,6 +142,7 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
     }
   }
   frame.localBytes = static_cast<int>(frame.localOffsets.size()) * kWordBytes;
+  frame.outgoingArgumentBytes = maxOverflowArgs * kWordBytes;
   return frame;
 }
 
@@ -164,10 +177,16 @@ void CodeGenerator::generateInstruction(const IRInst& inst, std::ostream& out) {
     if (inst.dest.type == OperandType::LOCAL_VAR) {
       ensureLocalOffset(inst.dest);
       if (inst.src1.type == OperandType::PARAM) {
-        const std::string reg =
-            currentParamIndex_ < 8 ? ("a" + std::to_string(currentParamIndex_)) : "a7";
-        emit(out, "mv", "t0, " + reg);
-        storeOperand("t0", inst.dest, out);
+        if (currentParamIndex_ < 8) {
+          const std::string reg = "a" + std::to_string(currentParamIndex_);
+          emit(out, "mv", "t0, " + reg);
+          storeOperand("t0", inst.dest, out);
+        } else {
+          // 溢出参数从调用者栈帧读取（位于 s0 正偏移处）
+          const int stackOffset = (currentParamIndex_ - 8) * kWordBytes;
+          emit(out, "lw", "t0, " + std::to_string(stackOffset) + "(s0)");
+          storeOperand("t0", inst.dest, out);
+        }
         currentParamIndex_ += 1;
       } else if (inst.src1.type == OperandType::IMM) {
         loadOperand(inst.src1, "t0", out);
@@ -203,12 +222,23 @@ void CodeGenerator::generateInstruction(const IRInst& inst, std::ostream& out) {
     emitCompareOp(inst, out);
     break;
   case IROp::PARAM: {
-    const int argIndex = inst.src2.immVal;
-    const std::string reg = argIndex < 8 ? ("a" + std::to_string(argIndex)) : "a7";
-    if (inst.dest.type == OperandType::IMM) {
-      emit(out, "li", reg + ", " + std::to_string(inst.dest.immVal));
+    const int argIndex = inst.src1.immVal;
+    if (argIndex < 8) {
+      const std::string reg = "a" + std::to_string(argIndex);
+      if (inst.dest.type == OperandType::IMM) {
+        emit(out, "li", reg + ", " + std::to_string(inst.dest.immVal));
+      } else {
+        loadOperand(inst.dest, reg, out);
+      }
     } else {
-      loadOperand(inst.dest, reg, out);
+      // 溢出参数存入栈（调用者栈帧低地址区）
+      const int stackOffset = (argIndex - 8) * kWordBytes;
+      if (inst.dest.type == OperandType::IMM) {
+        emit(out, "li", "t0, " + std::to_string(inst.dest.immVal));
+      } else {
+        loadOperand(inst.dest, "t0", out);
+      }
+      emit(out, "sw", "t0, " + std::to_string(stackOffset) + "(sp)");
     }
     break;
   }
