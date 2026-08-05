@@ -232,7 +232,8 @@ void SemanticAnalyzer::analyzeDecl(Decl* decl) {
         decl->constValue = foldedValue;
       } else {
         error(decl->line, decl->col,
-              "global variable '" + decl->name + "' must be initialized with a constant expression");
+              "global variable '" + decl->name +
+                  "' must be initialized with a constant expression");
       }
     }
   }
