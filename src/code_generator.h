@@ -51,6 +51,9 @@ private:
   void emitPrologue(const StackFrame& frame, std::ostream& out) const;
   void emitEpilogue(const StackFrame& frame, std::ostream& out) const;
 
+  // 汇编级窥孔优化：合并比较+分支序列（slt+beqz -> bge 等）
+  void applyPeephole(const std::string& asmText, std::ostream& out);
+
   void loadOperand(const Operand& operand, std::string_view reg, std::ostream& out);
   void storeOperand(std::string_view reg, const Operand& operand, std::ostream& out);
   void emitBinaryOp(const IRInst& inst, std::ostream& out);

@@ -366,7 +366,8 @@ void testIR_whileLoop() {
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
   auto ir = irGen.generate(*comp);
-  if (irContains(ir, "BEQZ") && irContains(ir, "BRANCH") && irContains(ir, "LABEL")) {
+  // 循环反转后条件判断变为 BNEZ（位于循环体末尾），但 LABEL/BRANCH 仍在
+  if (irContains(ir, "BNEZ") && irContains(ir, "BRANCH") && irContains(ir, "LABEL")) {
     testPass();
   } else {
     testFail("while IR structure mismatch:\n" + irToString(ir));
@@ -879,7 +880,8 @@ void testIR_continueInWhile() {
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
   auto ir = irGen.generate(*comp);
-  if (irContains(ir, "BRANCH") && irContains(ir, "BEQZ")) {
+  // continue 跳转到循环测试点（反转后位于循环体末尾），以 LABEL/BNEZ 形式存在
+  if (irContains(ir, "BRANCH") && irContains(ir, "LABEL") && irContains(ir, "BNEZ")) {
     testPass();
   } else {
     testFail("continue IR mismatch:\n" + irToString(ir));
@@ -923,13 +925,13 @@ void testIR_nestedWhile() {
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
   auto ir = irGen.generate(*comp);
-  // 两个 while 各需要 BEQZ
+  // 两个 while 各需要 BNEZ（循环反转后条件判断位于循环体末尾）
   auto irStr = irToString(ir);
-  size_t first = irStr.find("BEQZ");
-  if (first != std::string::npos && irStr.find("BEQZ", first + 1) != std::string::npos) {
+  size_t first = irStr.find("BNEZ");
+  if (first != std::string::npos && irStr.find("BNEZ", first + 1) != std::string::npos) {
     testPass();
   } else {
-    testFail("nested while should have 2 BEQZ:\n" + irStr);
+    testFail("nested while should have 2 BNEZ:\n" + irStr);
   }
 }
 

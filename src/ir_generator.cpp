@@ -1,6 +1,7 @@
 #include "ir_generator.h"
 
 #include <cassert>
+#include <iostream>
 
 namespace toycc {
 
@@ -602,6 +603,44 @@ void countUses(const std::vector<IRInst>& ir, std::unordered_map<std::string, in
   }
 }
 
+// 判断变量名是否为 IR 临时变量（t0, t1, ...）
+bool isTempName(const std::string& name) {
+  if (name.empty() || name[0] != 't') {
+    return false;
+  }
+  for (std::size_t i = 1; i < name.size(); ++i) {
+    if (name[i] < '0' || name[i] > '9') {
+      return false;
+    }
+  }
+  return !name.empty();
+}
+
+// 判断指令是否适合出现在循环条件块中（无副作用，且只写临时变量）
+// 这样的条件块可以被安全地移动到循环体末尾（loop inversion）
+bool isPureCondInst(const IRInst& inst) {
+  switch (inst.op) {
+  case IROp::ADD:
+  case IROp::SUB:
+  case IROp::MUL:
+  case IROp::DIV:
+  case IROp::MOD:
+  case IROp::NOT:
+  case IROp::LT:
+  case IROp::GT:
+  case IROp::LE:
+  case IROp::GE:
+  case IROp::EQ:
+  case IROp::NE:
+    return inst.dest.isLocalVar() && isTempName(inst.dest.name);
+  case IROp::ASSIGN:
+    // 只允许给临时变量赋值（循环条件中的中间计算结果）
+    return inst.dest.isLocalVar() && isTempName(inst.dest.name);
+  default:
+    return false;
+  }
+}
+
 } // namespace
 
 void IRGenerator::optimizePass() {
@@ -871,6 +910,100 @@ void IRGenerator::optimizePass() {
       }
       if (ir.size() != optimized.size()) {
         ir = std::move(optimized);
+      }
+    }
+
+    // Pass 3: 循环反转（loop inversion）
+    // 将 "LABEL c; <cond>; BEQZ t,e; LABEL b; <body>; BRANCH c; LABEL e" 转换为
+    // "BRANCH c; LABEL b; <body>; LABEL c; <cond>; BNEZ t,b; LABEL e"
+    // 消除循环体末尾的 j 跳转，每次迭代少执行 1 条指令
+    {
+      std::vector<IRInst> optimized;
+      std::size_t i = 0;
+      while (i < ir.size()) {
+        // 查找: LABEL c
+        if (ir[i].op == IROp::LABEL && i + 2 < ir.size()) {
+          const std::string condLabel = ir[i].dest.name;
+          std::size_t j = i + 1;
+          // 条件块：连续纯指令，最后一条必须是 BEQZ t, e
+          while (j < ir.size() && isPureCondInst(ir[j])) {
+            ++j;
+          }
+          if (j < ir.size() && ir[j].op == IROp::BEQZ && j + 1 < ir.size()) {
+            const std::string endLabel = ir[j].dest.name;
+            // BEQZ 之后必须是 LABEL b（循环体开始）
+            if (ir[j + 1].op == IROp::LABEL) {
+              const std::string bodyLabel = ir[j + 1].dest.name;
+              // 向后扫描到 LABEL e，记录最后一个 BRANCH c（循环尾跳转）
+              std::size_t k = j + 1;
+              std::size_t lastBranchC = 0;
+              bool foundEnd = false;
+              for (; k < ir.size(); ++k) {
+                if (ir[k].op == IROp::BRANCH && ir[k].dest.name == condLabel) {
+                  lastBranchC = k;
+                } else if (ir[k].op == IROp::LABEL && ir[k].dest.name == endLabel) {
+                  foundEnd = true;
+                  break;
+                }
+              }
+              // 要求循环尾跳转紧邻 LABEL e（标准 while 结构）
+              if (foundEnd && lastBranchC != 0 && lastBranchC + 1 == k) {
+                // 常量提升：若条件块最后一条指令是 src2 为立即数的比较，
+                // 将该立即数提升到循环外的临时变量，使比较变成寄存器比较，
+                // 便于代码生成阶段将 slt+bnez 合并为单条条件分支 blt/bge
+                if (j > i + 1) {
+                  IRInst& lastCond = ir[j - 1];
+                  const bool isCmpOp = lastCond.op == IROp::LT || lastCond.op == IROp::LE ||
+                                       lastCond.op == IROp::GT || lastCond.op == IROp::GE ||
+                                       lastCond.op == IROp::EQ || lastCond.op == IROp::NE;
+                  if (isCmpOp && lastCond.src2.isImm()) {
+                    // 使用 'k' 前缀标记循环常量提升变量，代码生成阶段优先分配寄存器
+                    const std::string constVar = "k" + std::to_string(tempCounter++);
+                    optimized.push_back(IRInst(IROp::ASSIGN, Operand::localVar(constVar),
+                                               Operand::imm(lastCond.src2.immVal),
+                                               Operand::none()));
+                    lastCond.src2 = Operand::localVar(constVar);
+                  }
+                }
+                // 变换:
+                // 1. 在 LABEL b 之前插入 BRANCH c（首次进入先测试）
+                // 2. BEQZ t,e -> BNEZ t,b（条件满足跳回循环体）
+                // 3. 循环尾 BRANCH c -> LABEL c（测试点移到循环体末尾）
+                // 4. 条件块移动到测试点（循环体末尾）重新执行
+                optimized.push_back(IRInst(IROp::BRANCH, Operand::label(condLabel), Operand::none(),
+                                           Operand::none()));
+                // 循环体（LABEL b 到循环尾跳转之前）
+                for (std::size_t m = j + 1; m < lastBranchC; ++m) {
+                  optimized.push_back(ir[m]);
+                }
+                // 循环尾: BRANCH c -> LABEL c（测试点）
+                IRInst testLabel = ir[lastBranchC];
+                testLabel.op = IROp::LABEL;
+                optimized.push_back(testLabel);
+                // 条件块移动到测试点
+                for (std::size_t m = i + 1; m < j; ++m) {
+                  optimized.push_back(ir[m]);
+                }
+                // BEQZ t,e -> BNEZ t,b
+                IRInst bnez = ir[j];
+                bnez.op = IROp::BNEZ;
+                bnez.dest = Operand::label(bodyLabel);
+                optimized.push_back(bnez);
+                i = lastBranchC + 1;
+                changed = true;
+                continue;
+              }
+            }
+          }
+        }
+        optimized.push_back(ir[i]);
+        ++i;
+      }
+      // 循环反转前后指令数量不变（LABEL/BRANCH 互换），必须无条件更新
+      if (changed) {
+        ir = std::move(optimized);
+      } else {
+        ir = optimized;
       }
     }
   }

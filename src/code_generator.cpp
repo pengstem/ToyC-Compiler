@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <ostream>
+#include <sstream>
 #include <string>
 #include <utility>
 
@@ -173,9 +174,16 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
   }
 
   // 按使用频率降序排列，优先为高频变量分配寄存器（循环计数器等）
-  std::stable_sort(
-      varOrder.begin(), varOrder.end(),
-      [&](const std::string& a, const std::string& b) { return useFreq[a] > useFreq[b]; });
+  // 循环常量提升变量（'k' 前缀）无条件优先，保证循环内比较变成寄存器比较
+  std::stable_sort(varOrder.begin(), varOrder.end(),
+                   [&](const std::string& a, const std::string& b) {
+                     const bool aHoisted = !a.empty() && a[0] == 'k';
+                     const bool bHoisted = !b.empty() && b[0] == 'k';
+                     if (aHoisted != bHoisted) {
+                       return aHoisted;
+                     }
+                     return useFreq[a] > useFreq[b];
+                   });
 
   // 为前 10 个高频局部变量分配 s2-s11 寄存器
   for (const auto& varName : varOrder) {
@@ -202,24 +210,28 @@ void CodeGenerator::generateFunction(const FunctionRange& function, std::ostream
   currentFunction_ = function.name;
   currentParamIndex_ = 0;
 
-  emitRaw(out, "    .align 2\n");
-  emitRaw(out, "    .globl " + function.name + "\n");
-  emitRaw(out, "    .type " + function.name + ", @function\n");
-  out << function.name << ":\n";
+  // 先生成到缓冲区，再做汇编级窥孔优化（合并比较+分支），最后输出
+  std::ostringstream body;
+  emitRaw(body, "    .align 2\n");
+  emitRaw(body, "    .globl " + function.name + "\n");
+  emitRaw(body, "    .type " + function.name + ", @function\n");
+  body << function.name << ":\n";
 
-  emitPrologue(frame_, out);
+  emitPrologue(frame_, body);
 
   for (std::size_t i = function.begin; i < function.end; ++i) {
     const auto& inst = ir_[i];
     if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
       continue;
     }
-    generateInstruction(inst, out);
+    generateInstruction(inst, body);
   }
 
-  out << ".L_" << function.name << "_exit:\n";
-  emitEpilogue(frame_, out);
-  out << "    .size " << function.name << ", .-" << function.name << "\n";
+  body << ".L_" << function.name << "_exit:\n";
+  emitEpilogue(frame_, body);
+  body << "    .size " << function.name << ", .-" << function.name << "\n";
+
+  applyPeephole(body.str(), out);
 }
 
 void CodeGenerator::generateInstruction(const IRInst& inst, std::ostream& out) {
@@ -408,6 +420,133 @@ void CodeGenerator::emitEpilogue(const StackFrame& frame, std::ostream& out) con
   emit(out, "lw", "s0, -8(s0)");
   emit(out, "addi", "sp, sp, " + std::to_string(frame.frameSizeBytes()));
   emit(out, "ret", "");
+}
+
+namespace {
+
+// 解析汇编行：去掉前导空白，拆分为操作码 + 参数列表
+struct AsmToken {
+  std::string opcode;
+  std::vector<std::string> args;
+};
+
+AsmToken parseAsmLine(const std::string& line) {
+  AsmToken token;
+  std::size_t pos = line.find_first_not_of(" \t");
+  if (pos == std::string::npos) {
+    return token;
+  }
+  const std::size_t end = line.find_last_not_of(" \t");
+  const std::string content = line.substr(pos, end - pos + 1);
+  if (content.empty() || content.back() == ':') {
+    return token; // 标签行
+  }
+  std::size_t sp = content.find(' ');
+  if (sp == std::string::npos) {
+    token.opcode = content;
+    return token;
+  }
+  token.opcode = content.substr(0, sp);
+  std::string args = content.substr(sp + 1);
+  // 按逗号分割参数
+  std::size_t start = 0;
+  while (start <= args.size()) {
+    std::size_t comma = args.find(',', start);
+    const std::string part =
+        args.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+    std::size_t p0 = part.find_first_not_of(" \t");
+    std::size_t p1 = part.find_last_not_of(" \t");
+    if (p0 != std::string::npos) {
+      token.args.push_back(part.substr(p0, p1 - p0 + 1));
+    }
+    if (comma == std::string::npos) {
+      break;
+    }
+    start = comma + 1;
+  }
+  return token;
+}
+
+} // namespace
+
+void CodeGenerator::applyPeephole(const std::string& asmText, std::ostream& out) {
+  // 按行拆分
+  std::vector<std::string> lines;
+  {
+    std::istringstream iss(asmText);
+    std::string line;
+    while (std::getline(iss, line)) {
+      lines.push_back(line);
+    }
+  }
+  const auto n = lines.size();
+  for (std::size_t i = 0; i < n; ++i) {
+    const AsmToken tok = parseAsmLine(lines[i]);
+    const auto& op = tok.opcode;
+    const auto& args = tok.args;
+
+    // 模式1: slt rd, rs1, rs2  +  beqz rd, L  ->  bge rs1, rs2, L
+    // 模式2: slt rd, rs1, rs2  +  bnez rd, L  ->  blt rs1, rs2, L
+    if (op == "slt" && args.size() == 3 && i + 1 < n) {
+      const AsmToken next = parseAsmLine(lines[i + 1]);
+      if (next.opcode == "beqz" && next.args.size() == 2 && next.args[0] == args[0]) {
+        emit(out, "bge", args[1] + ", " + args[2] + ", " + next.args[1]);
+        ++i;
+        continue;
+      }
+      if (next.opcode == "bnez" && next.args.size() == 2 && next.args[0] == args[0]) {
+        emit(out, "blt", args[1] + ", " + args[2] + ", " + next.args[1]);
+        ++i;
+        continue;
+      }
+    }
+
+    // 模式3: sub rd, rs1, rs2 + seqz rd, rd + beqz rd, L -> bne rs1, rs2, L
+    // 模式4: sub rd, rs1, rs2 + seqz rd, rd + bnez rd, L -> beq rs1, rs2, L
+    // 模式5: sub rd, rs1, rs2 + snez rd, rd + beqz rd, L -> beq rs1, rs2, L
+    // 模式6: sub rd, rs1, rs2 + snez rd, rd + bnez rd, L -> bne rs1, rs2, L
+    if (op == "sub" && args.size() == 3 && i + 2 < n) {
+      const AsmToken t1 = parseAsmLine(lines[i + 1]);
+      const AsmToken t2 = parseAsmLine(lines[i + 2]);
+      if ((t1.opcode == "seqz" || t1.opcode == "snez") && t1.args.size() == 2 &&
+          t1.args[0] == args[0] && t1.args[1] == args[0]) {
+        const bool isEq = t1.opcode == "seqz";
+        if (t2.opcode == "beqz" && t2.args.size() == 2 && t2.args[0] == args[0]) {
+          // seqz+beqz -> bne ; snez+beqz -> beq
+          emit(out, (isEq ? "bne" : "beq"), args[1] + ", " + args[2] + ", " + t2.args[1]);
+          i += 2;
+          continue;
+        }
+        if (t2.opcode == "bnez" && t2.args.size() == 2 && t2.args[0] == args[0]) {
+          emit(out, (isEq ? "beq" : "bne"), args[1] + ", " + args[2] + ", " + t2.args[1]);
+          i += 2;
+          continue;
+        }
+      }
+    }
+
+    // 模式7: slt rd, rs1, rs2 + xori rd, rd, 1 + beqz rd, L -> blt rs1, rs2, L
+    // 模式8: slt rd, rs1, rs2 + xori rd, rd, 1 + bnez rd, L -> bge rs1, rs2, L
+    if (op == "slt" && args.size() == 3 && i + 2 < n) {
+      const AsmToken t1 = parseAsmLine(lines[i + 1]);
+      const AsmToken t2 = parseAsmLine(lines[i + 2]);
+      if (t1.opcode == "xori" && t1.args.size() == 3 && t1.args[0] == args[0] &&
+          t1.args[1] == args[0] && t1.args[2] == "1") {
+        if (t2.opcode == "beqz" && t2.args.size() == 2 && t2.args[0] == args[0]) {
+          emit(out, "blt", args[1] + ", " + args[2] + ", " + t2.args[1]);
+          i += 2;
+          continue;
+        }
+        if (t2.opcode == "bnez" && t2.args.size() == 2 && t2.args[0] == args[0]) {
+          emit(out, "bge", args[1] + ", " + args[2] + ", " + t2.args[1]);
+          i += 2;
+          continue;
+        }
+      }
+    }
+
+    out << lines[i] << "\n";
+  }
 }
 
 void CodeGenerator::loadOperand(const Operand& operand, std::string_view reg, std::ostream& out) {
