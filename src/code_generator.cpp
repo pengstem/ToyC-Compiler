@@ -370,8 +370,8 @@ void CodeGenerator::loadOperand(const Operand& operand, std::string_view reg, st
   }
 
   if (operand.type == OperandType::GLOBAL_VAR) {
-    emit(out, "la", "t1, " + globalSymbol(operand.name));
-    emit(out, "lw", std::string(reg) + ", 0(t1)");
+    emit(out, "la", "t2, " + globalSymbol(operand.name));
+    emit(out, "lw", std::string(reg) + ", 0(t2)");
     return;
   }
 
@@ -404,150 +404,191 @@ void CodeGenerator::storeOperand(std::string_view reg, const Operand& operand, s
   }
 
   if (operand.type == OperandType::GLOBAL_VAR) {
-    emit(out, "la", "t1, " + globalSymbol(operand.name));
-    emit(out, "sw", std::string(reg) + ", 0(t1)");
+    emit(out, "la", "t2, " + globalSymbol(operand.name));
+    emit(out, "sw", std::string(reg) + ", 0(t2)");
     return;
   }
 }
 
 void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
-  loadOperand(inst.src1, "t0", out);
+  // 确定目标寄存器：若 dest 分配了寄存器则直接用该寄存器运算，避免 mv 往返
+  std::string destReg = "t0";
+  bool destInReg = false;
+  if (inst.dest.isLocalVar()) {
+    auto it = frame_.regAlloc.find(inst.dest.name);
+    if (it != frame_.regAlloc.end()) {
+      destReg = "s" + std::to_string(it->second);
+      destInReg = true;
+    }
+  }
+
+  // 一元 NOT
   if (inst.op == IROp::NOT) {
-    emit(out, "sltiu", "t0, t0, 1");
-    storeOperand("t0", inst.dest, out);
+    loadOperand(inst.src1, destReg, out);
+    emit(out, "sltiu", destReg + ", " + destReg + ", 1");
+    if (!destInReg) {
+      storeOperand(destReg, inst.dest, out);
+    }
     return;
   }
 
-  // 当 src2 为 12 位有符号立即数范围内时使用立即数指令，省去 li
-  if (inst.src2.isImm() && inst.src2.immVal >= -2048 && inst.src2.immVal <= 2047) {
-    const int imm = inst.src2.immVal;
+  // 先处理 src2（加载到 t1 或使用立即数），避免 destReg 覆盖 src2 寄存器
+  const bool src2IsSmallImm =
+      inst.src2.isImm() && inst.src2.immVal >= -2048 && inst.src2.immVal <= 2047;
+  int imm = 0;
+  if (src2IsSmallImm) {
+    imm = inst.src2.immVal;
+  } else {
+    loadOperand(inst.src2, "t1", out);
+  }
+
+  // 再加载 src1 到 destReg（若 src1==dest 且都在寄存器，loadOperand 自动跳过 mv）
+  loadOperand(inst.src1, destReg, out);
+
+  // 执行运算，结果直接落在 destReg
+  if (src2IsSmallImm) {
     switch (inst.op) {
     case IROp::ADD:
-      emit(out, "addi", "t0, t0, " + std::to_string(imm));
+      emit(out, "addi", destReg + ", " + destReg + ", " + std::to_string(imm));
       break;
     case IROp::SUB:
-      // RISC-V 无 subi，用 addi 取反
-      emit(out, "addi", "t0, t0, " + std::to_string(-imm));
+      emit(out, "addi", destReg + ", " + destReg + ", " + std::to_string(-imm));
       break;
     case IROp::MUL:
-      // 乘 2 的幂可用左移，否则仍需 li+mul
       if (imm > 0 && (imm & (imm - 1)) == 0) {
-        emit(out, "slli", "t0, t0, " + std::to_string(__builtin_ctz(static_cast<unsigned>(imm))));
+        emit(out, "slli",
+             destReg + ", " + destReg + ", " +
+                 std::to_string(__builtin_ctz(static_cast<unsigned>(imm))));
       } else {
-        loadOperand(inst.src2, "t1", out);
-        emit(out, "mul", "t0, t0, t1");
+        emit(out, "li", "t1, " + std::to_string(imm));
+        emit(out, "mul", destReg + ", " + destReg + ", t1");
       }
+      break;
+    case IROp::DIV:
+      emit(out, "li", "t1, " + std::to_string(imm));
+      emit(out, "div", destReg + ", " + destReg + ", t1");
+      break;
+    case IROp::MOD:
+      emit(out, "li", "t1, " + std::to_string(imm));
+      emit(out, "rem", destReg + ", " + destReg + ", t1");
       break;
     default:
-      loadOperand(inst.src2, "t1", out);
-      switch (inst.op) {
-      case IROp::DIV:
-        emit(out, "div", "t0, t0, t1");
-        break;
-      case IROp::MOD:
-        emit(out, "rem", "t0, t0, t1");
-        break;
-      default:
-        break;
-      }
       break;
     }
-    storeOperand("t0", inst.dest, out);
-    return;
+  } else {
+    switch (inst.op) {
+    case IROp::ADD:
+      emit(out, "add", destReg + ", " + destReg + ", t1");
+      break;
+    case IROp::SUB:
+      emit(out, "sub", destReg + ", " + destReg + ", t1");
+      break;
+    case IROp::MUL:
+      emit(out, "mul", destReg + ", " + destReg + ", t1");
+      break;
+    case IROp::DIV:
+      emit(out, "div", destReg + ", " + destReg + ", t1");
+      break;
+    case IROp::MOD:
+      emit(out, "rem", destReg + ", " + destReg + ", t1");
+      break;
+    default:
+      break;
+    }
   }
 
-  loadOperand(inst.src2, "t1", out);
-  switch (inst.op) {
-  case IROp::ADD:
-    emit(out, "add", "t0, t0, t1");
-    break;
-  case IROp::SUB:
-    emit(out, "sub", "t0, t0, t1");
-    break;
-  case IROp::MUL:
-    emit(out, "mul", "t0, t0, t1");
-    break;
-  case IROp::DIV:
-    emit(out, "div", "t0, t0, t1");
-    break;
-  case IROp::MOD:
-    emit(out, "rem", "t0, t0, t1");
-    break;
-  default:
-    break;
+  if (!destInReg) {
+    storeOperand(destReg, inst.dest, out);
   }
-  storeOperand("t0", inst.dest, out);
 }
 
 void CodeGenerator::emitCompareOp(const IRInst& inst, std::ostream& out) {
-  loadOperand(inst.src1, "t0", out);
+  // 确定目标寄存器：若 dest 分配了寄存器则直接用该寄存器
+  std::string destReg = "t0";
+  bool destInReg = false;
+  if (inst.dest.isLocalVar()) {
+    auto it = frame_.regAlloc.find(inst.dest.name);
+    if (it != frame_.regAlloc.end()) {
+      destReg = "s" + std::to_string(it->second);
+      destInReg = true;
+    }
+  }
 
-  // 当 src2 为 12 位有符号立即数范围内时使用立即数比较指令
-  if (inst.src2.isImm() && inst.src2.immVal >= -2048 && inst.src2.immVal <= 2047) {
-    const int imm = inst.src2.immVal;
+  // 先处理 src2
+  const bool src2IsSmallImm =
+      inst.src2.isImm() && inst.src2.immVal >= -2048 && inst.src2.immVal <= 2047;
+  int imm = 0;
+  if (src2IsSmallImm) {
+    imm = inst.src2.immVal;
+  } else {
+    loadOperand(inst.src2, "t1", out);
+  }
+
+  loadOperand(inst.src1, destReg, out);
+
+  if (src2IsSmallImm) {
     switch (inst.op) {
     case IROp::LT:
-      emit(out, "slti", "t0, t0, " + std::to_string(imm));
+      emit(out, "slti", destReg + ", " + destReg + ", " + std::to_string(imm));
       break;
-    case IROp::GT: // x > imm  ==  !(x <= imm) ==  imm < x，需翻转
-      // t0 > imm  <=>  imm < t0，用 slti 不行（操作数顺序固定）
-      // 改用：slt t0, t0, imm+1 取反。但更简洁：用通用路径
-      loadOperand(inst.src2, "t1", out);
-      emit(out, "slt", "t0, t1, t0");
+    case IROp::GT:
+      // x > imm  <=>  imm < x，需用 t1 加载 imm
+      emit(out, "li", "t1, " + std::to_string(imm));
+      emit(out, "slt", destReg + ", t1, " + destReg);
       break;
-    case IROp::LE: // x <= imm <=> !(imm < x)，但无直接指令
+    case IROp::LE:
       // x <= imm  <=>  x < imm+1
-      emit(out, "slti", "t0, t0, " + std::to_string(imm + 1));
+      emit(out, "slti", destReg + ", " + destReg + ", " + std::to_string(imm + 1));
       break;
-    case IROp::GE: // x >= imm <=> !(x < imm)
-      emit(out, "slti", "t0, t0, " + std::to_string(imm));
-      emit(out, "xori", "t0, t0, 1");
+    case IROp::GE:
+      emit(out, "slti", destReg + ", " + destReg + ", " + std::to_string(imm));
+      emit(out, "xori", destReg + ", " + destReg + ", 1");
       break;
     case IROp::EQ:
-      emit(out, "addi", "t1, zero, " + std::to_string(imm));
-      emit(out, "sub", "t0, t0, t1");
-      emit(out, "seqz", "t0, t0");
+      emit(out, "li", "t1, " + std::to_string(imm));
+      emit(out, "sub", destReg + ", " + destReg + ", t1");
+      emit(out, "seqz", destReg + ", " + destReg);
       break;
     case IROp::NE:
-      emit(out, "addi", "t1, zero, " + std::to_string(imm));
-      emit(out, "sub", "t0, t0, t1");
-      emit(out, "snez", "t0, t0");
+      emit(out, "li", "t1, " + std::to_string(imm));
+      emit(out, "sub", destReg + ", " + destReg + ", t1");
+      emit(out, "snez", destReg + ", " + destReg);
       break;
     default:
       break;
     }
-    storeOperand("t0", inst.dest, out);
-    return;
+  } else {
+    switch (inst.op) {
+    case IROp::LT:
+      emit(out, "slt", destReg + ", " + destReg + ", t1");
+      break;
+    case IROp::GT:
+      emit(out, "slt", destReg + ", t1, " + destReg);
+      break;
+    case IROp::LE:
+      emit(out, "slt", destReg + ", t1, " + destReg);
+      emit(out, "xori", destReg + ", " + destReg + ", 1");
+      break;
+    case IROp::GE:
+      emit(out, "slt", destReg + ", " + destReg + ", t1");
+      emit(out, "xori", destReg + ", " + destReg + ", 1");
+      break;
+    case IROp::EQ:
+      emit(out, "sub", destReg + ", " + destReg + ", t1");
+      emit(out, "seqz", destReg + ", " + destReg);
+      break;
+    case IROp::NE:
+      emit(out, "sub", destReg + ", " + destReg + ", t1");
+      emit(out, "snez", destReg + ", " + destReg);
+      break;
+    default:
+      break;
+    }
   }
 
-  loadOperand(inst.src2, "t1", out);
-  switch (inst.op) {
-  case IROp::LT:
-    emit(out, "slt", "t0, t0, t1");
-    break;
-  case IROp::GT:
-    emit(out, "slt", "t0, t1, t0");
-    break;
-  case IROp::LE:
-    emit(out, "slt", "t0, t1, t0");
-    emit(out, "xori", "t0, t0, 1");
-    break;
-  case IROp::GE:
-    emit(out, "slt", "t0, t0, t1");
-    emit(out, "xori", "t0, t0, 1");
-    break;
-  case IROp::EQ:
-    emit(out, "sub", "t0, t0, t1");
-    emit(out, "seqz", "t0, t0");
-    break;
-  case IROp::NE:
-    emit(out, "sub", "t0, t0, t1");
-    emit(out, "snez", "t0, t0");
-    break;
-  default:
-    break;
+  if (!destInReg) {
+    storeOperand(destReg, inst.dest, out);
   }
-  storeOperand("t0", inst.dest, out);
 }
 
 void CodeGenerator::emitCall(const IRInst& inst, std::ostream& out) {
