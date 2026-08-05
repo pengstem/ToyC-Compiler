@@ -1,4 +1,5 @@
 %option noyywrap nounput noinput
+%option never-interactive
 %option prefix="toycc"
 
 %{

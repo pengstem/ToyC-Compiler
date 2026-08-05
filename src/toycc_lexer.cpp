@@ -1,6 +1,6 @@
-#line 2 "src/toycc_lexer.cpp"
+#line 2 "toycc_lexer.cpp"
 
-#line 4 "src/toycc_lexer.cpp"
+#line 4 "toycc_lexer.cpp"
 
 #define  YY_INT_ALIGNED short int
 
@@ -756,15 +756,15 @@ int yy_flex_debug = 0;
 #define YY_MORE_ADJ 0
 #define YY_RESTORE_YY_MORE_OFFSET
 char *yytext;
-#line 1 "src/toycc_lexer.l"
+#line 1 "toycc_lexer.l"
 #define YY_NO_INPUT 1
-#line 5 "src/toycc_lexer.l"
+#line 6 "toycc_lexer.l"
 #include <string>
 #include "parser_driver.h"
 #include "toycc_parser.hpp"
-#line 766 "src/toycc_lexer.cpp"
+#line 766 "toycc_lexer.cpp"
 
-#line 768 "src/toycc_lexer.cpp"
+#line 768 "toycc_lexer.cpp"
 
 #define INITIAL 0
 #define COMMENT 1
@@ -980,10 +980,10 @@ YY_DECL
 		}
 
 	{
-#line 12 "src/toycc_lexer.l"
+#line 13 "toycc_lexer.l"
 
 
-#line 987 "src/toycc_lexer.cpp"
+#line 987 "toycc_lexer.cpp"
 
 	while ( /*CONSTCOND*/1 )		/* loops until end-of-file is reached */
 		{
@@ -1016,16 +1016,12 @@ yy_match:
 			yy_current_state = yy_nxt[yy_base[yy_current_state] + yy_c];
 			++yy_cp;
 			}
-		while ( yy_base[yy_current_state] != 104 );
+		while ( yy_current_state != 83 );
+		yy_cp = (yy_last_accepting_cpos);
+		yy_current_state = (yy_last_accepting_state);
 
 yy_find_action:
 		yy_act = yy_accept[yy_current_state];
-		if ( yy_act == 0 )
-			{ /* have to back up */
-			yy_cp = (yy_last_accepting_cpos);
-			yy_current_state = (yy_last_accepting_state);
-			yy_act = yy_accept[yy_current_state];
-			}
 
 		YY_DO_BEFORE_ACTION;
 
@@ -1042,212 +1038,212 @@ do_action:	/* This label is used only to access EOF actions. */
 
 case 1:
 YY_RULE_SETUP
-#line 14 "src/toycc_lexer.l"
+#line 15 "toycc_lexer.l"
 { BEGIN(COMMENT); }
 	YY_BREAK
 case 2:
 YY_RULE_SETUP
-#line 15 "src/toycc_lexer.l"
+#line 16 "toycc_lexer.l"
 { BEGIN(INITIAL); }
 	YY_BREAK
 case 3:
 YY_RULE_SETUP
-#line 16 "src/toycc_lexer.l"
+#line 17 "toycc_lexer.l"
 ;
 	YY_BREAK
 case 4:
 YY_RULE_SETUP
-#line 17 "src/toycc_lexer.l"
+#line 18 "toycc_lexer.l"
 ;
 	YY_BREAK
 case 5:
 /* rule 5 can match eol */
 YY_RULE_SETUP
-#line 18 "src/toycc_lexer.l"
+#line 19 "toycc_lexer.l"
 ;
 	YY_BREAK
 case 6:
 YY_RULE_SETUP
-#line 20 "src/toycc_lexer.l"
+#line 21 "toycc_lexer.l"
 ;
 	YY_BREAK
 case 7:
 /* rule 7 can match eol */
 YY_RULE_SETUP
-#line 22 "src/toycc_lexer.l"
+#line 23 "toycc_lexer.l"
 ;
 	YY_BREAK
 case 8:
 YY_RULE_SETUP
-#line 24 "src/toycc_lexer.l"
+#line 25 "toycc_lexer.l"
 { return yy::parser::token::CONST; }
 	YY_BREAK
 case 9:
 YY_RULE_SETUP
-#line 25 "src/toycc_lexer.l"
+#line 26 "toycc_lexer.l"
 { return yy::parser::token::INT; }
 	YY_BREAK
 case 10:
 YY_RULE_SETUP
-#line 26 "src/toycc_lexer.l"
+#line 27 "toycc_lexer.l"
 { return yy::parser::token::VOID; }
 	YY_BREAK
 case 11:
 YY_RULE_SETUP
-#line 27 "src/toycc_lexer.l"
+#line 28 "toycc_lexer.l"
 { return yy::parser::token::RETURN; }
 	YY_BREAK
 case 12:
 YY_RULE_SETUP
-#line 28 "src/toycc_lexer.l"
+#line 29 "toycc_lexer.l"
 { return yy::parser::token::IF; }
 	YY_BREAK
 case 13:
 YY_RULE_SETUP
-#line 29 "src/toycc_lexer.l"
+#line 30 "toycc_lexer.l"
 { return yy::parser::token::ELSE; }
 	YY_BREAK
 case 14:
 YY_RULE_SETUP
-#line 30 "src/toycc_lexer.l"
+#line 31 "toycc_lexer.l"
 { return yy::parser::token::WHILE; }
 	YY_BREAK
 case 15:
 YY_RULE_SETUP
-#line 31 "src/toycc_lexer.l"
+#line 32 "toycc_lexer.l"
 { return yy::parser::token::BREAK; }
 	YY_BREAK
 case 16:
 YY_RULE_SETUP
-#line 32 "src/toycc_lexer.l"
+#line 33 "toycc_lexer.l"
 { return yy::parser::token::CONTINUE; }
 	YY_BREAK
 case 17:
 YY_RULE_SETUP
-#line 34 "src/toycc_lexer.l"
+#line 35 "toycc_lexer.l"
 { return yy::parser::token::ASSIGN; }
 	YY_BREAK
 case 18:
 YY_RULE_SETUP
-#line 35 "src/toycc_lexer.l"
+#line 36 "toycc_lexer.l"
 { return yy::parser::token::SEMI; }
 	YY_BREAK
 case 19:
 YY_RULE_SETUP
-#line 36 "src/toycc_lexer.l"
+#line 37 "toycc_lexer.l"
 { return yy::parser::token::COMMA; }
 	YY_BREAK
 case 20:
 YY_RULE_SETUP
-#line 37 "src/toycc_lexer.l"
+#line 38 "toycc_lexer.l"
 { return yy::parser::token::LPAREN; }
 	YY_BREAK
 case 21:
 YY_RULE_SETUP
-#line 38 "src/toycc_lexer.l"
+#line 39 "toycc_lexer.l"
 { return yy::parser::token::RPAREN; }
 	YY_BREAK
 case 22:
 YY_RULE_SETUP
-#line 39 "src/toycc_lexer.l"
+#line 40 "toycc_lexer.l"
 { return yy::parser::token::LBRACE; }
 	YY_BREAK
 case 23:
 YY_RULE_SETUP
-#line 40 "src/toycc_lexer.l"
+#line 41 "toycc_lexer.l"
 { return yy::parser::token::RBRACE; }
 	YY_BREAK
 case 24:
 YY_RULE_SETUP
-#line 42 "src/toycc_lexer.l"
+#line 43 "toycc_lexer.l"
 { return yy::parser::token::EQ; }
 	YY_BREAK
 case 25:
 YY_RULE_SETUP
-#line 43 "src/toycc_lexer.l"
+#line 44 "toycc_lexer.l"
 { return yy::parser::token::NE; }
 	YY_BREAK
 case 26:
 YY_RULE_SETUP
-#line 44 "src/toycc_lexer.l"
+#line 45 "toycc_lexer.l"
 { return yy::parser::token::LE; }
 	YY_BREAK
 case 27:
 YY_RULE_SETUP
-#line 45 "src/toycc_lexer.l"
+#line 46 "toycc_lexer.l"
 { return yy::parser::token::GE; }
 	YY_BREAK
 case 28:
 YY_RULE_SETUP
-#line 46 "src/toycc_lexer.l"
+#line 47 "toycc_lexer.l"
 { return yy::parser::token::LT; }
 	YY_BREAK
 case 29:
 YY_RULE_SETUP
-#line 47 "src/toycc_lexer.l"
+#line 48 "toycc_lexer.l"
 { return yy::parser::token::GT; }
 	YY_BREAK
 case 30:
 YY_RULE_SETUP
-#line 48 "src/toycc_lexer.l"
+#line 49 "toycc_lexer.l"
 { return yy::parser::token::ADD; }
 	YY_BREAK
 case 31:
 YY_RULE_SETUP
-#line 49 "src/toycc_lexer.l"
+#line 50 "toycc_lexer.l"
 { return yy::parser::token::SUB; }
 	YY_BREAK
 case 32:
 YY_RULE_SETUP
-#line 50 "src/toycc_lexer.l"
+#line 51 "toycc_lexer.l"
 { return yy::parser::token::MUL; }
 	YY_BREAK
 case 33:
 YY_RULE_SETUP
-#line 51 "src/toycc_lexer.l"
+#line 52 "toycc_lexer.l"
 { return yy::parser::token::DIV; }
 	YY_BREAK
 case 34:
 YY_RULE_SETUP
-#line 52 "src/toycc_lexer.l"
+#line 53 "toycc_lexer.l"
 { return yy::parser::token::MOD; }
 	YY_BREAK
 case 35:
 YY_RULE_SETUP
-#line 53 "src/toycc_lexer.l"
+#line 54 "toycc_lexer.l"
 { return yy::parser::token::AND; }
 	YY_BREAK
 case 36:
 YY_RULE_SETUP
-#line 54 "src/toycc_lexer.l"
+#line 55 "toycc_lexer.l"
 { return yy::parser::token::OR; }
 	YY_BREAK
 case 37:
 YY_RULE_SETUP
-#line 55 "src/toycc_lexer.l"
+#line 56 "toycc_lexer.l"
 { return yy::parser::token::NOT; }
 	YY_BREAK
 case 38:
 YY_RULE_SETUP
-#line 57 "src/toycc_lexer.l"
+#line 58 "toycc_lexer.l"
 { return yy::parser::token::IDENT; }
 	YY_BREAK
 case 39:
 YY_RULE_SETUP
-#line 58 "src/toycc_lexer.l"
+#line 59 "toycc_lexer.l"
 { return yy::parser::token::INT_LITERAL; }
 	YY_BREAK
 case 40:
 YY_RULE_SETUP
-#line 60 "src/toycc_lexer.l"
+#line 61 "toycc_lexer.l"
 { return yy::parser::token::INVALID; }
 	YY_BREAK
 case 41:
 YY_RULE_SETUP
-#line 62 "src/toycc_lexer.l"
+#line 63 "toycc_lexer.l"
 ECHO;
 	YY_BREAK
-#line 1251 "src/toycc_lexer.cpp"
+#line 1247 "toycc_lexer.cpp"
 case YY_STATE_EOF(INITIAL):
 case YY_STATE_EOF(COMMENT):
 	yyterminate();
@@ -1315,7 +1311,8 @@ case YY_STATE_EOF(COMMENT):
 
 			else
 				{
-				yy_cp = (yy_c_buf_p);
+				yy_cp = (yy_last_accepting_cpos);
+				yy_current_state = (yy_last_accepting_state);
 				goto yy_find_action;
 				}
 			}
@@ -2216,6 +2213,6 @@ void yyfree (void * ptr )
 
 #define YYTABLES_NAME "yytables"
 
-#line 62 "src/toycc_lexer.l"
+#line 63 "toycc_lexer.l"
 
 

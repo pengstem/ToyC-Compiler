@@ -745,11 +745,11 @@ void CodeGenerator::applyPeephole(const std::string& asmText, std::ostream& out)
         if (t1.opcode == "sub" && t1.args.size() == 3 && t1.args[2] == "t1" &&
             ((t2.opcode == "seqz" && t3.opcode == "bnez") ||
              (t2.opcode == "snez" && t3.opcode == "beqz"))) {
-          const bool jumpWhenEq = (t2.opcode == "snez"); // snez+beqz 与 seqz+bnez 都是跳转当相等
+          // seqz+bnez 与 snez+beqz 都是跳转当相等 -> addi + beqz
           if (t2.args.size() == 2 && t2.args[0] == t1.args[0] && t2.args[1] == t1.args[0] &&
               t3.args.size() == 2 && t3.args[0] == t1.args[0]) {
             emit(out, "addi", t1.args[0] + ", " + t1.args[1] + ", " + std::to_string(-immVal));
-            emit(out, (jumpWhenEq ? "beqz" : "bnez"), t1.args[0] + ", " + t3.args[1]);
+            emit(out, "beqz", t1.args[0] + ", " + t3.args[1]);
             i += 3;
             continue;
           }
