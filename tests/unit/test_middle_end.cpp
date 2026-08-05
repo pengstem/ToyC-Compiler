@@ -290,13 +290,10 @@ void testIR_arithmetic() {
   testHeader("IR: arithmetic expression (x+y)*z");
   auto comp = makeCompUnit();
   comp->globalDecls.push_back(makeFuncDef(
-      Type::INT, "main", {},
-      makeBlock(
-          {makeDeclStmt(makeDecl(false, "x", makeInt(1))),
-           makeDeclStmt(makeDecl(false, "y", makeInt(2))),
-           makeDeclStmt(makeDecl(false, "z", makeInt(3))),
-           makeReturn(makeBinary(BinOp::MUL, makeBinary(BinOp::ADD, makeVar("x"), makeVar("y")),
-                                 makeVar("z")))})));
+      Type::INT, "f",
+      {makeParam(Type::INT, "x"), makeParam(Type::INT, "y"), makeParam(Type::INT, "z")},
+      makeBlock({makeReturn(makeBinary(
+          BinOp::MUL, makeBinary(BinOp::ADD, makeVar("x"), makeVar("y")), makeVar("z")))})));
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
@@ -434,23 +431,24 @@ void testIR_nestedScope() {
   testHeader("IR: nested block scope");
   auto comp = makeCompUnit();
   comp->globalDecls.push_back(makeFuncDef(
-      Type::INT, "main", {},
-      makeBlock({makeDeclStmt(makeDecl(false, "a", makeInt(1))),
-                 makeBlock({
-                     makeExprStmt(makeBinary(BinOp::ASSIGN, makeVar("a"),
-                                             makeBinary(BinOp::ADD, makeVar("a"), makeInt(2)))),
-                     makeDeclStmt(makeDecl(false, "a", makeInt(3))),
-                     makeExprStmt(makeBinary(BinOp::ASSIGN, makeVar("a"),
-                                             makeBinary(BinOp::ADD, makeVar("a"), makeInt(4)))),
-                 }),
-                 makeExprStmt(makeBinary(BinOp::ASSIGN, makeVar("a"),
-                                         makeBinary(BinOp::ADD, makeVar("a"), makeInt(5)))),
-                 makeReturn(makeVar("a"))})));
+      Type::INT, "f", {makeParam(Type::INT, "a")},
+      makeBlock(
+          {makeBlock({
+               makeExprStmt(makeBinary(BinOp::ASSIGN, makeVar("a"),
+                                       makeBinary(BinOp::ADD, makeVar("a"), makeInt(2)))),
+               makeDeclStmt(makeDecl(false, "a", makeBinary(BinOp::ADD, makeVar("a"), makeInt(3)))),
+               makeExprStmt(makeBinary(BinOp::ASSIGN, makeVar("a"),
+                                       makeBinary(BinOp::ADD, makeVar("a"), makeInt(4)))),
+           }),
+           makeExprStmt(makeBinary(BinOp::ASSIGN, makeVar("a"),
+                                   makeBinary(BinOp::ADD, makeVar("a"), makeInt(5)))),
+           makeReturn(makeVar("a"))})));
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
   auto ir = irGen.generate(*comp);
-  if (irContains(ir, "LOCAL_VAR_DECL %a") && irContains(ir, "ASSIGN %a")) {
+  // 优化后 ASSIGN 合并进 ADD，但应保留两层 a 的 LOCAL_VAR_DECL
+  if (irContains(ir, "LOCAL_VAR_DECL %a.0") && irContains(ir, "LOCAL_VAR_DECL %a.1")) {
     testPass();
   } else {
     testFail("nested scope IR mismatch:\n" + irToString(ir));
@@ -508,9 +506,8 @@ void testIR_unaryNeg() {
   testHeader("IR: unary negate (-x)");
   auto comp = makeCompUnit();
   comp->globalDecls.push_back(
-      makeFuncDef(Type::INT, "main", {},
-                  makeBlock({makeDeclStmt(makeDecl(false, "x", makeInt(42))),
-                             makeReturn(makeUnary(UnaryOp::NEG, makeVar("x")))})));
+      makeFuncDef(Type::INT, "f", {makeParam(Type::INT, "x")},
+                  makeBlock({makeReturn(makeUnary(UnaryOp::NEG, makeVar("x")))})));
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
@@ -526,9 +523,8 @@ void testIR_unaryNot() {
   testHeader("IR: unary logical NOT (!x)");
   auto comp = makeCompUnit();
   comp->globalDecls.push_back(
-      makeFuncDef(Type::INT, "main", {},
-                  makeBlock({makeDeclStmt(makeDecl(false, "x", makeInt(0))),
-                             makeReturn(makeUnary(UnaryOp::NOT, makeVar("x")))})));
+      makeFuncDef(Type::INT, "f", {makeParam(Type::INT, "x")},
+                  makeBlock({makeReturn(makeUnary(UnaryOp::NOT, makeVar("x")))})));
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
@@ -548,10 +544,8 @@ void testIR_compareLT() {
   testHeader("IR: less than (x < y)");
   auto comp = makeCompUnit();
   comp->globalDecls.push_back(
-      makeFuncDef(Type::INT, "main", {},
-                  makeBlock({makeDeclStmt(makeDecl(false, "x", makeInt(3))),
-                             makeDeclStmt(makeDecl(false, "y", makeInt(5))),
-                             makeReturn(makeBinary(BinOp::LT, makeVar("x"), makeVar("y")))})));
+      makeFuncDef(Type::INT, "f", {makeParam(Type::INT, "x"), makeParam(Type::INT, "y")},
+                  makeBlock({makeReturn(makeBinary(BinOp::LT, makeVar("x"), makeVar("y")))})));
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
@@ -567,10 +561,8 @@ void testIR_compareGT() {
   testHeader("IR: greater than (x > y)");
   auto comp = makeCompUnit();
   comp->globalDecls.push_back(
-      makeFuncDef(Type::INT, "main", {},
-                  makeBlock({makeDeclStmt(makeDecl(false, "x", makeInt(5))),
-                             makeDeclStmt(makeDecl(false, "y", makeInt(3))),
-                             makeReturn(makeBinary(BinOp::GT, makeVar("x"), makeVar("y")))})));
+      makeFuncDef(Type::INT, "f", {makeParam(Type::INT, "x"), makeParam(Type::INT, "y")},
+                  makeBlock({makeReturn(makeBinary(BinOp::GT, makeVar("x"), makeVar("y")))})));
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
@@ -586,10 +578,8 @@ void testIR_compareLE() {
   testHeader("IR: less or equal (x <= y)");
   auto comp = makeCompUnit();
   comp->globalDecls.push_back(
-      makeFuncDef(Type::INT, "main", {},
-                  makeBlock({makeDeclStmt(makeDecl(false, "x", makeInt(3))),
-                             makeDeclStmt(makeDecl(false, "y", makeInt(3))),
-                             makeReturn(makeBinary(BinOp::LE, makeVar("x"), makeVar("y")))})));
+      makeFuncDef(Type::INT, "f", {makeParam(Type::INT, "x"), makeParam(Type::INT, "y")},
+                  makeBlock({makeReturn(makeBinary(BinOp::LE, makeVar("x"), makeVar("y")))})));
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
@@ -605,10 +595,8 @@ void testIR_compareGE() {
   testHeader("IR: greater or equal (x >= y)");
   auto comp = makeCompUnit();
   comp->globalDecls.push_back(
-      makeFuncDef(Type::INT, "main", {},
-                  makeBlock({makeDeclStmt(makeDecl(false, "x", makeInt(5))),
-                             makeDeclStmt(makeDecl(false, "y", makeInt(5))),
-                             makeReturn(makeBinary(BinOp::GE, makeVar("x"), makeVar("y")))})));
+      makeFuncDef(Type::INT, "f", {makeParam(Type::INT, "x"), makeParam(Type::INT, "y")},
+                  makeBlock({makeReturn(makeBinary(BinOp::GE, makeVar("x"), makeVar("y")))})));
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
@@ -624,10 +612,8 @@ void testIR_compareEQ() {
   testHeader("IR: equal (x == y)");
   auto comp = makeCompUnit();
   comp->globalDecls.push_back(
-      makeFuncDef(Type::INT, "main", {},
-                  makeBlock({makeDeclStmt(makeDecl(false, "x", makeInt(3))),
-                             makeDeclStmt(makeDecl(false, "y", makeInt(3))),
-                             makeReturn(makeBinary(BinOp::EQ, makeVar("x"), makeVar("y")))})));
+      makeFuncDef(Type::INT, "f", {makeParam(Type::INT, "x"), makeParam(Type::INT, "y")},
+                  makeBlock({makeReturn(makeBinary(BinOp::EQ, makeVar("x"), makeVar("y")))})));
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
@@ -643,10 +629,8 @@ void testIR_compareNE() {
   testHeader("IR: not equal (x != y)");
   auto comp = makeCompUnit();
   comp->globalDecls.push_back(
-      makeFuncDef(Type::INT, "main", {},
-                  makeBlock({makeDeclStmt(makeDecl(false, "x", makeInt(3))),
-                             makeDeclStmt(makeDecl(false, "y", makeInt(5))),
-                             makeReturn(makeBinary(BinOp::NE, makeVar("x"), makeVar("y")))})));
+      makeFuncDef(Type::INT, "f", {makeParam(Type::INT, "x"), makeParam(Type::INT, "y")},
+                  makeBlock({makeReturn(makeBinary(BinOp::NE, makeVar("x"), makeVar("y")))})));
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
@@ -770,22 +754,22 @@ void testIR_varShadowing() {
   testHeader("IR: variable shadowing in nested block");
   auto comp = makeCompUnit();
   comp->globalDecls.push_back(makeFuncDef(
-      Type::INT, "main", {},
+      Type::INT, "f", {makeParam(Type::INT, "a")},
       makeBlock({
-          makeDeclStmt(makeDecl(false, "a", makeInt(1))),
           makeBlock({
-              makeDeclStmt(makeDecl(false, "a", makeInt(100))),
+              makeDeclStmt(
+                  makeDecl(false, "a", makeBinary(BinOp::ADD, makeVar("a"), makeInt(100)))),
               makeExprStmt(makeBinary(BinOp::ASSIGN, makeVar("a"),
                                       makeBinary(BinOp::ADD, makeVar("a"), makeInt(1)))),
           }),
-          makeReturn(makeVar("a")) // 外层 a 仍为 1
+          makeReturn(makeVar("a")) // 外层 a（参数）
       })));
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
   auto ir = irGen.generate(*comp);
   // 内层 a 和外层 a 应该是不同的变量
-  if (irContains(ir, "LOCAL_VAR_DECL %a") && irContains(ir, "ASSIGN %a")) {
+  if (irContains(ir, "LOCAL_VAR_DECL %a.0") && irContains(ir, "LOCAL_VAR_DECL %a.1")) {
     testPass();
   } else {
     testFail("shadowing IR mismatch:\n" + irToString(ir));
@@ -1079,16 +1063,18 @@ void testSema_assignToNonLvalue() {
 void testIR_assignAndRead() {
   testHeader("IR: assign then read variable");
   auto comp = makeCompUnit();
-  comp->globalDecls.push_back(
-      makeFuncDef(Type::INT, "main", {},
-                  makeBlock({makeDeclStmt(makeDecl(false, "x", makeInt(0))),
-                             makeExprStmt(makeBinary(BinOp::ASSIGN, makeVar("x"), makeInt(42))),
-                             makeReturn(makeVar("x"))})));
+  comp->globalDecls.push_back(makeFuncDef(
+      Type::INT, "f", {makeParam(Type::INT, "x")},
+      makeBlock({makeDeclStmt(makeDecl(false, "y")),
+                 makeExprStmt(makeBinary(BinOp::ASSIGN, makeVar("y"),
+                                         makeBinary(BinOp::ADD, makeVar("x"), makeInt(42)))),
+                 makeReturn(makeVar("y"))})));
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
   auto ir = irGen.generate(*comp);
-  if (irContains(ir, "ASSIGN %x.") && irContains(ir, "#42")) {
+  // 优化后 ASSIGN 被合并进 ADD，但应保留变量引用和常量
+  if (irContains(ir, "%y.") && irContains(ir, "#42")) {
     testPass();
   } else {
     testFail("assign IR missing:\n" + irToString(ir));
@@ -1147,13 +1133,11 @@ void testIR_shortCircuitWithCompare() {
   testHeader("IR: short-circuit with compare (x>y) && (a<b)");
   auto comp = makeCompUnit();
   comp->globalDecls.push_back(makeFuncDef(
-      Type::INT, "main", {},
+      Type::INT, "f",
+      {makeParam(Type::INT, "x"), makeParam(Type::INT, "y"), makeParam(Type::INT, "a"),
+       makeParam(Type::INT, "b")},
       makeBlock(
-          {makeDeclStmt(makeDecl(false, "x", makeInt(3))),
-           makeDeclStmt(makeDecl(false, "y", makeInt(2))),
-           makeDeclStmt(makeDecl(false, "a", makeInt(5))),
-           makeDeclStmt(makeDecl(false, "b", makeInt(10))),
-           makeReturn(makeBinary(BinOp::AND, makeBinary(BinOp::GT, makeVar("x"), makeVar("y")),
+          {makeReturn(makeBinary(BinOp::AND, makeBinary(BinOp::GT, makeVar("x"), makeVar("y")),
                                  makeBinary(BinOp::LT, makeVar("a"), makeVar("b"))))})));
   SemanticAnalyzer sema;
   sema.analyze(*comp);
@@ -1277,13 +1261,10 @@ void testIntegration_arithmetic() {
   testHeader("Integration: arithmetic (x+y)*z → RISC-V");
   auto comp = makeCompUnit();
   comp->globalDecls.push_back(makeFuncDef(
-      Type::INT, "main", {},
-      makeBlock(
-          {makeDeclStmt(makeDecl(false, "x", makeInt(1))),
-           makeDeclStmt(makeDecl(false, "y", makeInt(2))),
-           makeDeclStmt(makeDecl(false, "z", makeInt(3))),
-           makeReturn(makeBinary(BinOp::MUL, makeBinary(BinOp::ADD, makeVar("x"), makeVar("y")),
-                                 makeVar("z")))})));
+      Type::INT, "f",
+      {makeParam(Type::INT, "x"), makeParam(Type::INT, "y"), makeParam(Type::INT, "z")},
+      makeBlock({makeReturn(makeBinary(
+          BinOp::MUL, makeBinary(BinOp::ADD, makeVar("x"), makeVar("y")), makeVar("z")))})));
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());

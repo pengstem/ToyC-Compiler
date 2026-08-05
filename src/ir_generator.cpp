@@ -605,50 +605,274 @@ void countUses(const std::vector<IRInst>& ir, std::unordered_map<std::string, in
 } // namespace
 
 void IRGenerator::optimizePass() {
-  // Pass 1: 合并 OP+ASSIGN 模式
-  // 当 OP %tmp, ... 紧跟 ASSIGN %dest, %tmp，且 %tmp 只被使用一次（就是这个 ASSIGN），
-  // 合并为 OP %dest, ...，消除临时变量的 store/load 往返
-  {
-    std::unordered_map<std::string, int> useCount;
-    countUses(ir, useCount);
+  // 迭代优化直到 IR 不再变化（常量传播 → 折叠 → 合并 → DCE 可能级联触发）
+  bool changed = true;
+  int maxIterations = 8;
+  while (changed && maxIterations-- > 0) {
+    changed = false;
 
-    std::vector<IRInst> optimized;
-    std::size_t i = 0;
-    while (i < ir.size()) {
-      if (i + 1 < ir.size() && isCombinableOp(ir[i].op) && ir[i].dest.isLocalVar() &&
-          ir[i + 1].op == IROp::ASSIGN && ir[i + 1].src1.isLocalVar() &&
-          ir[i + 1].src1.name == ir[i].dest.name && useCount[ir[i].dest.name] == 1 &&
-          (ir[i + 1].dest.isLocalVar() || ir[i + 1].dest.isGlobalVar())) {
-        // 合并：运算结果直接写入 ASSIGN 的目标
-        IRInst merged = ir[i];
-        merged.dest = ir[i + 1].dest;
-        optimized.push_back(merged);
-        i += 2;
-      } else {
-        optimized.push_back(ir[i]);
-        i += 1;
+    // Pass 0: 局部常量传播 + 复制传播
+    // constMap: 跟踪 ASSIGN x, #imm，在后续使用 x 的地方替换为 #imm
+    // copyMap:  跟踪 ASSIGN x, y(局部变量)，在后续使用 x 的地方替换为 y
+    // 遇到 LABEL/CALL/BRANCH 等控制流变化时保守清除所有映射
+    {
+      std::unordered_map<std::string, int> constMap;
+      std::unordered_map<std::string, std::string> copyMap;
+
+      auto resolveOperand = [&](Operand& op) {
+        if (!op.isLocalVar()) {
+          return;
+        }
+        // 跟随复制链（最多 4 跳，避免潜在环路）
+        for (int hop = 0; hop < 4; ++hop) {
+          auto cit = constMap.find(op.name);
+          if (cit != constMap.end()) {
+            op = Operand::imm(cit->second);
+            changed = true;
+            return;
+          }
+          auto it = copyMap.find(op.name);
+          if (it == copyMap.end()) {
+            return;
+          }
+          op = Operand::localVar(it->second);
+          changed = true;
+        }
+      };
+
+      auto invalidateDest = [&](const Operand& dest) {
+        if (!dest.isLocalVar()) {
+          return;
+        }
+        constMap.erase(dest.name);
+        copyMap.erase(dest.name);
+        // 指向 dest 的复制也失效（dest 值即将改变）
+        for (auto it = copyMap.begin(); it != copyMap.end();) {
+          if (it->second == dest.name) {
+            it = copyMap.erase(it);
+          } else {
+            ++it;
+          }
+        }
+      };
+
+      for (auto& inst : ir) {
+        // 控制流边界：清除所有映射（保守处理）
+        if (inst.op == IROp::LABEL || inst.op == IROp::BRANCH || inst.op == IROp::BEQZ ||
+            inst.op == IROp::BNEZ || inst.op == IROp::CALL) {
+          constMap.clear();
+          copyMap.clear();
+          if (inst.op != IROp::CALL) {
+            continue;
+          }
+        }
+
+        // 传播：将 src 中引用常量/复制变量的地方替换
+        resolveOperand(inst.src1);
+        resolveOperand(inst.src2);
+        if (inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
+          resolveOperand(inst.dest);
+        }
+
+        // 失效 dest 的旧映射（在记录新映射之前）
+        invalidateDest(inst.dest);
+
+        // 记录新映射
+        if (inst.op == IROp::ASSIGN && inst.dest.isLocalVar()) {
+          if (inst.src1.isImm()) {
+            constMap[inst.dest.name] = inst.src1.immVal;
+          } else if (inst.src1.isLocalVar()) {
+            copyMap[inst.dest.name] = inst.src1.name;
+          }
+        }
       }
     }
-    ir = std::move(optimized);
-  }
 
-  // Pass 2: 死代码消除 — 删除结果从未被使用的局部变量运算/赋值
-  // 注意：不删除对 GLOBAL_VAR 的赋值（可能有可观察副作用）
-  {
-    std::unordered_map<std::string, int> useCount;
-    countUses(ir, useCount);
-
-    std::vector<IRInst> optimized;
-    for (const auto& inst : ir) {
-      if (isCombinableOp(inst.op) && inst.dest.isLocalVar() && useCount[inst.dest.name] == 0) {
-        continue; // 运算结果从未被使用，删除
+    // Pass 0b: 常量折叠（传播后两个操作数可能都变成立即数）
+    {
+      for (auto& inst : ir) {
+        if (!isCombinableOp(inst.op)) {
+          continue;
+        }
+        if (inst.op == IROp::NOT) {
+          if (inst.src1.isImm()) {
+            const int val = inst.src1.immVal == 0 ? 1 : 0;
+            inst.op = IROp::ASSIGN;
+            inst.src1 = Operand::imm(val);
+            inst.src2 = Operand::none();
+            changed = true;
+          }
+          continue;
+        }
+        if (inst.src1.isImm() && inst.src2.isImm()) {
+          const int a = inst.src1.immVal;
+          const int b = inst.src2.immVal;
+          int result = 0;
+          bool folded = true;
+          switch (inst.op) {
+          case IROp::ADD:
+            result = a + b;
+            break;
+          case IROp::SUB:
+            result = a - b;
+            break;
+          case IROp::MUL:
+            result = a * b;
+            break;
+          case IROp::DIV:
+            if (b == 0) {
+              folded = false;
+            } else {
+              result = a / b;
+            }
+            break;
+          case IROp::MOD:
+            if (b == 0) {
+              folded = false;
+            } else {
+              result = a % b;
+            }
+            break;
+          case IROp::LT:
+            result = (a < b) ? 1 : 0;
+            break;
+          case IROp::GT:
+            result = (a > b) ? 1 : 0;
+            break;
+          case IROp::LE:
+            result = (a <= b) ? 1 : 0;
+            break;
+          case IROp::GE:
+            result = (a >= b) ? 1 : 0;
+            break;
+          case IROp::EQ:
+            result = (a == b) ? 1 : 0;
+            break;
+          case IROp::NE:
+            result = (a != b) ? 1 : 0;
+            break;
+          default:
+            folded = false;
+            break;
+          }
+          if (folded) {
+            inst.op = IROp::ASSIGN;
+            inst.src1 = Operand::imm(result);
+            inst.src2 = Operand::none();
+            changed = true;
+          }
+        }
       }
-      if (inst.op == IROp::ASSIGN && inst.dest.isLocalVar() && useCount[inst.dest.name] == 0) {
-        continue; // 赋值结果从未被使用，删除
-      }
-      optimized.push_back(inst);
     }
-    ir = std::move(optimized);
+
+    // Pass 0c: 代数简化
+    {
+      for (auto& inst : ir) {
+        if (!isCombinableOp(inst.op) || inst.op == IROp::NOT) {
+          continue;
+        }
+        // x + 0 = x, 0 + x = x
+        if (inst.op == IROp::ADD) {
+          if (inst.src2.isImm() && inst.src2.immVal == 0) {
+            inst.op = IROp::ASSIGN;
+            inst.src2 = Operand::none();
+            changed = true;
+          } else if (inst.src1.isImm() && inst.src1.immVal == 0) {
+            inst.op = IROp::ASSIGN;
+            inst.src1 = inst.src2;
+            inst.src2 = Operand::none();
+            changed = true;
+          }
+        }
+        // x - 0 = x
+        if (inst.op == IROp::SUB && inst.src2.isImm() && inst.src2.immVal == 0) {
+          inst.op = IROp::ASSIGN;
+          inst.src2 = Operand::none();
+          changed = true;
+        }
+        // x * 0 = 0
+        if (inst.op == IROp::MUL) {
+          if ((inst.src1.isImm() && inst.src1.immVal == 0) ||
+              (inst.src2.isImm() && inst.src2.immVal == 0)) {
+            inst.op = IROp::ASSIGN;
+            inst.src1 = Operand::imm(0);
+            inst.src2 = Operand::none();
+            changed = true;
+          } else if (inst.src2.isImm() && inst.src2.immVal == 1) {
+            inst.op = IROp::ASSIGN;
+            inst.src2 = Operand::none();
+            changed = true;
+          } else if (inst.src1.isImm() && inst.src1.immVal == 1) {
+            inst.op = IROp::ASSIGN;
+            inst.src1 = inst.src2;
+            inst.src2 = Operand::none();
+            changed = true;
+          }
+        }
+        // x / 1 = x
+        if (inst.op == IROp::DIV && inst.src2.isImm() && inst.src2.immVal == 1) {
+          inst.op = IROp::ASSIGN;
+          inst.src2 = Operand::none();
+          changed = true;
+        }
+        // x % 1 = 0
+        if (inst.op == IROp::MOD && inst.src2.isImm() && inst.src2.immVal == 1) {
+          inst.op = IROp::ASSIGN;
+          inst.src1 = Operand::imm(0);
+          inst.src2 = Operand::none();
+          changed = true;
+        }
+      }
+    }
+
+    // Pass 1: 合并 OP+ASSIGN 模式
+    {
+      std::unordered_map<std::string, int> useCount;
+      countUses(ir, useCount);
+
+      std::vector<IRInst> optimized;
+      std::size_t i = 0;
+      while (i < ir.size()) {
+        if (i + 1 < ir.size() && isCombinableOp(ir[i].op) && ir[i].dest.isLocalVar() &&
+            ir[i + 1].op == IROp::ASSIGN && ir[i + 1].src1.isLocalVar() &&
+            ir[i + 1].src1.name == ir[i].dest.name && useCount[ir[i].dest.name] == 1 &&
+            (ir[i + 1].dest.isLocalVar() || ir[i + 1].dest.isGlobalVar())) {
+          IRInst merged = ir[i];
+          merged.dest = ir[i + 1].dest;
+          optimized.push_back(merged);
+          i += 2;
+          changed = true;
+        } else {
+          optimized.push_back(ir[i]);
+          i += 1;
+        }
+      }
+      if (ir.size() != optimized.size()) {
+        ir = std::move(optimized);
+      }
+    }
+
+    // Pass 2: 死代码消除
+    {
+      std::unordered_map<std::string, int> useCount;
+      countUses(ir, useCount);
+
+      std::vector<IRInst> optimized;
+      for (const auto& inst : ir) {
+        if (isCombinableOp(inst.op) && inst.dest.isLocalVar() && useCount[inst.dest.name] == 0) {
+          changed = true;
+          continue;
+        }
+        if (inst.op == IROp::ASSIGN && inst.dest.isLocalVar() && useCount[inst.dest.name] == 0) {
+          changed = true;
+          continue;
+        }
+        optimized.push_back(inst);
+      }
+      if (ir.size() != optimized.size()) {
+        ir = std::move(optimized);
+      }
+    }
   }
 }
 

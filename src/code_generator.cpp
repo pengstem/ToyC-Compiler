@@ -157,7 +157,27 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
     }
   }
 
-  // 第二遍：为前 10 个局部变量分配 s2-s11 寄存器
+  // 第二遍：统计每个局部变量的使用频率（读写次数）
+  std::unordered_map<std::string, int> useFreq;
+  for (std::size_t i = function.begin; i < function.end; ++i) {
+    const auto& inst = ir_[i];
+    if (inst.src1.isLocalVar()) {
+      useFreq[inst.src1.name]++;
+    }
+    if (inst.src2.isLocalVar()) {
+      useFreq[inst.src2.name]++;
+    }
+    if (inst.dest.isLocalVar()) {
+      useFreq[inst.dest.name]++;
+    }
+  }
+
+  // 按使用频率降序排列，优先为高频变量分配寄存器（循环计数器等）
+  std::stable_sort(
+      varOrder.begin(), varOrder.end(),
+      [&](const std::string& a, const std::string& b) { return useFreq[a] > useFreq[b]; });
+
+  // 为前 10 个高频局部变量分配 s2-s11 寄存器
   for (const auto& varName : varOrder) {
     if (nextReg <= 11) {
       frame.regAlloc[varName] = nextReg++;
@@ -210,29 +230,49 @@ void CodeGenerator::generateInstruction(const IRInst& inst, std::ostream& out) {
       if (inst.src1.type == OperandType::PARAM) {
         if (currentParamIndex_ < 8) {
           const std::string reg = "a" + std::to_string(currentParamIndex_);
-          emit(out, "mv", "t0, " + reg);
-          storeOperand("t0", inst.dest, out);
+          // 若 dest 在寄存器中，直接 mv 到该寄存器，避免 t0 中转
+          auto it = frame_.regAlloc.find(inst.dest.name);
+          if (it != frame_.regAlloc.end()) {
+            std::string destReg = "s" + std::to_string(it->second);
+            if (destReg != reg) {
+              emit(out, "mv", destReg + ", " + reg);
+            }
+          } else {
+            emit(out, "mv", "t0, " + reg);
+            storeOperand("t0", inst.dest, out);
+          }
         } else {
-          // 溢出参数从调用者栈帧读取（位于 s0 正偏移处）
           const int stackOffset = (currentParamIndex_ - 8) * kWordBytes;
-          emit(out, "lw", "t0, " + std::to_string(stackOffset) + "(s0)");
-          storeOperand("t0", inst.dest, out);
+          auto it = frame_.regAlloc.find(inst.dest.name);
+          if (it != frame_.regAlloc.end()) {
+            std::string destReg = "s" + std::to_string(it->second);
+            emit(out, "lw", destReg + ", " + std::to_string(stackOffset) + "(s0)");
+          } else {
+            emit(out, "lw", "t0, " + std::to_string(stackOffset) + "(s0)");
+            storeOperand("t0", inst.dest, out);
+          }
         }
         currentParamIndex_ += 1;
       } else if (inst.src1.type == OperandType::IMM) {
-        loadOperand(inst.src1, "t0", out);
-        storeOperand("t0", inst.dest, out);
+        loadOperand(inst.src1, destRegOrT0(inst.dest), out);
+        if (!isDestInReg(inst.dest)) {
+          storeOperand("t0", inst.dest, out);
+        }
       } else if (!inst.src1.isNone()) {
-        loadOperand(inst.src1, "t0", out);
-        storeOperand("t0", inst.dest, out);
+        loadOperand(inst.src1, destRegOrT0(inst.dest), out);
+        if (!isDestInReg(inst.dest)) {
+          storeOperand("t0", inst.dest, out);
+        }
       }
     }
     break;
   }
   case IROp::ASSIGN: {
     if (inst.dest.type == OperandType::LOCAL_VAR || inst.dest.type == OperandType::GLOBAL_VAR) {
-      loadOperand(inst.src1, "t0", out);
-      storeOperand("t0", inst.dest, out);
+      loadOperand(inst.src1, destRegOrT0(inst.dest), out);
+      if (!isDestInReg(inst.dest)) {
+        storeOperand("t0", inst.dest, out);
+      }
     }
     break;
   }
@@ -289,25 +329,48 @@ void CodeGenerator::generateInstruction(const IRInst& inst, std::ostream& out) {
   case IROp::BRANCH:
     out << "    j " << asmLabel(inst.dest.name) << "\n";
     break;
-  case IROp::BEQZ:
+  case IROp::BEQZ: {
+    // 若条件变量已在寄存器中，直接使用该寄存器，省去 mv
+    if (inst.src1.isLocalVar()) {
+      auto it = frame_.regAlloc.find(inst.src1.name);
+      if (it != frame_.regAlloc.end()) {
+        std::string reg = "s" + std::to_string(it->second);
+        out << "    beqz " << reg << ", " << asmLabel(inst.dest.name) << "\n";
+        break;
+      }
+    }
     loadOperand(inst.src1, "t0", out);
     out << "    beqz t0, " << asmLabel(inst.dest.name) << "\n";
     break;
-  case IROp::BNEZ:
+  }
+  case IROp::BNEZ: {
+    if (inst.src1.isLocalVar()) {
+      auto it = frame_.regAlloc.find(inst.src1.name);
+      if (it != frame_.regAlloc.end()) {
+        std::string reg = "s" + std::to_string(it->second);
+        out << "    bnez " << reg << ", " << asmLabel(inst.dest.name) << "\n";
+        break;
+      }
+    }
     loadOperand(inst.src1, "t0", out);
     out << "    bnez t0, " << asmLabel(inst.dest.name) << "\n";
     break;
+  }
   case IROp::LOAD: {
     if (inst.dest.type == OperandType::LOCAL_VAR || inst.dest.type == OperandType::GLOBAL_VAR) {
-      loadOperand(inst.src1, "t0", out);
-      storeOperand("t0", inst.dest, out);
+      loadOperand(inst.src1, destRegOrT0(inst.dest), out);
+      if (!isDestInReg(inst.dest)) {
+        storeOperand("t0", inst.dest, out);
+      }
     }
     break;
   }
   case IROp::STORE: {
     if (inst.dest.type == OperandType::LOCAL_VAR || inst.dest.type == OperandType::GLOBAL_VAR) {
-      loadOperand(inst.src1, "t0", out);
-      storeOperand("t0", inst.dest, out);
+      loadOperand(inst.src1, destRegOrT0(inst.dest), out);
+      if (!isDestInReg(inst.dest)) {
+        storeOperand("t0", inst.dest, out);
+      }
     }
     break;
   }
@@ -456,9 +519,32 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
       break;
     case IROp::MUL:
       if (imm > 0 && (imm & (imm - 1)) == 0) {
+        // 2 的幂：单条 slli
         emit(out, "slli",
              destReg + ", " + destReg + ", " +
                  std::to_string(__builtin_ctz(static_cast<unsigned>(imm))));
+      } else if (imm == 3) {
+        emit(out, "slli", "t1, " + destReg + ", 1");
+        emit(out, "add", destReg + ", t1, " + destReg);
+      } else if (imm == 5) {
+        emit(out, "slli", "t1, " + destReg + ", 2");
+        emit(out, "add", destReg + ", t1, " + destReg);
+      } else if (imm == 7) {
+        emit(out, "slli", "t1, " + destReg + ", 3");
+        emit(out, "sub", destReg + ", t1, " + destReg);
+      } else if (imm == 9) {
+        emit(out, "slli", "t1, " + destReg + ", 3");
+        emit(out, "add", destReg + ", t1, " + destReg);
+      } else if (imm == 15) {
+        emit(out, "slli", "t1, " + destReg + ", 4");
+        emit(out, "sub", destReg + ", t1, " + destReg);
+      } else if (imm == -1) {
+        emit(out, "sub", destReg + ", x0, " + destReg);
+      } else if (imm < 0 && (-imm & (-imm - 1)) == 0) {
+        // 负的 2 的幂：x * (-2^n) = -(x << n)
+        const int shift = __builtin_ctz(static_cast<unsigned>(-imm));
+        emit(out, "slli", destReg + ", " + destReg + ", " + std::to_string(shift));
+        emit(out, "sub", destReg + ", x0, " + destReg);
       } else {
         emit(out, "li", "t1, " + std::to_string(imm));
         emit(out, "mul", destReg + ", " + destReg + ", t1");
@@ -598,6 +684,23 @@ void CodeGenerator::emitCall(const IRInst& inst, std::ostream& out) {
   } else {
     emit(out, "call", inst.src1.name);
   }
+}
+
+std::string CodeGenerator::destRegOrT0(const Operand& dest) const {
+  if (dest.isLocalVar()) {
+    auto it = frame_.regAlloc.find(dest.name);
+    if (it != frame_.regAlloc.end()) {
+      return "s" + std::to_string(it->second);
+    }
+  }
+  return "t0";
+}
+
+bool CodeGenerator::isDestInReg(const Operand& dest) const {
+  if (!dest.isLocalVar()) {
+    return false;
+  }
+  return frame_.regAlloc.find(dest.name) != frame_.regAlloc.end();
 }
 
 std::string CodeGenerator::asmLabel(const std::string& label) const {
