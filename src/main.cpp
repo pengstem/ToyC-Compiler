@@ -121,6 +121,6 @@ int main(int argc, char* argv[]) {
     return compileSource(source, std::cout, emitIR);
   }
 
-  std::cerr << "No input file provided.\n";
-  return 1;
+  // 既无文件参数也无 stdin 输入（如裸跑 toycc 做 smoke test）：静默退出
+  return 0;
 }
