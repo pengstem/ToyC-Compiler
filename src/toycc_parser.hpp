@@ -32,7 +32,7 @@
 
 
 /**
- ** \file src/toycc_parser.hpp
+ ** \file toycc_parser.hpp
  ** Define the yy::parser class.
  */
 
@@ -42,10 +42,10 @@
 // especially those whose name start with YY_ or yy_.  They are
 // private implementation details that can be changed or removed.
 
-#ifndef YY_YY_SRC_TOYCC_PARSER_HPP_INCLUDED
-# define YY_YY_SRC_TOYCC_PARSER_HPP_INCLUDED
+#ifndef YY_YY_TOYCC_PARSER_HPP_INCLUDED
+# define YY_YY_TOYCC_PARSER_HPP_INCLUDED
 // "%code requires" blocks.
-#line 13 "src/toycc_parser.yy"
+#line 13 "toycc_parser.yy"
 
 #include <memory>
 #include <string>
@@ -67,7 +67,7 @@ namespace yy {
 class parser;
 }
 
-#line 71 "src/toycc_parser.hpp"
+#line 71 "toycc_parser.hpp"
 
 # include <cassert>
 # include <cstdlib> // std::abort
@@ -207,7 +207,7 @@ class parser;
 #endif
 
 namespace yy {
-#line 211 "src/toycc_parser.hpp"
+#line 211 "toycc_parser.hpp"
 
 
 
@@ -429,14 +429,11 @@ namespace yy {
       // INT_LITERAL
       char dummy1[sizeof (int)];
 
-      // global_decl
-      char dummy2[sizeof (std::shared_ptr<toycc::ASTNode>)];
-
       // compound_stmt
-      char dummy3[sizeof (std::shared_ptr<toycc::Block>)];
+      char dummy2[sizeof (std::shared_ptr<toycc::Block>)];
 
-      // decl
-      char dummy4[sizeof (std::shared_ptr<toycc::Decl>)];
+      // init_declarator
+      char dummy3[sizeof (std::shared_ptr<toycc::Decl>)];
 
       // opt_init
       // opt_expr
@@ -450,13 +447,13 @@ namespace yy {
       // multiplicative_expr
       // unary_expr
       // primary_expr
-      char dummy5[sizeof (std::shared_ptr<toycc::Expr>)];
+      char dummy4[sizeof (std::shared_ptr<toycc::Expr>)];
 
       // func_def
-      char dummy6[sizeof (std::shared_ptr<toycc::FuncDef>)];
+      char dummy5[sizeof (std::shared_ptr<toycc::FuncDef>)];
 
       // param
-      char dummy7[sizeof (std::shared_ptr<toycc::FuncParam>)];
+      char dummy6[sizeof (std::shared_ptr<toycc::FuncParam>)];
 
       // stmt
       // decl_stmt
@@ -466,13 +463,18 @@ namespace yy {
       // return_stmt
       // break_stmt
       // continue_stmt
-      char dummy8[sizeof (std::shared_ptr<toycc::Stmt>)];
+      char dummy7[sizeof (std::shared_ptr<toycc::Stmt>)];
 
       // IDENT
-      char dummy9[sizeof (std::string)];
+      char dummy8[sizeof (std::string)];
 
       // global_decl_list
-      char dummy10[sizeof (std::vector<std::shared_ptr<toycc::ASTNode>>)];
+      // global_decl
+      char dummy9[sizeof (std::vector<std::shared_ptr<toycc::ASTNode>>)];
+
+      // decl
+      // init_declarator_list
+      char dummy10[sizeof (std::vector<std::shared_ptr<toycc::Decl>>)];
 
       // opt_arg_list
       // arg_list
@@ -632,30 +634,32 @@ namespace yy {
         S_param = 44,                            // param
         S_decl_specifier = 45,                   // decl_specifier
         S_decl = 46,                             // decl
-        S_opt_init = 47,                         // opt_init
-        S_compound_stmt = 48,                    // compound_stmt
-        S_stmt_list = 49,                        // stmt_list
-        S_stmt = 50,                             // stmt
-        S_decl_stmt = 51,                        // decl_stmt
-        S_expr_stmt = 52,                        // expr_stmt
-        S_if_stmt = 53,                          // if_stmt
-        S_while_stmt = 54,                       // while_stmt
-        S_return_stmt = 55,                      // return_stmt
-        S_break_stmt = 56,                       // break_stmt
-        S_continue_stmt = 57,                    // continue_stmt
-        S_opt_expr = 58,                         // opt_expr
-        S_expr = 59,                             // expr
-        S_assign_expr = 60,                      // assign_expr
-        S_logical_or_expr = 61,                  // logical_or_expr
-        S_logical_and_expr = 62,                 // logical_and_expr
-        S_equality_expr = 63,                    // equality_expr
-        S_relational_expr = 64,                  // relational_expr
-        S_additive_expr = 65,                    // additive_expr
-        S_multiplicative_expr = 66,              // multiplicative_expr
-        S_unary_expr = 67,                       // unary_expr
-        S_primary_expr = 68,                     // primary_expr
-        S_opt_arg_list = 69,                     // opt_arg_list
-        S_arg_list = 70                          // arg_list
+        S_init_declarator_list = 47,             // init_declarator_list
+        S_init_declarator = 48,                  // init_declarator
+        S_opt_init = 49,                         // opt_init
+        S_compound_stmt = 50,                    // compound_stmt
+        S_stmt_list = 51,                        // stmt_list
+        S_stmt = 52,                             // stmt
+        S_decl_stmt = 53,                        // decl_stmt
+        S_expr_stmt = 54,                        // expr_stmt
+        S_if_stmt = 55,                          // if_stmt
+        S_while_stmt = 56,                       // while_stmt
+        S_return_stmt = 57,                      // return_stmt
+        S_break_stmt = 58,                       // break_stmt
+        S_continue_stmt = 59,                    // continue_stmt
+        S_opt_expr = 60,                         // opt_expr
+        S_expr = 61,                             // expr
+        S_assign_expr = 62,                      // assign_expr
+        S_logical_or_expr = 63,                  // logical_or_expr
+        S_logical_and_expr = 64,                 // logical_and_expr
+        S_equality_expr = 65,                    // equality_expr
+        S_relational_expr = 66,                  // relational_expr
+        S_additive_expr = 67,                    // additive_expr
+        S_multiplicative_expr = 68,              // multiplicative_expr
+        S_unary_expr = 69,                       // unary_expr
+        S_primary_expr = 70,                     // primary_expr
+        S_opt_arg_list = 71,                     // opt_arg_list
+        S_arg_list = 72                          // arg_list
       };
     };
 
@@ -694,15 +698,11 @@ namespace yy {
         value.move< int > (std::move (that.value));
         break;
 
-      case symbol_kind::S_global_decl: // global_decl
-        value.move< std::shared_ptr<toycc::ASTNode> > (std::move (that.value));
-        break;
-
       case symbol_kind::S_compound_stmt: // compound_stmt
         value.move< std::shared_ptr<toycc::Block> > (std::move (that.value));
         break;
 
-      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator: // init_declarator
         value.move< std::shared_ptr<toycc::Decl> > (std::move (that.value));
         break;
 
@@ -745,7 +745,13 @@ namespace yy {
         break;
 
       case symbol_kind::S_global_decl_list: // global_decl_list
+      case symbol_kind::S_global_decl: // global_decl
         value.move< std::vector<std::shared_ptr<toycc::ASTNode>> > (std::move (that.value));
+        break;
+
+      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator_list: // init_declarator_list
+        value.move< std::vector<std::shared_ptr<toycc::Decl>> > (std::move (that.value));
         break;
 
       case symbol_kind::S_opt_arg_list: // opt_arg_list
@@ -794,18 +800,6 @@ namespace yy {
       {}
 #else
       basic_symbol (typename Base::kind_type t, const int& v)
-        : Base (t)
-        , value (v)
-      {}
-#endif
-
-#if 201103L <= YY_CPLUSPLUS
-      basic_symbol (typename Base::kind_type t, std::shared_ptr<toycc::ASTNode>&& v)
-        : Base (t)
-        , value (std::move (v))
-      {}
-#else
-      basic_symbol (typename Base::kind_type t, const std::shared_ptr<toycc::ASTNode>& v)
         : Base (t)
         , value (v)
       {}
@@ -908,6 +902,18 @@ namespace yy {
 #endif
 
 #if 201103L <= YY_CPLUSPLUS
+      basic_symbol (typename Base::kind_type t, std::vector<std::shared_ptr<toycc::Decl>>&& v)
+        : Base (t)
+        , value (std::move (v))
+      {}
+#else
+      basic_symbol (typename Base::kind_type t, const std::vector<std::shared_ptr<toycc::Decl>>& v)
+        : Base (t)
+        , value (v)
+      {}
+#endif
+
+#if 201103L <= YY_CPLUSPLUS
       basic_symbol (typename Base::kind_type t, std::vector<std::shared_ptr<toycc::Expr>>&& v)
         : Base (t)
         , value (std::move (v))
@@ -983,15 +989,11 @@ switch (yykind)
         value.template destroy< int > ();
         break;
 
-      case symbol_kind::S_global_decl: // global_decl
-        value.template destroy< std::shared_ptr<toycc::ASTNode> > ();
-        break;
-
       case symbol_kind::S_compound_stmt: // compound_stmt
         value.template destroy< std::shared_ptr<toycc::Block> > ();
         break;
 
-      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator: // init_declarator
         value.template destroy< std::shared_ptr<toycc::Decl> > ();
         break;
 
@@ -1034,7 +1036,13 @@ switch (yykind)
         break;
 
       case symbol_kind::S_global_decl_list: // global_decl_list
+      case symbol_kind::S_global_decl: // global_decl
         value.template destroy< std::vector<std::shared_ptr<toycc::ASTNode>> > ();
+        break;
+
+      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator_list: // init_declarator_list
+        value.template destroy< std::vector<std::shared_ptr<toycc::Decl>> > ();
         break;
 
       case symbol_kind::S_opt_arg_list: // opt_arg_list
@@ -2103,8 +2111,8 @@ switch (yykind)
     /// Constants.
     enum
     {
-      yylast_ = 126,     ///< Last index in yytable_.
-      yynnts_ = 34,  ///< Number of nonterminal symbols.
+      yylast_ = 125,     ///< Last index in yytable_.
+      yynnts_ = 36,  ///< Number of nonterminal symbols.
       yyfinal_ = 3 ///< Termination state number.
     };
 
@@ -2178,15 +2186,11 @@ switch (yykind)
         value.copy< int > (YY_MOVE (that.value));
         break;
 
-      case symbol_kind::S_global_decl: // global_decl
-        value.copy< std::shared_ptr<toycc::ASTNode> > (YY_MOVE (that.value));
-        break;
-
       case symbol_kind::S_compound_stmt: // compound_stmt
         value.copy< std::shared_ptr<toycc::Block> > (YY_MOVE (that.value));
         break;
 
-      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator: // init_declarator
         value.copy< std::shared_ptr<toycc::Decl> > (YY_MOVE (that.value));
         break;
 
@@ -2229,7 +2233,13 @@ switch (yykind)
         break;
 
       case symbol_kind::S_global_decl_list: // global_decl_list
+      case symbol_kind::S_global_decl: // global_decl
         value.copy< std::vector<std::shared_ptr<toycc::ASTNode>> > (YY_MOVE (that.value));
+        break;
+
+      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator_list: // init_declarator_list
+        value.copy< std::vector<std::shared_ptr<toycc::Decl>> > (YY_MOVE (that.value));
         break;
 
       case symbol_kind::S_opt_arg_list: // opt_arg_list
@@ -2285,15 +2295,11 @@ switch (yykind)
         value.move< int > (YY_MOVE (s.value));
         break;
 
-      case symbol_kind::S_global_decl: // global_decl
-        value.move< std::shared_ptr<toycc::ASTNode> > (YY_MOVE (s.value));
-        break;
-
       case symbol_kind::S_compound_stmt: // compound_stmt
         value.move< std::shared_ptr<toycc::Block> > (YY_MOVE (s.value));
         break;
 
-      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator: // init_declarator
         value.move< std::shared_ptr<toycc::Decl> > (YY_MOVE (s.value));
         break;
 
@@ -2336,7 +2342,13 @@ switch (yykind)
         break;
 
       case symbol_kind::S_global_decl_list: // global_decl_list
+      case symbol_kind::S_global_decl: // global_decl
         value.move< std::vector<std::shared_ptr<toycc::ASTNode>> > (YY_MOVE (s.value));
+        break;
+
+      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator_list: // init_declarator_list
+        value.move< std::vector<std::shared_ptr<toycc::Decl>> > (YY_MOVE (s.value));
         break;
 
       case symbol_kind::S_opt_arg_list: // opt_arg_list
@@ -2422,9 +2434,9 @@ switch (yykind)
 
 
 } // yy
-#line 2426 "src/toycc_parser.hpp"
+#line 2438 "toycc_parser.hpp"
 
 
 
 
-#endif // !YY_YY_SRC_TOYCC_PARSER_HPP_INCLUDED
+#endif // !YY_YY_TOYCC_PARSER_HPP_INCLUDED

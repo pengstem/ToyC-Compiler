@@ -54,8 +54,10 @@ parser::symbol_type yylex(toycc::ParserDriver& driver);
 
 %type <toycc::DeclSpec> decl_specifier
 %type <std::vector<std::shared_ptr<toycc::ASTNode>>> global_decl_list
-%type <std::shared_ptr<toycc::ASTNode>> global_decl
-%type <std::shared_ptr<toycc::Decl>> decl
+%type <std::vector<std::shared_ptr<toycc::ASTNode>>> global_decl
+%type <std::vector<std::shared_ptr<toycc::Decl>>> decl
+%type <std::shared_ptr<toycc::Decl>> init_declarator
+%type <std::vector<std::shared_ptr<toycc::Decl>>> init_declarator_list
 %type <std::shared_ptr<toycc::FuncDef>> func_def
 %type <std::shared_ptr<toycc::FuncParam>> param
 %type <std::vector<std::shared_ptr<toycc::FuncParam>>> param_list opt_param_list
@@ -82,14 +84,22 @@ compilation_unit
 global_decl_list
   : %empty { $$ = {}; }
   | global_decl_list global_decl {
-      $1.push_back(std::move($2));
+      for (auto& n : $2) {
+        $1.push_back(std::move(n));
+      }
       $$ = std::move($1);
     }
   ;
 
 global_decl
-  : func_def { $$ = std::move($1); }
-  | decl { $$ = std::move($1); }
+  : func_def { $$ = {}; $$.push_back(std::move($1)); }
+  | decl {
+      std::vector<std::shared_ptr<toycc::ASTNode>> nodes;
+      for (auto& d : $1) {
+        nodes.push_back(std::move(d));
+      }
+      $$ = std::move(nodes);
+    }
   ;
 
 func_def
@@ -132,12 +142,28 @@ decl_specifier
   ;
 
 decl
-  : decl_specifier IDENT opt_init SEMI {
+  : decl_specifier init_declarator_list SEMI {
+      for (auto& d : $2) {
+        d->isConst = $1.isConst;
+        d->varType = $1.varType;
+      }
+      $$ = std::move($2);
+    }
+  ;
+
+init_declarator_list
+  : init_declarator { $$ = {}; $$.push_back(std::move($1)); }
+  | init_declarator_list COMMA init_declarator {
+      $1.push_back(std::move($3));
+      $$ = std::move($1);
+    }
+  ;
+
+init_declarator
+  : IDENT opt_init {
       auto decl = std::make_shared<toycc::Decl>();
-      decl->isConst = $1.isConst;
-      decl->varType = $1.varType;
-      decl->name = std::move($2);
-      decl->initExpr = std::move($3);
+      decl->name = std::move($1);
+      decl->initExpr = std::move($2);
       driver.setLocation(decl.get());
       $$ = std::move(decl);
     }
@@ -176,7 +202,7 @@ stmt
 decl_stmt
   : decl {
       auto stmt = std::make_shared<toycc::DeclStmt>();
-      stmt->decl = std::move($1);
+      stmt->decls = std::move($1);
       driver.setLocation(stmt.get());
       $$ = std::move(stmt);
     }

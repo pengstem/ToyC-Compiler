@@ -110,10 +110,10 @@ class Decl;
 
 class DeclStmt : public Stmt {
 public:
-  std::shared_ptr<Decl> decl;
+  std::vector<std::shared_ptr<Decl>> decls; // 支持 int a = 1, b = 2; 多变量声明
   DeclStmt() = default;
-  DeclStmt(std::shared_ptr<Decl> d)
-      : decl(std::move(d)) {}
+  explicit DeclStmt(std::vector<std::shared_ptr<Decl>> d)
+      : decls(std::move(d)) {}
 };
 
 class IfStmt : public Stmt {

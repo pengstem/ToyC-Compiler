@@ -165,8 +165,8 @@ void IRGenerator::genStmt(Stmt* stmt) {
   }
 
   if (auto* declStmt = dynamic_cast<DeclStmt*>(stmt)) {
-    if (declStmt->decl) {
-      genDecl(declStmt->decl.get());
+    for (const auto& decl : declStmt->decls) {
+      genDecl(decl.get());
     }
     return;
   }

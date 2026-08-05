@@ -42,7 +42,7 @@
 
 
 // Unqualified %code blocks.
-#line 35 "src/toycc_parser.yy"
+#line 35 "toycc_parser.yy"
 
 #include <iostream>
 #include <stdexcept>
@@ -54,7 +54,7 @@ namespace yy {
 parser::symbol_type yylex(toycc::ParserDriver& driver);
 }
 
-#line 58 "src/toycc_parser.cpp"
+#line 58 "toycc_parser.cpp"
 
 
 #ifndef YY_
@@ -127,7 +127,7 @@ parser::symbol_type yylex(toycc::ParserDriver& driver);
 #define YYRECOVERING()  (!!yyerrstatus_)
 
 namespace yy {
-#line 131 "src/toycc_parser.cpp"
+#line 131 "toycc_parser.cpp"
 
   /// Build a parser object.
   parser::parser (toycc::ParserDriver& driver_yyarg)
@@ -199,15 +199,11 @@ namespace yy {
         value.YY_MOVE_OR_COPY< int > (YY_MOVE (that.value));
         break;
 
-      case symbol_kind::S_global_decl: // global_decl
-        value.YY_MOVE_OR_COPY< std::shared_ptr<toycc::ASTNode> > (YY_MOVE (that.value));
-        break;
-
       case symbol_kind::S_compound_stmt: // compound_stmt
         value.YY_MOVE_OR_COPY< std::shared_ptr<toycc::Block> > (YY_MOVE (that.value));
         break;
 
-      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator: // init_declarator
         value.YY_MOVE_OR_COPY< std::shared_ptr<toycc::Decl> > (YY_MOVE (that.value));
         break;
 
@@ -250,7 +246,13 @@ namespace yy {
         break;
 
       case symbol_kind::S_global_decl_list: // global_decl_list
+      case symbol_kind::S_global_decl: // global_decl
         value.YY_MOVE_OR_COPY< std::vector<std::shared_ptr<toycc::ASTNode>> > (YY_MOVE (that.value));
+        break;
+
+      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator_list: // init_declarator_list
+        value.YY_MOVE_OR_COPY< std::vector<std::shared_ptr<toycc::Decl>> > (YY_MOVE (that.value));
         break;
 
       case symbol_kind::S_opt_arg_list: // opt_arg_list
@@ -290,15 +292,11 @@ namespace yy {
         value.move< int > (YY_MOVE (that.value));
         break;
 
-      case symbol_kind::S_global_decl: // global_decl
-        value.move< std::shared_ptr<toycc::ASTNode> > (YY_MOVE (that.value));
-        break;
-
       case symbol_kind::S_compound_stmt: // compound_stmt
         value.move< std::shared_ptr<toycc::Block> > (YY_MOVE (that.value));
         break;
 
-      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator: // init_declarator
         value.move< std::shared_ptr<toycc::Decl> > (YY_MOVE (that.value));
         break;
 
@@ -341,7 +339,13 @@ namespace yy {
         break;
 
       case symbol_kind::S_global_decl_list: // global_decl_list
+      case symbol_kind::S_global_decl: // global_decl
         value.move< std::vector<std::shared_ptr<toycc::ASTNode>> > (YY_MOVE (that.value));
+        break;
+
+      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator_list: // init_declarator_list
+        value.move< std::vector<std::shared_ptr<toycc::Decl>> > (YY_MOVE (that.value));
         break;
 
       case symbol_kind::S_opt_arg_list: // opt_arg_list
@@ -381,15 +385,11 @@ namespace yy {
         value.copy< int > (that.value);
         break;
 
-      case symbol_kind::S_global_decl: // global_decl
-        value.copy< std::shared_ptr<toycc::ASTNode> > (that.value);
-        break;
-
       case symbol_kind::S_compound_stmt: // compound_stmt
         value.copy< std::shared_ptr<toycc::Block> > (that.value);
         break;
 
-      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator: // init_declarator
         value.copy< std::shared_ptr<toycc::Decl> > (that.value);
         break;
 
@@ -432,7 +432,13 @@ namespace yy {
         break;
 
       case symbol_kind::S_global_decl_list: // global_decl_list
+      case symbol_kind::S_global_decl: // global_decl
         value.copy< std::vector<std::shared_ptr<toycc::ASTNode>> > (that.value);
+        break;
+
+      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator_list: // init_declarator_list
+        value.copy< std::vector<std::shared_ptr<toycc::Decl>> > (that.value);
         break;
 
       case symbol_kind::S_opt_arg_list: // opt_arg_list
@@ -470,15 +476,11 @@ namespace yy {
         value.move< int > (that.value);
         break;
 
-      case symbol_kind::S_global_decl: // global_decl
-        value.move< std::shared_ptr<toycc::ASTNode> > (that.value);
-        break;
-
       case symbol_kind::S_compound_stmt: // compound_stmt
         value.move< std::shared_ptr<toycc::Block> > (that.value);
         break;
 
-      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator: // init_declarator
         value.move< std::shared_ptr<toycc::Decl> > (that.value);
         break;
 
@@ -521,7 +523,13 @@ namespace yy {
         break;
 
       case symbol_kind::S_global_decl_list: // global_decl_list
+      case symbol_kind::S_global_decl: // global_decl
         value.move< std::vector<std::shared_ptr<toycc::ASTNode>> > (that.value);
+        break;
+
+      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator_list: // init_declarator_list
+        value.move< std::vector<std::shared_ptr<toycc::Decl>> > (that.value);
         break;
 
       case symbol_kind::S_opt_arg_list: // opt_arg_list
@@ -800,15 +808,11 @@ namespace yy {
         yylhs.value.emplace< int > ();
         break;
 
-      case symbol_kind::S_global_decl: // global_decl
-        yylhs.value.emplace< std::shared_ptr<toycc::ASTNode> > ();
-        break;
-
       case symbol_kind::S_compound_stmt: // compound_stmt
         yylhs.value.emplace< std::shared_ptr<toycc::Block> > ();
         break;
 
-      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator: // init_declarator
         yylhs.value.emplace< std::shared_ptr<toycc::Decl> > ();
         break;
 
@@ -851,7 +855,13 @@ namespace yy {
         break;
 
       case symbol_kind::S_global_decl_list: // global_decl_list
+      case symbol_kind::S_global_decl: // global_decl
         yylhs.value.emplace< std::vector<std::shared_ptr<toycc::ASTNode>> > ();
+        break;
+
+      case symbol_kind::S_decl: // decl
+      case symbol_kind::S_init_declarator_list: // init_declarator_list
+        yylhs.value.emplace< std::vector<std::shared_ptr<toycc::Decl>> > ();
         break;
 
       case symbol_kind::S_opt_arg_list: // opt_arg_list
@@ -887,45 +897,53 @@ namespace yy {
           switch (yyn)
             {
   case 2: // compilation_unit: global_decl_list
-#line 74 "src/toycc_parser.yy"
+#line 76 "toycc_parser.yy"
                      {
       auto unit = std::make_shared<toycc::CompUnit>();
       unit->globalDecls = std::move(yystack_[0].value.as < std::vector<std::shared_ptr<toycc::ASTNode>> > ());
       driver.setLocation(unit.get());
       driver.setAST(std::move(unit));
     }
-#line 898 "src/toycc_parser.cpp"
+#line 908 "toycc_parser.cpp"
     break;
 
   case 3: // global_decl_list: %empty
-#line 83 "src/toycc_parser.yy"
+#line 85 "toycc_parser.yy"
            { yylhs.value.as < std::vector<std::shared_ptr<toycc::ASTNode>> > () = {}; }
-#line 904 "src/toycc_parser.cpp"
+#line 914 "toycc_parser.cpp"
     break;
 
   case 4: // global_decl_list: global_decl_list global_decl
-#line 84 "src/toycc_parser.yy"
+#line 86 "toycc_parser.yy"
                                  {
-      yystack_[1].value.as < std::vector<std::shared_ptr<toycc::ASTNode>> > ().push_back(std::move(yystack_[0].value.as < std::shared_ptr<toycc::ASTNode> > ()));
+      for (auto& n : yystack_[0].value.as < std::vector<std::shared_ptr<toycc::ASTNode>> > ()) {
+        yystack_[1].value.as < std::vector<std::shared_ptr<toycc::ASTNode>> > ().push_back(std::move(n));
+      }
       yylhs.value.as < std::vector<std::shared_ptr<toycc::ASTNode>> > () = std::move(yystack_[1].value.as < std::vector<std::shared_ptr<toycc::ASTNode>> > ());
     }
-#line 913 "src/toycc_parser.cpp"
+#line 925 "toycc_parser.cpp"
     break;
 
   case 5: // global_decl: func_def
-#line 91 "src/toycc_parser.yy"
-             { yylhs.value.as < std::shared_ptr<toycc::ASTNode> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::FuncDef> > ()); }
-#line 919 "src/toycc_parser.cpp"
+#line 95 "toycc_parser.yy"
+             { yylhs.value.as < std::vector<std::shared_ptr<toycc::ASTNode>> > () = {}; yylhs.value.as < std::vector<std::shared_ptr<toycc::ASTNode>> > ().push_back(std::move(yystack_[0].value.as < std::shared_ptr<toycc::FuncDef> > ())); }
+#line 931 "toycc_parser.cpp"
     break;
 
   case 6: // global_decl: decl
-#line 92 "src/toycc_parser.yy"
-         { yylhs.value.as < std::shared_ptr<toycc::ASTNode> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Decl> > ()); }
-#line 925 "src/toycc_parser.cpp"
+#line 96 "toycc_parser.yy"
+         {
+      std::vector<std::shared_ptr<toycc::ASTNode>> nodes;
+      for (auto& d : yystack_[0].value.as < std::vector<std::shared_ptr<toycc::Decl>> > ()) {
+        nodes.push_back(std::move(d));
+      }
+      yylhs.value.as < std::vector<std::shared_ptr<toycc::ASTNode>> > () = std::move(nodes);
+    }
+#line 943 "toycc_parser.cpp"
     break;
 
   case 7: // func_def: decl_specifier IDENT LPAREN opt_param_list RPAREN compound_stmt
-#line 96 "src/toycc_parser.yy"
+#line 106 "toycc_parser.yy"
                                                                     {
       auto func = std::make_shared<toycc::FuncDef>();
       func->retType = yystack_[5].value.as < toycc::DeclSpec > ().varType;
@@ -935,35 +953,35 @@ namespace yy {
       driver.setLocation(func.get());
       yylhs.value.as < std::shared_ptr<toycc::FuncDef> > () = std::move(func);
     }
-#line 939 "src/toycc_parser.cpp"
+#line 957 "toycc_parser.cpp"
     break;
 
   case 8: // opt_param_list: %empty
-#line 108 "src/toycc_parser.yy"
+#line 118 "toycc_parser.yy"
            { yylhs.value.as < std::vector<std::shared_ptr<toycc::FuncParam>> > () = {}; }
-#line 945 "src/toycc_parser.cpp"
+#line 963 "toycc_parser.cpp"
     break;
 
   case 9: // opt_param_list: param_list
-#line 109 "src/toycc_parser.yy"
+#line 119 "toycc_parser.yy"
                { yylhs.value.as < std::vector<std::shared_ptr<toycc::FuncParam>> > () = std::move(yystack_[0].value.as < std::vector<std::shared_ptr<toycc::FuncParam>> > ()); }
-#line 951 "src/toycc_parser.cpp"
+#line 969 "toycc_parser.cpp"
     break;
 
   case 10: // param_list: param
-#line 113 "src/toycc_parser.yy"
+#line 123 "toycc_parser.yy"
           { yylhs.value.as < std::vector<std::shared_ptr<toycc::FuncParam>> > () = {}; yylhs.value.as < std::vector<std::shared_ptr<toycc::FuncParam>> > ().push_back(std::move(yystack_[0].value.as < std::shared_ptr<toycc::FuncParam> > ())); }
-#line 957 "src/toycc_parser.cpp"
+#line 975 "toycc_parser.cpp"
     break;
 
   case 11: // param_list: param_list COMMA param
-#line 114 "src/toycc_parser.yy"
+#line 124 "toycc_parser.yy"
                            { yystack_[2].value.as < std::vector<std::shared_ptr<toycc::FuncParam>> > ().push_back(std::move(yystack_[0].value.as < std::shared_ptr<toycc::FuncParam> > ())); yylhs.value.as < std::vector<std::shared_ptr<toycc::FuncParam>> > () = std::move(yystack_[2].value.as < std::vector<std::shared_ptr<toycc::FuncParam>> > ()); }
-#line 963 "src/toycc_parser.cpp"
+#line 981 "toycc_parser.cpp"
     break;
 
   case 12: // param: decl_specifier IDENT
-#line 118 "src/toycc_parser.yy"
+#line 128 "toycc_parser.yy"
                          {
       auto param = std::make_shared<toycc::FuncParam>();
       param->type = yystack_[1].value.as < toycc::DeclSpec > ().varType;
@@ -971,154 +989,179 @@ namespace yy {
       driver.setLocation(param.get());
       yylhs.value.as < std::shared_ptr<toycc::FuncParam> > () = std::move(param);
     }
-#line 975 "src/toycc_parser.cpp"
+#line 993 "toycc_parser.cpp"
     break;
 
   case 13: // decl_specifier: INT
-#line 128 "src/toycc_parser.yy"
+#line 138 "toycc_parser.yy"
         { yylhs.value.as < toycc::DeclSpec > () = {.isConst = false, .varType = toycc::Type::INT}; }
-#line 981 "src/toycc_parser.cpp"
+#line 999 "toycc_parser.cpp"
     break;
 
   case 14: // decl_specifier: VOID
-#line 129 "src/toycc_parser.yy"
+#line 139 "toycc_parser.yy"
          { yylhs.value.as < toycc::DeclSpec > () = {.isConst = false, .varType = toycc::Type::VOID}; }
-#line 987 "src/toycc_parser.cpp"
+#line 1005 "toycc_parser.cpp"
     break;
 
   case 15: // decl_specifier: CONST INT
-#line 130 "src/toycc_parser.yy"
+#line 140 "toycc_parser.yy"
               { yylhs.value.as < toycc::DeclSpec > () = {.isConst = true, .varType = toycc::Type::INT}; }
-#line 993 "src/toycc_parser.cpp"
+#line 1011 "toycc_parser.cpp"
     break;
 
   case 16: // decl_specifier: CONST VOID
-#line 131 "src/toycc_parser.yy"
+#line 141 "toycc_parser.yy"
                { yylhs.value.as < toycc::DeclSpec > () = {.isConst = true, .varType = toycc::Type::VOID}; }
-#line 999 "src/toycc_parser.cpp"
+#line 1017 "toycc_parser.cpp"
     break;
 
-  case 17: // decl: decl_specifier IDENT opt_init SEMI
-#line 135 "src/toycc_parser.yy"
-                                       {
+  case 17: // decl: decl_specifier init_declarator_list SEMI
+#line 145 "toycc_parser.yy"
+                                             {
+      for (auto& d : yystack_[1].value.as < std::vector<std::shared_ptr<toycc::Decl>> > ()) {
+        d->isConst = yystack_[2].value.as < toycc::DeclSpec > ().isConst;
+        d->varType = yystack_[2].value.as < toycc::DeclSpec > ().varType;
+      }
+      yylhs.value.as < std::vector<std::shared_ptr<toycc::Decl>> > () = std::move(yystack_[1].value.as < std::vector<std::shared_ptr<toycc::Decl>> > ());
+    }
+#line 1029 "toycc_parser.cpp"
+    break;
+
+  case 18: // init_declarator_list: init_declarator
+#line 155 "toycc_parser.yy"
+                    { yylhs.value.as < std::vector<std::shared_ptr<toycc::Decl>> > () = {}; yylhs.value.as < std::vector<std::shared_ptr<toycc::Decl>> > ().push_back(std::move(yystack_[0].value.as < std::shared_ptr<toycc::Decl> > ())); }
+#line 1035 "toycc_parser.cpp"
+    break;
+
+  case 19: // init_declarator_list: init_declarator_list COMMA init_declarator
+#line 156 "toycc_parser.yy"
+                                               {
+      yystack_[2].value.as < std::vector<std::shared_ptr<toycc::Decl>> > ().push_back(std::move(yystack_[0].value.as < std::shared_ptr<toycc::Decl> > ()));
+      yylhs.value.as < std::vector<std::shared_ptr<toycc::Decl>> > () = std::move(yystack_[2].value.as < std::vector<std::shared_ptr<toycc::Decl>> > ());
+    }
+#line 1044 "toycc_parser.cpp"
+    break;
+
+  case 20: // init_declarator: IDENT opt_init
+#line 163 "toycc_parser.yy"
+                   {
       auto decl = std::make_shared<toycc::Decl>();
-      decl->isConst = yystack_[3].value.as < toycc::DeclSpec > ().isConst;
-      decl->varType = yystack_[3].value.as < toycc::DeclSpec > ().varType;
-      decl->name = std::move(yystack_[2].value.as < std::string > ());
-      decl->initExpr = std::move(yystack_[1].value.as < std::shared_ptr<toycc::Expr> > ());
+      decl->name = std::move(yystack_[1].value.as < std::string > ());
+      decl->initExpr = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ());
       driver.setLocation(decl.get());
       yylhs.value.as < std::shared_ptr<toycc::Decl> > () = std::move(decl);
     }
-#line 1013 "src/toycc_parser.cpp"
+#line 1056 "toycc_parser.cpp"
     break;
 
-  case 18: // opt_init: %empty
-#line 147 "src/toycc_parser.yy"
+  case 21: // opt_init: %empty
+#line 173 "toycc_parser.yy"
            { yylhs.value.as < std::shared_ptr<toycc::Expr> > () = nullptr; }
-#line 1019 "src/toycc_parser.cpp"
+#line 1062 "toycc_parser.cpp"
     break;
 
-  case 19: // opt_init: ASSIGN expr
-#line 148 "src/toycc_parser.yy"
+  case 22: // opt_init: ASSIGN expr
+#line 174 "toycc_parser.yy"
                 { yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()); }
-#line 1025 "src/toycc_parser.cpp"
+#line 1068 "toycc_parser.cpp"
     break;
 
-  case 20: // compound_stmt: LBRACE stmt_list RBRACE
-#line 152 "src/toycc_parser.yy"
+  case 23: // compound_stmt: LBRACE stmt_list RBRACE
+#line 178 "toycc_parser.yy"
                             {
       auto block = std::make_shared<toycc::Block>();
       block->stmts = std::move(yystack_[1].value.as < std::vector<std::shared_ptr<toycc::Stmt>> > ());
       driver.setLocation(block.get());
       yylhs.value.as < std::shared_ptr<toycc::Block> > () = std::move(block);
     }
-#line 1036 "src/toycc_parser.cpp"
+#line 1079 "toycc_parser.cpp"
     break;
 
-  case 21: // stmt_list: %empty
-#line 161 "src/toycc_parser.yy"
+  case 24: // stmt_list: %empty
+#line 187 "toycc_parser.yy"
            { yylhs.value.as < std::vector<std::shared_ptr<toycc::Stmt>> > () = {}; }
-#line 1042 "src/toycc_parser.cpp"
+#line 1085 "toycc_parser.cpp"
     break;
 
-  case 22: // stmt_list: stmt_list stmt
-#line 162 "src/toycc_parser.yy"
+  case 25: // stmt_list: stmt_list stmt
+#line 188 "toycc_parser.yy"
                    { yystack_[1].value.as < std::vector<std::shared_ptr<toycc::Stmt>> > ().push_back(std::move(yystack_[0].value.as < std::shared_ptr<toycc::Stmt> > ())); yylhs.value.as < std::vector<std::shared_ptr<toycc::Stmt>> > () = std::move(yystack_[1].value.as < std::vector<std::shared_ptr<toycc::Stmt>> > ()); }
-#line 1048 "src/toycc_parser.cpp"
+#line 1091 "toycc_parser.cpp"
     break;
 
-  case 23: // stmt: compound_stmt
-#line 166 "src/toycc_parser.yy"
+  case 26: // stmt: compound_stmt
+#line 192 "toycc_parser.yy"
                   { yylhs.value.as < std::shared_ptr<toycc::Stmt> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Block> > ()); }
-#line 1054 "src/toycc_parser.cpp"
+#line 1097 "toycc_parser.cpp"
     break;
 
-  case 24: // stmt: expr_stmt
-#line 167 "src/toycc_parser.yy"
+  case 27: // stmt: expr_stmt
+#line 193 "toycc_parser.yy"
               { yylhs.value.as < std::shared_ptr<toycc::Stmt> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Stmt> > ()); }
-#line 1060 "src/toycc_parser.cpp"
+#line 1103 "toycc_parser.cpp"
     break;
 
-  case 25: // stmt: decl_stmt
-#line 168 "src/toycc_parser.yy"
+  case 28: // stmt: decl_stmt
+#line 194 "toycc_parser.yy"
               { yylhs.value.as < std::shared_ptr<toycc::Stmt> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Stmt> > ()); }
-#line 1066 "src/toycc_parser.cpp"
+#line 1109 "toycc_parser.cpp"
     break;
 
-  case 26: // stmt: if_stmt
-#line 169 "src/toycc_parser.yy"
+  case 29: // stmt: if_stmt
+#line 195 "toycc_parser.yy"
             { yylhs.value.as < std::shared_ptr<toycc::Stmt> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Stmt> > ()); }
-#line 1072 "src/toycc_parser.cpp"
+#line 1115 "toycc_parser.cpp"
     break;
 
-  case 27: // stmt: while_stmt
-#line 170 "src/toycc_parser.yy"
+  case 30: // stmt: while_stmt
+#line 196 "toycc_parser.yy"
                { yylhs.value.as < std::shared_ptr<toycc::Stmt> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Stmt> > ()); }
-#line 1078 "src/toycc_parser.cpp"
+#line 1121 "toycc_parser.cpp"
     break;
 
-  case 28: // stmt: return_stmt
-#line 171 "src/toycc_parser.yy"
+  case 31: // stmt: return_stmt
+#line 197 "toycc_parser.yy"
                 { yylhs.value.as < std::shared_ptr<toycc::Stmt> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Stmt> > ()); }
-#line 1084 "src/toycc_parser.cpp"
+#line 1127 "toycc_parser.cpp"
     break;
 
-  case 29: // stmt: break_stmt
-#line 172 "src/toycc_parser.yy"
+  case 32: // stmt: break_stmt
+#line 198 "toycc_parser.yy"
                { yylhs.value.as < std::shared_ptr<toycc::Stmt> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Stmt> > ()); }
-#line 1090 "src/toycc_parser.cpp"
+#line 1133 "toycc_parser.cpp"
     break;
 
-  case 30: // stmt: continue_stmt
-#line 173 "src/toycc_parser.yy"
+  case 33: // stmt: continue_stmt
+#line 199 "toycc_parser.yy"
                   { yylhs.value.as < std::shared_ptr<toycc::Stmt> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Stmt> > ()); }
-#line 1096 "src/toycc_parser.cpp"
+#line 1139 "toycc_parser.cpp"
     break;
 
-  case 31: // decl_stmt: decl
-#line 177 "src/toycc_parser.yy"
+  case 34: // decl_stmt: decl
+#line 203 "toycc_parser.yy"
          {
       auto stmt = std::make_shared<toycc::DeclStmt>();
-      stmt->decl = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Decl> > ());
+      stmt->decls = std::move(yystack_[0].value.as < std::vector<std::shared_ptr<toycc::Decl>> > ());
       driver.setLocation(stmt.get());
       yylhs.value.as < std::shared_ptr<toycc::Stmt> > () = std::move(stmt);
     }
-#line 1107 "src/toycc_parser.cpp"
+#line 1150 "toycc_parser.cpp"
     break;
 
-  case 32: // expr_stmt: opt_expr SEMI
-#line 186 "src/toycc_parser.yy"
+  case 35: // expr_stmt: opt_expr SEMI
+#line 212 "toycc_parser.yy"
                   {
       auto stmt = std::make_shared<toycc::ExprStmt>();
       stmt->expr = std::move(yystack_[1].value.as < std::shared_ptr<toycc::Expr> > ());
       driver.setLocation(stmt.get());
       yylhs.value.as < std::shared_ptr<toycc::Stmt> > () = std::move(stmt);
     }
-#line 1118 "src/toycc_parser.cpp"
+#line 1161 "toycc_parser.cpp"
     break;
 
-  case 33: // if_stmt: IF LPAREN expr RPAREN stmt
-#line 195 "src/toycc_parser.yy"
+  case 36: // if_stmt: IF LPAREN expr RPAREN stmt
+#line 221 "toycc_parser.yy"
                                {
       auto stmt = std::make_shared<toycc::IfStmt>();
       stmt->condition = std::move(yystack_[2].value.as < std::shared_ptr<toycc::Expr> > ());
@@ -1126,11 +1169,11 @@ namespace yy {
       driver.setLocation(stmt.get());
       yylhs.value.as < std::shared_ptr<toycc::Stmt> > () = std::move(stmt);
     }
-#line 1130 "src/toycc_parser.cpp"
+#line 1173 "toycc_parser.cpp"
     break;
 
-  case 34: // if_stmt: IF LPAREN expr RPAREN stmt ELSE stmt
-#line 202 "src/toycc_parser.yy"
+  case 37: // if_stmt: IF LPAREN expr RPAREN stmt ELSE stmt
+#line 228 "toycc_parser.yy"
                                          {
       auto stmt = std::make_shared<toycc::IfStmt>();
       stmt->condition = std::move(yystack_[4].value.as < std::shared_ptr<toycc::Expr> > ());
@@ -1139,11 +1182,11 @@ namespace yy {
       driver.setLocation(stmt.get());
       yylhs.value.as < std::shared_ptr<toycc::Stmt> > () = std::move(stmt);
     }
-#line 1143 "src/toycc_parser.cpp"
+#line 1186 "toycc_parser.cpp"
     break;
 
-  case 35: // while_stmt: WHILE LPAREN expr RPAREN stmt
-#line 213 "src/toycc_parser.yy"
+  case 38: // while_stmt: WHILE LPAREN expr RPAREN stmt
+#line 239 "toycc_parser.yy"
                                   {
       auto stmt = std::make_shared<toycc::WhileStmt>();
       stmt->condition = std::move(yystack_[2].value.as < std::shared_ptr<toycc::Expr> > ());
@@ -1151,338 +1194,338 @@ namespace yy {
       driver.setLocation(stmt.get());
       yylhs.value.as < std::shared_ptr<toycc::Stmt> > () = std::move(stmt);
     }
-#line 1155 "src/toycc_parser.cpp"
+#line 1198 "toycc_parser.cpp"
     break;
 
-  case 36: // return_stmt: RETURN opt_expr SEMI
-#line 223 "src/toycc_parser.yy"
+  case 39: // return_stmt: RETURN opt_expr SEMI
+#line 249 "toycc_parser.yy"
                          {
       auto stmt = std::make_shared<toycc::ReturnStmt>();
       stmt->value = std::move(yystack_[1].value.as < std::shared_ptr<toycc::Expr> > ());
       driver.setLocation(stmt.get());
       yylhs.value.as < std::shared_ptr<toycc::Stmt> > () = std::move(stmt);
     }
-#line 1166 "src/toycc_parser.cpp"
+#line 1209 "toycc_parser.cpp"
     break;
 
-  case 37: // break_stmt: BREAK SEMI
-#line 232 "src/toycc_parser.yy"
+  case 40: // break_stmt: BREAK SEMI
+#line 258 "toycc_parser.yy"
                {
       auto stmt = std::make_shared<toycc::BreakStmt>();
       driver.setLocation(stmt.get());
       yylhs.value.as < std::shared_ptr<toycc::Stmt> > () = std::move(stmt);
     }
-#line 1176 "src/toycc_parser.cpp"
+#line 1219 "toycc_parser.cpp"
     break;
 
-  case 38: // continue_stmt: CONTINUE SEMI
-#line 240 "src/toycc_parser.yy"
+  case 41: // continue_stmt: CONTINUE SEMI
+#line 266 "toycc_parser.yy"
                   {
       auto stmt = std::make_shared<toycc::ContinueStmt>();
       driver.setLocation(stmt.get());
       yylhs.value.as < std::shared_ptr<toycc::Stmt> > () = std::move(stmt);
     }
-#line 1186 "src/toycc_parser.cpp"
+#line 1229 "toycc_parser.cpp"
     break;
 
-  case 39: // opt_expr: %empty
-#line 248 "src/toycc_parser.yy"
+  case 42: // opt_expr: %empty
+#line 274 "toycc_parser.yy"
            { yylhs.value.as < std::shared_ptr<toycc::Expr> > () = nullptr; }
-#line 1192 "src/toycc_parser.cpp"
+#line 1235 "toycc_parser.cpp"
     break;
 
-  case 40: // opt_expr: expr
-#line 249 "src/toycc_parser.yy"
+  case 43: // opt_expr: expr
+#line 275 "toycc_parser.yy"
          { yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()); }
-#line 1198 "src/toycc_parser.cpp"
+#line 1241 "toycc_parser.cpp"
     break;
 
-  case 41: // expr: assign_expr
-#line 253 "src/toycc_parser.yy"
+  case 44: // expr: assign_expr
+#line 279 "toycc_parser.yy"
                 { yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()); }
-#line 1204 "src/toycc_parser.cpp"
+#line 1247 "toycc_parser.cpp"
     break;
 
-  case 42: // assign_expr: logical_or_expr
-#line 257 "src/toycc_parser.yy"
+  case 45: // assign_expr: logical_or_expr
+#line 283 "toycc_parser.yy"
                     { yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()); }
-#line 1210 "src/toycc_parser.cpp"
+#line 1253 "toycc_parser.cpp"
     break;
 
-  case 43: // assign_expr: unary_expr ASSIGN assign_expr
-#line 258 "src/toycc_parser.yy"
+  case 46: // assign_expr: unary_expr ASSIGN assign_expr
+#line 284 "toycc_parser.yy"
                                   {
       auto expr = std::make_shared<toycc::BinaryExpr>(toycc::BinOp::ASSIGN, std::move(yystack_[2].value.as < std::shared_ptr<toycc::Expr> > ()), std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1220 "src/toycc_parser.cpp"
+#line 1263 "toycc_parser.cpp"
     break;
 
-  case 44: // logical_or_expr: logical_and_expr
-#line 266 "src/toycc_parser.yy"
+  case 47: // logical_or_expr: logical_and_expr
+#line 292 "toycc_parser.yy"
                      { yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()); }
-#line 1226 "src/toycc_parser.cpp"
+#line 1269 "toycc_parser.cpp"
     break;
 
-  case 45: // logical_or_expr: logical_or_expr OR logical_and_expr
-#line 267 "src/toycc_parser.yy"
+  case 48: // logical_or_expr: logical_or_expr OR logical_and_expr
+#line 293 "toycc_parser.yy"
                                         {
       auto expr = std::make_shared<toycc::BinaryExpr>(toycc::BinOp::OR, std::move(yystack_[2].value.as < std::shared_ptr<toycc::Expr> > ()), std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1236 "src/toycc_parser.cpp"
+#line 1279 "toycc_parser.cpp"
     break;
 
-  case 46: // logical_and_expr: equality_expr
-#line 275 "src/toycc_parser.yy"
+  case 49: // logical_and_expr: equality_expr
+#line 301 "toycc_parser.yy"
                   { yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()); }
-#line 1242 "src/toycc_parser.cpp"
+#line 1285 "toycc_parser.cpp"
     break;
 
-  case 47: // logical_and_expr: logical_and_expr AND equality_expr
-#line 276 "src/toycc_parser.yy"
+  case 50: // logical_and_expr: logical_and_expr AND equality_expr
+#line 302 "toycc_parser.yy"
                                        {
       auto expr = std::make_shared<toycc::BinaryExpr>(toycc::BinOp::AND, std::move(yystack_[2].value.as < std::shared_ptr<toycc::Expr> > ()), std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1252 "src/toycc_parser.cpp"
+#line 1295 "toycc_parser.cpp"
     break;
 
-  case 48: // equality_expr: relational_expr
-#line 284 "src/toycc_parser.yy"
+  case 51: // equality_expr: relational_expr
+#line 310 "toycc_parser.yy"
                     { yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()); }
-#line 1258 "src/toycc_parser.cpp"
+#line 1301 "toycc_parser.cpp"
     break;
 
-  case 49: // equality_expr: equality_expr EQ relational_expr
-#line 285 "src/toycc_parser.yy"
+  case 52: // equality_expr: equality_expr EQ relational_expr
+#line 311 "toycc_parser.yy"
                                      {
       auto expr = std::make_shared<toycc::BinaryExpr>(toycc::BinOp::EQ, std::move(yystack_[2].value.as < std::shared_ptr<toycc::Expr> > ()), std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1268 "src/toycc_parser.cpp"
+#line 1311 "toycc_parser.cpp"
     break;
 
-  case 50: // equality_expr: equality_expr NE relational_expr
-#line 290 "src/toycc_parser.yy"
+  case 53: // equality_expr: equality_expr NE relational_expr
+#line 316 "toycc_parser.yy"
                                      {
       auto expr = std::make_shared<toycc::BinaryExpr>(toycc::BinOp::NE, std::move(yystack_[2].value.as < std::shared_ptr<toycc::Expr> > ()), std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1278 "src/toycc_parser.cpp"
+#line 1321 "toycc_parser.cpp"
     break;
 
-  case 51: // relational_expr: additive_expr
-#line 298 "src/toycc_parser.yy"
+  case 54: // relational_expr: additive_expr
+#line 324 "toycc_parser.yy"
                   { yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()); }
-#line 1284 "src/toycc_parser.cpp"
+#line 1327 "toycc_parser.cpp"
     break;
 
-  case 52: // relational_expr: relational_expr LT additive_expr
-#line 299 "src/toycc_parser.yy"
+  case 55: // relational_expr: relational_expr LT additive_expr
+#line 325 "toycc_parser.yy"
                                      {
       auto expr = std::make_shared<toycc::BinaryExpr>(toycc::BinOp::LT, std::move(yystack_[2].value.as < std::shared_ptr<toycc::Expr> > ()), std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1294 "src/toycc_parser.cpp"
+#line 1337 "toycc_parser.cpp"
     break;
 
-  case 53: // relational_expr: relational_expr GT additive_expr
-#line 304 "src/toycc_parser.yy"
+  case 56: // relational_expr: relational_expr GT additive_expr
+#line 330 "toycc_parser.yy"
                                      {
       auto expr = std::make_shared<toycc::BinaryExpr>(toycc::BinOp::GT, std::move(yystack_[2].value.as < std::shared_ptr<toycc::Expr> > ()), std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1304 "src/toycc_parser.cpp"
+#line 1347 "toycc_parser.cpp"
     break;
 
-  case 54: // relational_expr: relational_expr LE additive_expr
-#line 309 "src/toycc_parser.yy"
+  case 57: // relational_expr: relational_expr LE additive_expr
+#line 335 "toycc_parser.yy"
                                      {
       auto expr = std::make_shared<toycc::BinaryExpr>(toycc::BinOp::LE, std::move(yystack_[2].value.as < std::shared_ptr<toycc::Expr> > ()), std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1314 "src/toycc_parser.cpp"
+#line 1357 "toycc_parser.cpp"
     break;
 
-  case 55: // relational_expr: relational_expr GE additive_expr
-#line 314 "src/toycc_parser.yy"
+  case 58: // relational_expr: relational_expr GE additive_expr
+#line 340 "toycc_parser.yy"
                                      {
       auto expr = std::make_shared<toycc::BinaryExpr>(toycc::BinOp::GE, std::move(yystack_[2].value.as < std::shared_ptr<toycc::Expr> > ()), std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1324 "src/toycc_parser.cpp"
+#line 1367 "toycc_parser.cpp"
     break;
 
-  case 56: // additive_expr: multiplicative_expr
-#line 322 "src/toycc_parser.yy"
+  case 59: // additive_expr: multiplicative_expr
+#line 348 "toycc_parser.yy"
                         { yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()); }
-#line 1330 "src/toycc_parser.cpp"
+#line 1373 "toycc_parser.cpp"
     break;
 
-  case 57: // additive_expr: additive_expr ADD multiplicative_expr
-#line 323 "src/toycc_parser.yy"
+  case 60: // additive_expr: additive_expr ADD multiplicative_expr
+#line 349 "toycc_parser.yy"
                                           {
       auto expr = std::make_shared<toycc::BinaryExpr>(toycc::BinOp::ADD, std::move(yystack_[2].value.as < std::shared_ptr<toycc::Expr> > ()), std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1340 "src/toycc_parser.cpp"
+#line 1383 "toycc_parser.cpp"
     break;
 
-  case 58: // additive_expr: additive_expr SUB multiplicative_expr
-#line 328 "src/toycc_parser.yy"
+  case 61: // additive_expr: additive_expr SUB multiplicative_expr
+#line 354 "toycc_parser.yy"
                                           {
       auto expr = std::make_shared<toycc::BinaryExpr>(toycc::BinOp::SUB, std::move(yystack_[2].value.as < std::shared_ptr<toycc::Expr> > ()), std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1350 "src/toycc_parser.cpp"
+#line 1393 "toycc_parser.cpp"
     break;
 
-  case 59: // multiplicative_expr: unary_expr
-#line 336 "src/toycc_parser.yy"
+  case 62: // multiplicative_expr: unary_expr
+#line 362 "toycc_parser.yy"
                { yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()); }
-#line 1356 "src/toycc_parser.cpp"
+#line 1399 "toycc_parser.cpp"
     break;
 
-  case 60: // multiplicative_expr: multiplicative_expr MUL unary_expr
-#line 337 "src/toycc_parser.yy"
+  case 63: // multiplicative_expr: multiplicative_expr MUL unary_expr
+#line 363 "toycc_parser.yy"
                                        {
       auto expr = std::make_shared<toycc::BinaryExpr>(toycc::BinOp::MUL, std::move(yystack_[2].value.as < std::shared_ptr<toycc::Expr> > ()), std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1366 "src/toycc_parser.cpp"
+#line 1409 "toycc_parser.cpp"
     break;
 
-  case 61: // multiplicative_expr: multiplicative_expr DIV unary_expr
-#line 342 "src/toycc_parser.yy"
+  case 64: // multiplicative_expr: multiplicative_expr DIV unary_expr
+#line 368 "toycc_parser.yy"
                                        {
       auto expr = std::make_shared<toycc::BinaryExpr>(toycc::BinOp::DIV, std::move(yystack_[2].value.as < std::shared_ptr<toycc::Expr> > ()), std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1376 "src/toycc_parser.cpp"
+#line 1419 "toycc_parser.cpp"
     break;
 
-  case 62: // multiplicative_expr: multiplicative_expr MOD unary_expr
-#line 347 "src/toycc_parser.yy"
+  case 65: // multiplicative_expr: multiplicative_expr MOD unary_expr
+#line 373 "toycc_parser.yy"
                                        {
       auto expr = std::make_shared<toycc::BinaryExpr>(toycc::BinOp::MOD, std::move(yystack_[2].value.as < std::shared_ptr<toycc::Expr> > ()), std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1386 "src/toycc_parser.cpp"
+#line 1429 "toycc_parser.cpp"
     break;
 
-  case 63: // unary_expr: primary_expr
-#line 355 "src/toycc_parser.yy"
+  case 66: // unary_expr: primary_expr
+#line 381 "toycc_parser.yy"
                  { yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()); }
-#line 1392 "src/toycc_parser.cpp"
+#line 1435 "toycc_parser.cpp"
     break;
 
-  case 64: // unary_expr: ADD unary_expr
-#line 356 "src/toycc_parser.yy"
+  case 67: // unary_expr: ADD unary_expr
+#line 382 "toycc_parser.yy"
                    {
       auto expr = std::make_shared<toycc::UnaryExpr>(toycc::UnaryOp::POS, std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1402 "src/toycc_parser.cpp"
+#line 1445 "toycc_parser.cpp"
     break;
 
-  case 65: // unary_expr: SUB unary_expr
-#line 361 "src/toycc_parser.yy"
+  case 68: // unary_expr: SUB unary_expr
+#line 387 "toycc_parser.yy"
                    {
       auto expr = std::make_shared<toycc::UnaryExpr>(toycc::UnaryOp::NEG, std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1412 "src/toycc_parser.cpp"
+#line 1455 "toycc_parser.cpp"
     break;
 
-  case 66: // unary_expr: NOT unary_expr
-#line 366 "src/toycc_parser.yy"
+  case 69: // unary_expr: NOT unary_expr
+#line 392 "toycc_parser.yy"
                    {
       auto expr = std::make_shared<toycc::UnaryExpr>(toycc::UnaryOp::NOT, std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1422 "src/toycc_parser.cpp"
+#line 1465 "toycc_parser.cpp"
     break;
 
-  case 67: // primary_expr: INT_LITERAL
-#line 374 "src/toycc_parser.yy"
+  case 70: // primary_expr: INT_LITERAL
+#line 400 "toycc_parser.yy"
                 {
       auto expr = std::make_shared<toycc::IntLiteral>(yystack_[0].value.as < int > ());
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1432 "src/toycc_parser.cpp"
+#line 1475 "toycc_parser.cpp"
     break;
 
-  case 68: // primary_expr: IDENT
-#line 379 "src/toycc_parser.yy"
+  case 71: // primary_expr: IDENT
+#line 405 "toycc_parser.yy"
           {
       auto expr = std::make_shared<toycc::VarExpr>(yystack_[0].value.as < std::string > ());
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1442 "src/toycc_parser.cpp"
+#line 1485 "toycc_parser.cpp"
     break;
 
-  case 69: // primary_expr: IDENT LPAREN opt_arg_list RPAREN
-#line 384 "src/toycc_parser.yy"
+  case 72: // primary_expr: IDENT LPAREN opt_arg_list RPAREN
+#line 410 "toycc_parser.yy"
                                      {
       auto expr = std::make_shared<toycc::CallExpr>(yystack_[3].value.as < std::string > (), std::move(yystack_[1].value.as < std::vector<std::shared_ptr<toycc::Expr>> > ()));
       driver.setLocation(expr.get());
       yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(expr);
     }
-#line 1452 "src/toycc_parser.cpp"
+#line 1495 "toycc_parser.cpp"
     break;
 
-  case 70: // primary_expr: LPAREN expr RPAREN
-#line 389 "src/toycc_parser.yy"
+  case 73: // primary_expr: LPAREN expr RPAREN
+#line 415 "toycc_parser.yy"
                        { yylhs.value.as < std::shared_ptr<toycc::Expr> > () = std::move(yystack_[1].value.as < std::shared_ptr<toycc::Expr> > ()); }
-#line 1458 "src/toycc_parser.cpp"
+#line 1501 "toycc_parser.cpp"
     break;
 
-  case 71: // opt_arg_list: %empty
-#line 393 "src/toycc_parser.yy"
+  case 74: // opt_arg_list: %empty
+#line 419 "toycc_parser.yy"
            { yylhs.value.as < std::vector<std::shared_ptr<toycc::Expr>> > () = {}; }
-#line 1464 "src/toycc_parser.cpp"
+#line 1507 "toycc_parser.cpp"
     break;
 
-  case 72: // opt_arg_list: arg_list
-#line 394 "src/toycc_parser.yy"
+  case 75: // opt_arg_list: arg_list
+#line 420 "toycc_parser.yy"
              { yylhs.value.as < std::vector<std::shared_ptr<toycc::Expr>> > () = std::move(yystack_[0].value.as < std::vector<std::shared_ptr<toycc::Expr>> > ()); }
-#line 1470 "src/toycc_parser.cpp"
+#line 1513 "toycc_parser.cpp"
     break;
 
-  case 73: // arg_list: expr
-#line 398 "src/toycc_parser.yy"
+  case 76: // arg_list: expr
+#line 424 "toycc_parser.yy"
          { yylhs.value.as < std::vector<std::shared_ptr<toycc::Expr>> > () = {}; yylhs.value.as < std::vector<std::shared_ptr<toycc::Expr>> > ().push_back(std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ())); }
-#line 1476 "src/toycc_parser.cpp"
+#line 1519 "toycc_parser.cpp"
     break;
 
-  case 74: // arg_list: arg_list COMMA expr
-#line 399 "src/toycc_parser.yy"
+  case 77: // arg_list: arg_list COMMA expr
+#line 425 "toycc_parser.yy"
                         { yystack_[2].value.as < std::vector<std::shared_ptr<toycc::Expr>> > ().push_back(std::move(yystack_[0].value.as < std::shared_ptr<toycc::Expr> > ())); yylhs.value.as < std::vector<std::shared_ptr<toycc::Expr>> > () = std::move(yystack_[2].value.as < std::vector<std::shared_ptr<toycc::Expr>> > ()); }
-#line 1482 "src/toycc_parser.cpp"
+#line 1525 "toycc_parser.cpp"
     break;
 
 
-#line 1486 "src/toycc_parser.cpp"
+#line 1529 "toycc_parser.cpp"
 
             default:
               break;
@@ -1668,12 +1711,12 @@ namespace yy {
   "MOD", "AND", "OR", "NOT", "INVALID", "END", "$accept",
   "compilation_unit", "global_decl_list", "global_decl", "func_def",
   "opt_param_list", "param_list", "param", "decl_specifier", "decl",
-  "opt_init", "compound_stmt", "stmt_list", "stmt", "decl_stmt",
-  "expr_stmt", "if_stmt", "while_stmt", "return_stmt", "break_stmt",
-  "continue_stmt", "opt_expr", "expr", "assign_expr", "logical_or_expr",
-  "logical_and_expr", "equality_expr", "relational_expr", "additive_expr",
-  "multiplicative_expr", "unary_expr", "primary_expr", "opt_arg_list",
-  "arg_list", YY_NULLPTR
+  "init_declarator_list", "init_declarator", "opt_init", "compound_stmt",
+  "stmt_list", "stmt", "decl_stmt", "expr_stmt", "if_stmt", "while_stmt",
+  "return_stmt", "break_stmt", "continue_stmt", "opt_expr", "expr",
+  "assign_expr", "logical_or_expr", "logical_and_expr", "equality_expr",
+  "relational_expr", "additive_expr", "multiplicative_expr", "unary_expr",
+  "primary_expr", "opt_arg_list", "arg_list", YY_NULLPTR
     };
     return yy_sname[yysymbol];
   }
@@ -1806,116 +1849,116 @@ namespace yy {
   }
 
 
-  const signed char parser::yypact_ninf_ = -110;
+  const signed char parser::yypact_ninf_ = -112;
 
   const signed char parser::yytable_ninf_ = -1;
 
   const signed char
   parser::yypact_[] =
   {
-    -110,     9,    45,  -110,     6,  -110,  -110,  -110,  -110,    20,
-    -110,  -110,  -110,    -6,    80,    45,    23,    61,  -110,    80,
-      80,    80,    80,  -110,  -110,    13,    50,    40,    -8,    38,
-      29,    72,  -110,    73,    74,  -110,    51,  -110,    80,    76,
-    -110,  -110,  -110,    80,    80,    80,    80,    80,    80,    80,
-      80,    80,    80,    80,    80,    80,    80,    79,    45,  -110,
-    -110,    81,    84,  -110,    50,  -110,    40,    -8,    -8,    38,
-      38,    38,    38,    29,    29,  -110,  -110,  -110,  -110,  -110,
-    -110,  -110,  -110,    80,    36,  -110,    80,    86,    87,    90,
-      91,  -110,    98,  -110,  -110,  -110,  -110,  -110,  -110,  -110,
-    -110,  -110,  -110,    94,  -110,    95,    80,    80,  -110,  -110,
-      97,  -110,  -110,    99,   100,    68,    68,   102,  -110,    68,
-    -110
+    -112,    11,    48,  -112,     8,  -112,  -112,  -112,  -112,    38,
+    -112,  -112,  -112,    -4,   -13,  -112,    83,    48,  -112,  -112,
+      46,    40,  -112,    83,    83,    83,    83,  -112,  -112,    52,
+      49,     4,    -6,    33,    34,    75,  -112,    73,    76,  -112,
+      90,    80,  -112,    83,    79,  -112,  -112,  -112,    83,    83,
+      83,    83,    83,    83,    83,    83,    83,    83,    83,    83,
+      83,    83,    82,    48,  -112,  -112,    84,    87,  -112,    49,
+    -112,     4,    -6,    -6,    33,    33,    33,    33,    34,    34,
+    -112,  -112,  -112,  -112,  -112,  -112,  -112,  -112,    83,    39,
+    -112,    83,    89,    91,    92,    94,  -112,    46,  -112,  -112,
+    -112,  -112,  -112,  -112,  -112,  -112,  -112,  -112,    97,  -112,
+      98,    83,    83,  -112,  -112,  -112,  -112,    86,    96,    71,
+      71,   105,  -112,    71,  -112
   };
 
   const signed char
   parser::yydefact_[] =
   {
        3,     0,     2,     1,     0,    14,    13,     4,     5,     0,
-       6,    16,    15,    18,     0,     8,     0,    68,    67,     0,
-       0,     0,     0,    19,    41,    42,    44,    46,    48,    51,
-      56,    59,    63,     0,     9,    10,     0,    17,    71,     0,
-      64,    65,    66,     0,     0,     0,     0,     0,     0,     0,
-       0,     0,     0,     0,     0,     0,     0,     0,     0,    12,
-      73,     0,    72,    70,    45,    59,    47,    49,    50,    54,
-      55,    52,    53,    57,    58,    60,    61,    62,    43,    21,
-       7,    11,    69,     0,    39,    74,    39,     0,     0,     0,
-       0,    20,     0,    31,    23,    22,    25,    24,    26,    27,
-      28,    29,    30,     0,    40,     0,     0,     0,    37,    38,
-      18,    32,    36,     0,     0,    39,    39,    33,    35,    39,
-      34
+       6,    16,    15,    21,     0,    18,     0,     8,    20,    17,
+       0,    71,    70,     0,     0,     0,     0,    22,    44,    45,
+      47,    49,    51,    54,    59,    62,    66,     0,     9,    10,
+       0,    21,    19,    74,     0,    67,    68,    69,     0,     0,
+       0,     0,     0,     0,     0,     0,     0,     0,     0,     0,
+       0,     0,     0,     0,    12,    76,     0,    75,    73,    48,
+      62,    50,    52,    53,    57,    58,    55,    56,    60,    61,
+      63,    64,    65,    46,    24,     7,    11,    72,     0,    42,
+      77,    42,     0,     0,     0,     0,    23,     0,    34,    26,
+      25,    28,    27,    29,    30,    31,    32,    33,     0,    43,
+       0,     0,     0,    40,    41,    35,    39,     0,     0,    42,
+      42,    36,    38,    42,    37
   };
 
   const signed char
   parser::yypgoto_[] =
   {
-    -110,  -110,  -110,  -110,  -110,  -110,  -110,    55,    -1,   113,
-    -110,    59,  -110,  -109,  -110,  -110,  -110,  -110,  -110,  -110,
-    -110,    33,   -14,    64,  -110,    78,    82,    22,   -28,    37,
-     -18,  -110,  -110,  -110
+    -112,  -112,  -112,  -112,  -112,  -112,  -112,    53,    -1,   116,
+    -112,    99,  -112,    58,  -112,  -111,  -112,  -112,  -112,  -112,
+    -112,  -112,  -112,    30,   -16,    61,  -112,    77,    74,    18,
+     -31,    14,   -20,  -112,  -112,  -112
   };
 
   const signed char
   parser::yydefgoto_[] =
   {
-       0,     1,     2,     7,     8,    33,    34,    35,    92,    93,
-      16,    94,    84,    95,    96,    97,    98,    99,   100,   101,
-     102,   103,   104,    24,    25,    26,    27,    28,    29,    30,
-      31,    32,    61,    62
+       0,     1,     2,     7,     8,    37,    38,    39,    97,    98,
+      14,    15,    18,    99,    89,   100,   101,   102,   103,   104,
+     105,   106,   107,   108,   109,    28,    29,    30,    31,    32,
+      33,    34,    35,    36,    66,    67
   };
 
   const signed char
   parser::yytable_[] =
   {
-      23,     9,    40,    41,    42,    39,   117,   118,    14,     3,
-     120,    15,    11,    12,    36,    47,    48,    49,    50,    69,
-      70,    71,    72,    13,    60,    65,    65,    65,    65,    65,
-      65,    65,    65,    65,    65,    75,    76,    77,    37,    17,
-      18,     4,     5,     6,    86,    87,    43,    88,    89,    90,
-       4,     5,     6,    19,    59,    79,    91,    36,    53,    54,
-      55,    45,    46,    20,    21,    51,    52,    67,    68,    85,
-      22,    17,    18,     4,     5,     6,    86,    87,    38,    88,
-      89,    90,    44,    17,    18,    19,    56,    79,    73,    74,
-      58,    57,   113,   114,    63,    20,    21,    19,    79,    82,
-      83,   110,    22,   106,   107,   108,   109,    20,    21,   111,
-     112,    14,   119,    81,    22,    10,    80,   115,   116,   105,
-      78,    64,     0,     0,     0,     0,    66
+      27,     9,    19,    20,    45,    46,    47,    44,   121,   122,
+      16,     3,   124,    17,    11,    12,    40,    52,    53,    54,
+      55,    74,    75,    76,    77,    50,    51,    65,    70,    70,
+      70,    70,    70,    70,    70,    70,    70,    70,    80,    81,
+      82,    13,    21,    22,     4,     5,     6,    91,    92,    41,
+      93,    94,    95,     4,     5,     6,    23,    43,    84,    96,
+      56,    57,    40,    58,    59,    60,    24,    25,    72,    73,
+      78,    79,    90,    26,    21,    22,     4,     5,     6,    91,
+      92,    49,    93,    94,    95,    48,    21,    22,    23,    61,
+      84,    62,    63,    64,    16,   117,   118,    68,    24,    25,
+      23,    84,    87,    88,   119,    26,   111,   113,   112,   114,
+      24,    25,   115,   116,   120,   123,    86,    26,    10,    42,
+      85,   110,    83,    71,     0,    69
   };
 
   const signed char
   parser::yycheck_[] =
   {
-      14,     2,    20,    21,    22,    19,   115,   116,    14,     0,
-     119,    17,     6,     7,    15,    23,    24,    25,    26,    47,
-      48,    49,    50,     3,    38,    43,    44,    45,    46,    47,
-      48,    49,    50,    51,    52,    53,    54,    55,    15,     3,
-       4,     5,     6,     7,     8,     9,    33,    11,    12,    13,
-       5,     6,     7,    17,     3,    19,    20,    58,    29,    30,
-      31,    21,    22,    27,    28,    27,    28,    45,    46,    83,
-      34,     3,     4,     5,     6,     7,     8,     9,    17,    11,
-      12,    13,    32,     3,     4,    17,    14,    19,    51,    52,
-      16,    18,   106,   107,    18,    27,    28,    17,    19,    18,
-      16,     3,    34,    17,    17,    15,    15,    27,    28,    15,
-      15,    14,    10,    58,    34,     2,    57,    18,    18,    86,
-      56,    43,    -1,    -1,    -1,    -1,    44
+      16,     2,    15,    16,    24,    25,    26,    23,   119,   120,
+      14,     0,   123,    17,     6,     7,    17,    23,    24,    25,
+      26,    52,    53,    54,    55,    21,    22,    43,    48,    49,
+      50,    51,    52,    53,    54,    55,    56,    57,    58,    59,
+      60,     3,     3,     4,     5,     6,     7,     8,     9,     3,
+      11,    12,    13,     5,     6,     7,    17,    17,    19,    20,
+      27,    28,    63,    29,    30,    31,    27,    28,    50,    51,
+      56,    57,    88,    34,     3,     4,     5,     6,     7,     8,
+       9,    32,    11,    12,    13,    33,     3,     4,    17,    14,
+      19,    18,    16,     3,    14,   111,   112,    18,    27,    28,
+      17,    19,    18,    16,    18,    34,    17,    15,    17,    15,
+      27,    28,    15,    15,    18,    10,    63,    34,     2,    20,
+      62,    91,    61,    49,    -1,    48
   };
 
   const signed char
   parser::yystos_[] =
   {
        0,    38,    39,     0,     5,     6,     7,    40,    41,    45,
-      46,     6,     7,     3,    14,    17,    47,     3,     4,    17,
-      27,    28,    34,    59,    60,    61,    62,    63,    64,    65,
-      66,    67,    68,    42,    43,    44,    45,    15,    17,    59,
-      67,    67,    67,    33,    32,    21,    22,    23,    24,    25,
-      26,    27,    28,    29,    30,    31,    14,    18,    16,     3,
-      59,    69,    70,    18,    62,    67,    63,    64,    64,    65,
-      65,    65,    65,    66,    66,    67,    67,    67,    60,    19,
-      48,    44,    18,    16,    49,    59,     8,     9,    11,    12,
-      13,    20,    45,    46,    48,    50,    51,    52,    53,    54,
-      55,    56,    57,    58,    59,    58,    17,    17,    15,    15,
-       3,    15,    15,    59,    59,    18,    18,    50,    50,    10,
-      50
+      46,     6,     7,     3,    47,    48,    14,    17,    49,    15,
+      16,     3,     4,    17,    27,    28,    34,    61,    62,    63,
+      64,    65,    66,    67,    68,    69,    70,    42,    43,    44,
+      45,     3,    48,    17,    61,    69,    69,    69,    33,    32,
+      21,    22,    23,    24,    25,    26,    27,    28,    29,    30,
+      31,    14,    18,    16,     3,    61,    71,    72,    18,    64,
+      69,    65,    66,    66,    67,    67,    67,    67,    68,    68,
+      69,    69,    69,    62,    19,    50,    44,    18,    16,    51,
+      61,     8,     9,    11,    12,    13,    20,    45,    46,    50,
+      52,    53,    54,    55,    56,    57,    58,    59,    60,    61,
+      60,    17,    17,    15,    15,    15,    15,    61,    61,    18,
+      18,    52,    52,    10,    52
   };
 
   const signed char
@@ -1923,25 +1966,25 @@ namespace yy {
   {
        0,    37,    38,    39,    39,    40,    40,    41,    42,    42,
       43,    43,    44,    45,    45,    45,    45,    46,    47,    47,
-      48,    49,    49,    50,    50,    50,    50,    50,    50,    50,
-      50,    51,    52,    53,    53,    54,    55,    56,    57,    58,
-      58,    59,    60,    60,    61,    61,    62,    62,    63,    63,
-      63,    64,    64,    64,    64,    64,    65,    65,    65,    66,
-      66,    66,    66,    67,    67,    67,    67,    68,    68,    68,
-      68,    69,    69,    70,    70
+      48,    49,    49,    50,    51,    51,    52,    52,    52,    52,
+      52,    52,    52,    52,    53,    54,    55,    55,    56,    57,
+      58,    59,    60,    60,    61,    62,    62,    63,    63,    64,
+      64,    65,    65,    65,    66,    66,    66,    66,    66,    67,
+      67,    67,    68,    68,    68,    68,    69,    69,    69,    69,
+      70,    70,    70,    70,    71,    71,    72,    72
   };
 
   const signed char
   parser::yyr2_[] =
   {
        0,     2,     1,     0,     2,     1,     1,     6,     0,     1,
-       1,     3,     2,     1,     1,     2,     2,     4,     0,     2,
-       3,     0,     2,     1,     1,     1,     1,     1,     1,     1,
-       1,     1,     2,     5,     7,     5,     3,     2,     2,     0,
-       1,     1,     1,     3,     1,     3,     1,     3,     1,     3,
-       3,     1,     3,     3,     3,     3,     1,     3,     3,     1,
-       3,     3,     3,     1,     2,     2,     2,     1,     1,     4,
-       3,     0,     1,     1,     3
+       1,     3,     2,     1,     1,     2,     2,     3,     1,     3,
+       2,     0,     2,     3,     0,     2,     1,     1,     1,     1,
+       1,     1,     1,     1,     1,     2,     5,     7,     5,     3,
+       2,     2,     0,     1,     1,     1,     3,     1,     3,     1,
+       3,     1,     3,     3,     1,     3,     3,     3,     3,     1,
+       3,     3,     1,     3,     3,     3,     1,     2,     2,     2,
+       1,     1,     4,     3,     0,     1,     1,     3
   };
 
 
@@ -1951,14 +1994,14 @@ namespace yy {
   const short
   parser::yyrline_[] =
   {
-       0,    74,    74,    83,    84,    91,    92,    96,   108,   109,
-     113,   114,   118,   128,   129,   130,   131,   135,   147,   148,
-     152,   161,   162,   166,   167,   168,   169,   170,   171,   172,
-     173,   177,   186,   195,   202,   213,   223,   232,   240,   248,
-     249,   253,   257,   258,   266,   267,   275,   276,   284,   285,
-     290,   298,   299,   304,   309,   314,   322,   323,   328,   336,
-     337,   342,   347,   355,   356,   361,   366,   374,   379,   384,
-     389,   393,   394,   398,   399
+       0,    76,    76,    85,    86,    95,    96,   106,   118,   119,
+     123,   124,   128,   138,   139,   140,   141,   145,   155,   156,
+     163,   173,   174,   178,   187,   188,   192,   193,   194,   195,
+     196,   197,   198,   199,   203,   212,   221,   228,   239,   249,
+     258,   266,   274,   275,   279,   283,   284,   292,   293,   301,
+     302,   310,   311,   316,   324,   325,   330,   335,   340,   348,
+     349,   354,   362,   363,   368,   373,   381,   382,   387,   392,
+     400,   405,   410,   415,   419,   420,   424,   425
   };
 
   void
@@ -1990,9 +2033,9 @@ namespace yy {
 
 
 } // yy
-#line 1994 "src/toycc_parser.cpp"
+#line 2037 "toycc_parser.cpp"
 
-#line 402 "src/toycc_parser.yy"
+#line 428 "toycc_parser.yy"
 
 
 void yy::parser::error(const std::string& msg) {

@@ -67,7 +67,9 @@ static std::shared_ptr<ExprStmt> makeExprStmt(std::shared_ptr<Expr> expr) {
 }
 
 static std::shared_ptr<DeclStmt> makeDeclStmt(std::shared_ptr<Decl> decl) {
-  return std::make_shared<DeclStmt>(std::move(decl));
+  std::vector<std::shared_ptr<Decl>> decls;
+  decls.push_back(std::move(decl));
+  return std::make_shared<DeclStmt>(std::move(decls));
 }
 
 static std::shared_ptr<ReturnStmt> makeReturn(std::shared_ptr<Expr> val = nullptr) {
