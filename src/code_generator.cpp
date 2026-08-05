@@ -363,35 +363,113 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
   loadOperand(inst.src1, "t0", out);
   if (inst.op == IROp::NOT) {
     emit(out, "sltiu", "t0, t0, 1");
-  } else {
-    loadOperand(inst.src2, "t1", out);
+    storeOperand("t0", inst.dest, out);
+    return;
+  }
+
+  // 当 src2 为 12 位有符号立即数范围内时使用立即数指令，省去 li
+  if (inst.src2.isImm() && inst.src2.immVal >= -2048 && inst.src2.immVal <= 2047) {
+    const int imm = inst.src2.immVal;
     switch (inst.op) {
     case IROp::ADD:
-      emit(out, "add", "t0, t0, t1");
+      emit(out, "addi", "t0, t0, " + std::to_string(imm));
       break;
     case IROp::SUB:
-      emit(out, "sub", "t0, t0, t1");
+      // RISC-V 无 subi，用 addi 取反
+      emit(out, "addi", "t0, t0, " + std::to_string(-imm));
       break;
     case IROp::MUL:
-      emit(out, "mul", "t0, t0, t1");
-      break;
-    case IROp::DIV:
-      emit(out, "div", "t0, t0, t1");
-      break;
-    case IROp::MOD:
-      emit(out, "rem", "t0, t0, t1");
+      // 乘 2 的幂可用左移，否则仍需 li+mul
+      if (imm > 0 && (imm & (imm - 1)) == 0) {
+        emit(out, "slli", "t0, t0, " + std::to_string(__builtin_ctz(static_cast<unsigned>(imm))));
+      } else {
+        loadOperand(inst.src2, "t1", out);
+        emit(out, "mul", "t0, t0, t1");
+      }
       break;
     default:
+      loadOperand(inst.src2, "t1", out);
+      switch (inst.op) {
+      case IROp::DIV:
+        emit(out, "div", "t0, t0, t1");
+        break;
+      case IROp::MOD:
+        emit(out, "rem", "t0, t0, t1");
+        break;
+      default:
+        break;
+      }
       break;
     }
+    storeOperand("t0", inst.dest, out);
+    return;
+  }
+
+  loadOperand(inst.src2, "t1", out);
+  switch (inst.op) {
+  case IROp::ADD:
+    emit(out, "add", "t0, t0, t1");
+    break;
+  case IROp::SUB:
+    emit(out, "sub", "t0, t0, t1");
+    break;
+  case IROp::MUL:
+    emit(out, "mul", "t0, t0, t1");
+    break;
+  case IROp::DIV:
+    emit(out, "div", "t0, t0, t1");
+    break;
+  case IROp::MOD:
+    emit(out, "rem", "t0, t0, t1");
+    break;
+  default:
+    break;
   }
   storeOperand("t0", inst.dest, out);
 }
 
 void CodeGenerator::emitCompareOp(const IRInst& inst, std::ostream& out) {
   loadOperand(inst.src1, "t0", out);
-  loadOperand(inst.src2, "t1", out);
 
+  // 当 src2 为 12 位有符号立即数范围内时使用立即数比较指令
+  if (inst.src2.isImm() && inst.src2.immVal >= -2048 && inst.src2.immVal <= 2047) {
+    const int imm = inst.src2.immVal;
+    switch (inst.op) {
+    case IROp::LT:
+      emit(out, "slti", "t0, t0, " + std::to_string(imm));
+      break;
+    case IROp::GT: // x > imm  ==  !(x <= imm) ==  imm < x，需翻转
+      // t0 > imm  <=>  imm < t0，用 slti 不行（操作数顺序固定）
+      // 改用：slt t0, t0, imm+1 取反。但更简洁：用通用路径
+      loadOperand(inst.src2, "t1", out);
+      emit(out, "slt", "t0, t1, t0");
+      break;
+    case IROp::LE: // x <= imm <=> !(imm < x)，但无直接指令
+      // x <= imm  <=>  x < imm+1
+      emit(out, "slti", "t0, t0, " + std::to_string(imm + 1));
+      break;
+    case IROp::GE: // x >= imm <=> !(x < imm)
+      emit(out, "slti", "t0, t0, " + std::to_string(imm));
+      emit(out, "xori", "t0, t0, 1");
+      break;
+    case IROp::EQ:
+      emit(out, "addi", "t1, zero, " + std::to_string(imm));
+      emit(out, "sub", "t0, t0, t1");
+      emit(out, "seqz", "t0, t0");
+      break;
+    case IROp::NE:
+      emit(out, "addi", "t1, zero, " + std::to_string(imm));
+      emit(out, "sub", "t0, t0, t1");
+      emit(out, "snez", "t0, t0");
+      break;
+    default:
+      break;
+    }
+    storeOperand("t0", inst.dest, out);
+    return;
+  }
+
+  loadOperand(inst.src2, "t1", out);
   switch (inst.op) {
   case IROp::LT:
     emit(out, "slt", "t0, t0, t1");
@@ -418,7 +496,6 @@ void CodeGenerator::emitCompareOp(const IRInst& inst, std::ostream& out) {
   default:
     break;
   }
-
   storeOperand("t0", inst.dest, out);
 }
 

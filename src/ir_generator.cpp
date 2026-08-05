@@ -285,6 +285,104 @@ Operand IRGenerator::genExpr(Expr* expr) {
     // 普通二元运算
     Operand lhsVal = genExpr(binaryExpr->lhs.get());
     Operand rhsVal = genExpr(binaryExpr->rhs.get());
+
+    // 常量折叠：两个操作数都是立即数时直接编译期计算
+    if (lhsVal.isImm() && rhsVal.isImm()) {
+      const int a = lhsVal.immVal;
+      const int b = rhsVal.immVal;
+      int result = 0;
+      bool folded = true;
+      switch (binaryExpr->op) {
+      case BinOp::ADD:
+        result = a + b;
+        break;
+      case BinOp::SUB:
+        result = a - b;
+        break;
+      case BinOp::MUL:
+        result = a * b;
+        break;
+      case BinOp::DIV:
+        if (b == 0) {
+          folded = false;
+        } else {
+          result = a / b;
+        }
+        break;
+      case BinOp::MOD:
+        if (b == 0) {
+          folded = false;
+        } else {
+          result = a % b;
+        }
+        break;
+      case BinOp::LT:
+        result = (a < b) ? 1 : 0;
+        break;
+      case BinOp::GT:
+        result = (a > b) ? 1 : 0;
+        break;
+      case BinOp::LE:
+        result = (a <= b) ? 1 : 0;
+        break;
+      case BinOp::GE:
+        result = (a >= b) ? 1 : 0;
+        break;
+      case BinOp::EQ:
+        result = (a == b) ? 1 : 0;
+        break;
+      case BinOp::NE:
+        result = (a != b) ? 1 : 0;
+        break;
+      default:
+        folded = false;
+        break;
+      }
+      if (folded) {
+        return Operand::imm(result);
+      }
+    }
+
+    // 代数简化：避免无意义的运行时运算
+    switch (binaryExpr->op) {
+    case BinOp::ADD:
+      // x + 0 = x, 0 + x = x
+      if (rhsVal.isImm() && rhsVal.immVal == 0)
+        return lhsVal;
+      if (lhsVal.isImm() && lhsVal.immVal == 0)
+        return rhsVal;
+      break;
+    case BinOp::SUB:
+      // x - 0 = x
+      if (rhsVal.isImm() && rhsVal.immVal == 0)
+        return lhsVal;
+      break;
+    case BinOp::MUL:
+      // x * 0 = 0
+      if (rhsVal.isImm() && rhsVal.immVal == 0)
+        return Operand::imm(0);
+      if (lhsVal.isImm() && lhsVal.immVal == 0)
+        return Operand::imm(0);
+      // x * 1 = x, 1 * x = x
+      if (rhsVal.isImm() && rhsVal.immVal == 1)
+        return lhsVal;
+      if (lhsVal.isImm() && lhsVal.immVal == 1)
+        return rhsVal;
+      break;
+    case BinOp::DIV:
+      // x / 1 = x
+      if (rhsVal.isImm() && rhsVal.immVal == 1)
+        return lhsVal;
+      break;
+    case BinOp::MOD:
+      // x % 1 = 0
+      if (rhsVal.isImm() && rhsVal.immVal == 1)
+        return Operand::imm(0);
+      break;
+    default:
+      break;
+    }
+
     Operand result = Operand::localVar(newTemp());
 
     IROp irOp;
@@ -333,6 +431,24 @@ Operand IRGenerator::genExpr(Expr* expr) {
 
   if (auto* unaryExpr = dynamic_cast<UnaryExpr*>(expr)) {
     Operand operandVal = genExpr(unaryExpr->operand.get());
+
+    // 常量折叠：操作数为立即数时直接编译期计算
+    if (operandVal.isImm()) {
+      switch (unaryExpr->op) {
+      case UnaryOp::POS:
+        return operandVal;
+      case UnaryOp::NEG:
+        return Operand::imm(-operandVal.immVal);
+      case UnaryOp::NOT:
+        return Operand::imm(operandVal.immVal == 0 ? 1 : 0);
+      }
+    }
+
+    // 代数简化：+x = x
+    if (unaryExpr->op == UnaryOp::POS) {
+      return operandVal;
+    }
+
     Operand result = Operand::localVar(newTemp());
 
     IROp irOp;
