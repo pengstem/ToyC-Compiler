@@ -19,6 +19,32 @@ std::string IRGenerator::newLabel() {
   return "L" + std::to_string(labelCounter++);
 }
 
+void IRGenerator::enterVarScope() {
+  varScopeStack_.push_back({});
+}
+
+void IRGenerator::exitVarScope() {
+  if (!varScopeStack_.empty()) {
+    varScopeStack_.pop_back();
+  }
+}
+
+std::string IRGenerator::declareVar(const std::string& name) {
+  std::string irName = name + "." + std::to_string(varCounter_++);
+  varScopeStack_.back()[name] = irName;
+  return irName;
+}
+
+std::string IRGenerator::resolveVar(const std::string& name) {
+  for (auto it = varScopeStack_.rbegin(); it != varScopeStack_.rend(); ++it) {
+    auto found = it->find(name);
+    if (found != it->end()) {
+      return found->second;
+    }
+  }
+  return name;
+}
+
 void IRGenerator::emit(IROp op, Operand dest, Operand src1, Operand src2) {
   ir.push_back(IRInst(op, std::move(dest), std::move(src1), std::move(src2)));
 }
@@ -58,9 +84,13 @@ void IRGenerator::genFuncDef(FuncDef* funcDef) {
 
   emit(IROp::FUNC_BEGIN, Operand::func(funcDef->name));
 
-  // 声明参数为局部变量
+  // 进入函数作用域
+  enterVarScope();
+
+  // 声明参数为局部变量（使用唯一 IR 名称）
   for (auto& param : funcDef->params) {
-    emit(IROp::LOCAL_VAR_DECL, Operand::localVar(param->name), Operand::param(param->name));
+    std::string irName = declareVar(param->name);
+    emit(IROp::LOCAL_VAR_DECL, Operand::localVar(irName), Operand::param(param->name));
   }
 
   // 生成函数体 IR
@@ -78,6 +108,9 @@ void IRGenerator::genFuncDef(FuncDef* funcDef) {
   }
 
   emit(IROp::FUNC_END, Operand::func(funcDef->name));
+
+  // 退出函数作用域
+  exitVarScope();
 }
 
 // ============================================================
@@ -86,14 +119,11 @@ void IRGenerator::genFuncDef(FuncDef* funcDef) {
 
 void IRGenerator::genDecl(Decl* decl) {
   if (decl->isConst) {
-    // const 变量已折叠，直接生成带有立即数值的局部变量
-    Symbol* sym = symTable.lookup(decl->name);
-    int initVal = (sym ? sym->constValue : 0);
-    emit(IROp::LOCAL_VAR_DECL, Operand::localVar(decl->name), Operand::imm(initVal));
+    // const 变量已在语义分析阶段折叠，引用处直接使用立即数，无需声明
     return;
   }
 
-  if (isGlobalContext) {
+  if (decl->isGlobalDecl) {
     // 全局变量
     int initVal = 0;
     emit(IROp::GLOBAL_VAR_DECL, Operand::globalVar(decl->name), Operand::imm(initVal));
@@ -104,12 +134,13 @@ void IRGenerator::genDecl(Decl* decl) {
     return;
   }
 
-  // 局部变量
-  emit(IROp::LOCAL_VAR_DECL, Operand::localVar(decl->name));
+  // 局部变量：使用唯一 IR 名称避免遮蔽冲突
+  std::string irName = declareVar(decl->name);
+  emit(IROp::LOCAL_VAR_DECL, Operand::localVar(irName));
 
   if (decl->initExpr) {
     Operand val = genExpr(decl->initExpr.get());
-    emit(IROp::ASSIGN, Operand::localVar(decl->name), val);
+    emit(IROp::ASSIGN, Operand::localVar(irName), val);
   }
 }
 
@@ -119,9 +150,11 @@ void IRGenerator::genDecl(Decl* decl) {
 
 void IRGenerator::genStmt(Stmt* stmt) {
   if (auto* block = dynamic_cast<Block*>(stmt)) {
+    enterVarScope();
     for (auto& s : block->stmts) {
       genStmt(s.get());
     }
+    exitVarScope();
     return;
   }
 
@@ -221,15 +254,14 @@ Operand IRGenerator::genExpr(Expr* expr) {
   }
 
   if (auto* varExpr = dynamic_cast<VarExpr*>(expr)) {
-    Symbol* sym = symTable.lookup(varExpr->name);
-    if (sym && sym->isConst) {
-      // 常量直接返回立即数
-      return Operand::imm(sym->constValue);
+    if (varExpr->resolvedIsConst) {
+      return Operand::imm(varExpr->resolvedConstValue);
     }
-    if (sym && sym->isGlobal) {
+    if (varExpr->resolvedIsGlobal) {
       return Operand::globalVar(varExpr->name);
     }
-    return Operand::localVar(varExpr->name);
+    std::string irName = resolveVar(varExpr->name);
+    return Operand::localVar(irName);
   }
 
   if (auto* binaryExpr = dynamic_cast<BinaryExpr*>(expr)) {
@@ -243,11 +275,11 @@ Operand IRGenerator::genExpr(Expr* expr) {
       Operand rhs = genExpr(binaryExpr->rhs.get());
       Operand lhs;
       if (auto* varExpr = dynamic_cast<VarExpr*>(binaryExpr->lhs.get())) {
-        Symbol* sym = symTable.lookup(varExpr->name);
-        if (sym && sym->isGlobal) {
+        if (varExpr->resolvedIsGlobal) {
           lhs = Operand::globalVar(varExpr->name);
         } else {
-          lhs = Operand::localVar(varExpr->name);
+          std::string irName = resolveVar(varExpr->name);
+          lhs = Operand::localVar(irName);
         }
       }
       emit(IROp::ASSIGN, lhs, rhs);

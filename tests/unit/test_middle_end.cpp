@@ -1068,7 +1068,7 @@ void testIR_assignAndRead() {
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
   auto ir = irGen.generate(*comp);
-  if (irContains(ir, "ASSIGN %x, #42")) {
+  if (irContains(ir, "ASSIGN %x.") && irContains(ir, "#42")) {
     testPass();
   } else {
     testFail("assign IR missing:\n" + irToString(ir));

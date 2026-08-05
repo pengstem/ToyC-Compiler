@@ -216,14 +216,22 @@ if(TOYCC_ENABLE_FORMAT_TARGETS)
   find_program(CLANG_FORMAT_EXE NAMES clang-format)
 
   if(CLANG_FORMAT_EXE)
+    # Filter out Flex/Bison generated files from formatting checks
+    set(TOYCC_FORMAT_SOURCES ${TOYCC_SOURCES})
+    set(TOYCC_FORMAT_HEADERS ${TOYCC_HEADERS})
+    list(FILTER TOYCC_FORMAT_SOURCES EXCLUDE REGEX
+      "toycc_parser\\.cpp$|toycc_lexer\\.cpp$")
+    list(FILTER TOYCC_FORMAT_HEADERS EXCLUDE REGEX
+      "toycc_parser\\.hpp$")
+
     add_custom_target(format
-      COMMAND ${CLANG_FORMAT_EXE} -i ${TOYCC_SOURCES} ${TOYCC_HEADERS}
+      COMMAND ${CLANG_FORMAT_EXE} -i ${TOYCC_FORMAT_SOURCES} ${TOYCC_FORMAT_HEADERS}
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
       COMMENT "Formatting source files with clang-format"
     )
 
     add_custom_target(check-format
-      COMMAND ${CLANG_FORMAT_EXE} --dry-run --Werror ${TOYCC_SOURCES} ${TOYCC_HEADERS}
+      COMMAND ${CLANG_FORMAT_EXE} --dry-run --Werror ${TOYCC_FORMAT_SOURCES} ${TOYCC_FORMAT_HEADERS}
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
       COMMENT "Checking source formatting with clang-format"
     )

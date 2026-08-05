@@ -53,6 +53,11 @@ public:
 class VarExpr : public Expr {
 public:
   std::string name;
+  // 语义分析阶段填充的解析信息（供 IR 生成器使用，避免依赖符号表作用域）
+  bool resolvedIsConst = false;
+  int resolvedConstValue = 0;
+  bool resolvedIsGlobal = false;
+  bool resolvedIsFunc = false;
   VarExpr(const std::string& n)
       : name(n) {}
 };
@@ -143,6 +148,9 @@ public:
   Type varType = Type::INT;
   std::string name;
   std::shared_ptr<Expr> initExpr; // 可为空
+  // 语义分析阶段填充（供 IR 生成器使用）
+  int constValue = 0;        // 若 isConst，存储编译期折叠结果
+  bool isGlobalDecl = false; // 是否为全局声明
 };
 
 class FuncParam : public ASTNode {

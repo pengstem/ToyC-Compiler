@@ -7,6 +7,7 @@
 
 #include <stack>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace toycc {
@@ -43,9 +44,13 @@ private:
   // 临时变量与标签计数器
   int tempCounter = 0;
   int labelCounter = 0;
+  int varCounter_ = 0;
 
   // 循环上下文栈
   std::stack<LoopContext> loopStack;
+
+  // 变量作用域栈（用于生成唯一 IR 变量名，处理变量遮蔽）
+  std::vector<std::unordered_map<std::string, std::string>> varScopeStack_;
 
   // 当前上下文
   bool isGlobalContext = true;
@@ -55,6 +60,12 @@ private:
   // 工具方法
   std::string newTemp();
   std::string newLabel();
+
+  // 变量作用域管理
+  void enterVarScope();
+  void exitVarScope();
+  std::string declareVar(const std::string& name);
+  std::string resolveVar(const std::string& name);
 
   // 生成 IR 指令
   void emit(IROp op, Operand dest = Operand::none(), Operand src1 = Operand::none(),

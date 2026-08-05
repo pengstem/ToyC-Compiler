@@ -261,9 +261,11 @@ void CodeGenerator::generateInstruction(const IRInst& inst, std::ostream& out) {
 void CodeGenerator::emitPrologue(const StackFrame& frame, std::ostream& out) const {
   const int frameSize = frame.frameSizeBytes();
   emit(out, "addi", "sp, sp, -" + std::to_string(frameSize));
+  // 在更新 s0 之前保存 ra 和旧 s0（使用 sp 相对偏移）
+  emit(out, "sw", "ra, " + std::to_string(frameSize - 4) + "(sp)");
+  emit(out, "sw", "s0, " + std::to_string(frameSize - 8) + "(sp)");
+  // 设置新帧指针
   emit(out, "addi", "s0, sp, " + std::to_string(frameSize));
-  emit(out, "sw", "ra, -4(s0)");
-  emit(out, "sw", "s0, -8(s0)");
 
   int saveOffset = -12;
   for (const auto& reg : frame.usedCalleeSavedRegisters) {

@@ -88,7 +88,7 @@ void ParserDriver::advanceColumn(int delta) {
 }
 
 void ParserDriver::consumeToken(const std::string& text) {
-  (void)text;
+  (void) text;
 }
 
 void ParserDriver::setTokenStart(int lineNo, int colNo) {
@@ -181,4 +181,3 @@ parser::symbol_type yylex(toycc::ParserDriver& driver) {
   return driver.lex();
 }
 } // namespace yy
-

@@ -204,6 +204,7 @@ void SemanticAnalyzer::analyzeDecl(Decl* decl) {
   sym.type = decl->varType;
   sym.isConst = decl->isConst;
   sym.isGlobal = symTable.isGlobalScope();
+  decl->isGlobalDecl = sym.isGlobal;
 
   // 处理初始化表达式
   if (decl->initExpr) {
@@ -219,6 +220,7 @@ void SemanticAnalyzer::analyzeDecl(Decl* decl) {
       int foldedValue = 0;
       if (tryConstFold(decl->initExpr.get(), foldedValue)) {
         sym.constValue = foldedValue;
+        decl->constValue = foldedValue;
       } else {
         error(decl->line, decl->col,
               "const variable '" + decl->name + "' must be initialized with a constant expression");
@@ -246,6 +248,11 @@ Type SemanticAnalyzer::analyzeExpr(Expr* expr) {
       expr->type = Type::INT;
       return Type::INT;
     }
+    // 填充解析信息供 IR 生成器使用
+    varExpr->resolvedIsConst = sym->isConst;
+    varExpr->resolvedConstValue = sym->constValue;
+    varExpr->resolvedIsGlobal = sym->isGlobal;
+    varExpr->resolvedIsFunc = sym->isFunction;
     expr->type = sym->type;
     return sym->type;
   }
