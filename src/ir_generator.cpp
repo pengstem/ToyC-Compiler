@@ -1164,17 +1164,28 @@ void IRGenerator::optimizePass() {
           if (condIdx < ir.size() && bnezIdx < ir.size()) {
             // 收集循环范围内被定义的局部变量（body + cond）
             std::unordered_map<std::string, bool> definedInLoop;
+            // 循环内被写入的全局变量：读取它们的表达式不能视为循环不变
+            std::unordered_map<std::string, bool> storedGlobals;
             for (std::size_t k = i + 2; k < bnezIdx; ++k) {
               if (ir[k].dest.isLocalVar()) {
                 definedInLoop[ir[k].dest.name] = true;
+              } else if (ir[k].dest.isGlobalVar()) {
+                storedGlobals[ir[k].dest.name] = true;
               }
             }
             // 操作数必须在循环内不被定义
             auto operandInvariant = [&](const Operand& op) {
-              if (!op.isLocalVar()) {
-                return true; // 立即数/全局常量视为不变（全局变量不可变）
+              if (op.isImm()) {
+                return true;
               }
-              return definedInLoop.count(op.name) == 0;
+              if (op.isGlobalVar()) {
+                // 全局变量可被循环内的 STORE/ASSIGN 修改，只有未被写入时才视为不变
+                return storedGlobals.count(op.name) == 0;
+              }
+              if (op.isLocalVar()) {
+                return definedInLoop.count(op.name) == 0;
+              }
+              return false;
             };
             // 待外提指令与原序保留指令
             // 注意范围从 i+1 开始：LABEL Lb 属于循环体，必须保留在原位（hoisted 之后），
@@ -1198,10 +1209,12 @@ void IRGenerator::optimizePass() {
               }
             }
             if (!hoisted.empty()) {
-              optimized.push_back(ir[i]); // BRANCH Lc
+              // 外提指令必须放在首跳 BRANCH Lc 之前，否则首跳会跳过它们，
+              // 导致外提计算成为不可达死代码（循环体永远用不到外提结果）
               for (auto& h : hoisted) {
                 optimized.push_back(h);
               }
+              optimized.push_back(ir[i]); // BRANCH Lc
               for (auto& ke : kept) {
                 optimized.push_back(ke);
               }
