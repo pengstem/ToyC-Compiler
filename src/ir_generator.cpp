@@ -947,17 +947,29 @@ void IRGenerator::optimizePass() {
 
     // Pass 1.5: 公共子表达式消除（基本块内）
     // 在无控制流的直线代码段内，若 (op, src1, src2) 已计算过且操作数未在块内被重新定义，
-    // 则复用之前的结果（IR 变量唯一命名，值一旦定义不再改变）
+    // 则复用之前的结果。用户变量可被重新赋值，须跟踪重定义并使相关条目失效。
     {
-      std::unordered_map<std::string, std::string> rename;   // 原名 → 复用名
+      std::unordered_map<std::string, std::string> rename; // 原名 → 复用名（仅临时变量）
       std::unordered_map<std::string, std::string> valueMap; // (op,src1,src2) → 结果变量
+      std::unordered_map<std::string, std::vector<std::string>> varKeys; // 变量 → 引用它的 key
       std::vector<IRInst> optimized;
+      auto invalidateVar = [&](const std::string& name) {
+        auto it = varKeys.find(name);
+        if (it == varKeys.end()) {
+          return;
+        }
+        for (const auto& key : it->second) {
+          valueMap.erase(key);
+        }
+        varKeys.erase(it);
+      };
       for (const auto& inst : ir) {
         // 控制流/调用/内存边界：重置所有映射（保守处理）
         if (inst.op == IROp::LABEL || inst.op == IROp::BRANCH || inst.op == IROp::BEQZ ||
             inst.op == IROp::BNEZ || inst.op == IROp::CALL || inst.op == IROp::LOAD ||
             inst.op == IROp::STORE || inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
           valueMap.clear();
+          varKeys.clear();
         }
         IRInst cur = inst;
         // 源操作数重命名
@@ -972,6 +984,10 @@ void IRGenerator::optimizePass() {
           if (it != rename.end()) {
             cur.src2 = Operand::localVar(it->second);
           }
+        }
+        // 本指令定义变量：使引用该变量的 CSE 条目失效（其值已变化）
+        if (cur.dest.isLocalVar()) {
+          invalidateVar(cur.dest.name);
         }
         if (isCombinableOp(cur.op) && cur.dest.isLocalVar() && isTempName(cur.dest.name) &&
             cur.op != IROp::NOT && cur.src1.type != OperandType::NONE &&
@@ -988,6 +1004,12 @@ void IRGenerator::optimizePass() {
             continue; // 冗余指令不再发射
           }
           valueMap[key] = cur.dest.name;
+          if (cur.src1.isLocalVar()) {
+            varKeys[cur.src1.name].push_back(key);
+          }
+          if (cur.src2.isLocalVar()) {
+            varKeys[cur.src2.name].push_back(key);
+          }
         }
         optimized.push_back(cur);
       }
