@@ -112,6 +112,11 @@ target_include_directories(toycc
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 
+# Flex 生成的词法分析器在非 POSIX 平台需要跳过 unistd.h
+if(WIN32)
+  target_compile_definitions(toycc PRIVATE YY_NO_UNISTD_H YY_NEVER_INTERACTIVE)
+endif()
+
 # ================================
 # Compiler warnings
 # ================================

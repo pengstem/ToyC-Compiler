@@ -495,68 +495,91 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
     return;
   }
 
-  // 先处理 src2（加载到 t1 或使用立即数），避免 destReg 覆盖 src2 寄存器
+  // 确定 src2 的寄存器：若已在寄存器中且不是 destReg，直接用该寄存器
   const bool src2IsSmallImm =
       inst.src2.isImm() && inst.src2.immVal >= -2048 && inst.src2.immVal <= 2047;
   int imm = 0;
+  std::string src2Reg = "t1";
+  bool src2InReg = false;
   if (src2IsSmallImm) {
     imm = inst.src2.immVal;
-  } else {
+  } else if (inst.src2.isLocalVar()) {
+    auto it = frame_.regAlloc.find(inst.src2.name);
+    if (it != frame_.regAlloc.end()) {
+      std::string reg = "s" + std::to_string(it->second);
+      // 若 src2 的寄存器就是 destReg，加载 src1 会覆盖 src2，需用 t1
+      if (reg != destReg) {
+        src2Reg = reg;
+        src2InReg = true;
+      }
+    }
+  }
+  if (!src2IsSmallImm && !src2InReg) {
     loadOperand(inst.src2, "t1", out);
   }
 
-  // 再加载 src1 到 destReg（若 src1==dest 且都在寄存器，loadOperand 自动跳过 mv）
-  loadOperand(inst.src1, destReg, out);
+  // 确定 src1 的寄存器：若已在寄存器中，直接用该寄存器运算，避免 mv 到 destReg
+  std::string src1Reg = destReg;
+  if (inst.src1.isLocalVar()) {
+    auto it = frame_.regAlloc.find(inst.src1.name);
+    if (it != frame_.regAlloc.end()) {
+      src1Reg = "s" + std::to_string(it->second);
+    } else {
+      loadOperand(inst.src1, destReg, out);
+      src1Reg = destReg;
+    }
+  } else {
+    loadOperand(inst.src1, destReg, out);
+    src1Reg = destReg;
+  }
 
   // 执行运算，结果直接落在 destReg
   if (src2IsSmallImm) {
     switch (inst.op) {
     case IROp::ADD:
-      emit(out, "addi", destReg + ", " + destReg + ", " + std::to_string(imm));
+      emit(out, "addi", destReg + ", " + src1Reg + ", " + std::to_string(imm));
       break;
     case IROp::SUB:
-      emit(out, "addi", destReg + ", " + destReg + ", " + std::to_string(-imm));
+      emit(out, "addi", destReg + ", " + src1Reg + ", " + std::to_string(-imm));
       break;
     case IROp::MUL:
       if (imm > 0 && (imm & (imm - 1)) == 0) {
-        // 2 的幂：单条 slli
         emit(out, "slli",
-             destReg + ", " + destReg + ", " +
+             destReg + ", " + src1Reg + ", " +
                  std::to_string(__builtin_ctz(static_cast<unsigned>(imm))));
       } else if (imm == 3) {
-        emit(out, "slli", "t1, " + destReg + ", 1");
-        emit(out, "add", destReg + ", t1, " + destReg);
+        emit(out, "slli", "t1, " + src1Reg + ", 1");
+        emit(out, "add", destReg + ", t1, " + src1Reg);
       } else if (imm == 5) {
-        emit(out, "slli", "t1, " + destReg + ", 2");
-        emit(out, "add", destReg + ", t1, " + destReg);
+        emit(out, "slli", "t1, " + src1Reg + ", 2");
+        emit(out, "add", destReg + ", t1, " + src1Reg);
       } else if (imm == 7) {
-        emit(out, "slli", "t1, " + destReg + ", 3");
-        emit(out, "sub", destReg + ", t1, " + destReg);
+        emit(out, "slli", "t1, " + src1Reg + ", 3");
+        emit(out, "sub", destReg + ", t1, " + src1Reg);
       } else if (imm == 9) {
-        emit(out, "slli", "t1, " + destReg + ", 3");
-        emit(out, "add", destReg + ", t1, " + destReg);
+        emit(out, "slli", "t1, " + src1Reg + ", 3");
+        emit(out, "add", destReg + ", t1, " + src1Reg);
       } else if (imm == 15) {
-        emit(out, "slli", "t1, " + destReg + ", 4");
-        emit(out, "sub", destReg + ", t1, " + destReg);
+        emit(out, "slli", "t1, " + src1Reg + ", 4");
+        emit(out, "sub", destReg + ", t1, " + src1Reg);
       } else if (imm == -1) {
-        emit(out, "sub", destReg + ", x0, " + destReg);
+        emit(out, "sub", destReg + ", x0, " + src1Reg);
       } else if (imm < 0 && (-imm & (-imm - 1)) == 0) {
-        // 负的 2 的幂：x * (-2^n) = -(x << n)
         const int shift = __builtin_ctz(static_cast<unsigned>(-imm));
-        emit(out, "slli", destReg + ", " + destReg + ", " + std::to_string(shift));
+        emit(out, "slli", destReg + ", " + src1Reg + ", " + std::to_string(shift));
         emit(out, "sub", destReg + ", x0, " + destReg);
       } else {
         emit(out, "li", "t1, " + std::to_string(imm));
-        emit(out, "mul", destReg + ", " + destReg + ", t1");
+        emit(out, "mul", destReg + ", " + src1Reg + ", t1");
       }
       break;
     case IROp::DIV:
       emit(out, "li", "t1, " + std::to_string(imm));
-      emit(out, "div", destReg + ", " + destReg + ", t1");
+      emit(out, "div", destReg + ", " + src1Reg + ", t1");
       break;
     case IROp::MOD:
       emit(out, "li", "t1, " + std::to_string(imm));
-      emit(out, "rem", destReg + ", " + destReg + ", t1");
+      emit(out, "rem", destReg + ", " + src1Reg + ", t1");
       break;
     default:
       break;
@@ -564,19 +587,19 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
   } else {
     switch (inst.op) {
     case IROp::ADD:
-      emit(out, "add", destReg + ", " + destReg + ", t1");
+      emit(out, "add", destReg + ", " + src1Reg + ", " + src2Reg);
       break;
     case IROp::SUB:
-      emit(out, "sub", destReg + ", " + destReg + ", t1");
+      emit(out, "sub", destReg + ", " + src1Reg + ", " + src2Reg);
       break;
     case IROp::MUL:
-      emit(out, "mul", destReg + ", " + destReg + ", t1");
+      emit(out, "mul", destReg + ", " + src1Reg + ", " + src2Reg);
       break;
     case IROp::DIV:
-      emit(out, "div", destReg + ", " + destReg + ", t1");
+      emit(out, "div", destReg + ", " + src1Reg + ", " + src2Reg);
       break;
     case IROp::MOD:
-      emit(out, "rem", destReg + ", " + destReg + ", t1");
+      emit(out, "rem", destReg + ", " + src1Reg + ", " + src2Reg);
       break;
     default:
       break;
@@ -600,44 +623,67 @@ void CodeGenerator::emitCompareOp(const IRInst& inst, std::ostream& out) {
     }
   }
 
-  // 先处理 src2
+  // 确定 src2 的寄存器：若已在寄存器中且不是 destReg，直接用该寄存器
   const bool src2IsSmallImm =
       inst.src2.isImm() && inst.src2.immVal >= -2048 && inst.src2.immVal <= 2047;
   int imm = 0;
+  std::string src2Reg = "t1";
+  bool src2InReg = false;
   if (src2IsSmallImm) {
     imm = inst.src2.immVal;
-  } else {
+  } else if (inst.src2.isLocalVar()) {
+    auto it = frame_.regAlloc.find(inst.src2.name);
+    if (it != frame_.regAlloc.end()) {
+      std::string reg = "s" + std::to_string(it->second);
+      if (reg != destReg) {
+        src2Reg = reg;
+        src2InReg = true;
+      }
+    }
+  }
+  if (!src2IsSmallImm && !src2InReg) {
     loadOperand(inst.src2, "t1", out);
   }
 
-  loadOperand(inst.src1, destReg, out);
+  // 确定 src1 的寄存器：若已在寄存器中，直接用该寄存器做比较，避免 mv 到 destReg
+  std::string src1Reg = destReg;
+  if (inst.src1.isLocalVar()) {
+    auto it = frame_.regAlloc.find(inst.src1.name);
+    if (it != frame_.regAlloc.end()) {
+      src1Reg = "s" + std::to_string(it->second);
+    } else {
+      loadOperand(inst.src1, destReg, out);
+      src1Reg = destReg;
+    }
+  } else {
+    loadOperand(inst.src1, destReg, out);
+    src1Reg = destReg;
+  }
 
   if (src2IsSmallImm) {
     switch (inst.op) {
     case IROp::LT:
-      emit(out, "slti", destReg + ", " + destReg + ", " + std::to_string(imm));
+      emit(out, "slti", destReg + ", " + src1Reg + ", " + std::to_string(imm));
       break;
     case IROp::GT:
-      // x > imm  <=>  imm < x，需用 t1 加载 imm
       emit(out, "li", "t1, " + std::to_string(imm));
-      emit(out, "slt", destReg + ", t1, " + destReg);
+      emit(out, "slt", destReg + ", t1, " + src1Reg);
       break;
     case IROp::LE:
-      // x <= imm  <=>  x < imm+1
-      emit(out, "slti", destReg + ", " + destReg + ", " + std::to_string(imm + 1));
+      emit(out, "slti", destReg + ", " + src1Reg + ", " + std::to_string(imm + 1));
       break;
     case IROp::GE:
-      emit(out, "slti", destReg + ", " + destReg + ", " + std::to_string(imm));
+      emit(out, "slti", destReg + ", " + src1Reg + ", " + std::to_string(imm));
       emit(out, "xori", destReg + ", " + destReg + ", 1");
       break;
     case IROp::EQ:
       emit(out, "li", "t1, " + std::to_string(imm));
-      emit(out, "sub", destReg + ", " + destReg + ", t1");
+      emit(out, "sub", destReg + ", " + src1Reg + ", t1");
       emit(out, "seqz", destReg + ", " + destReg);
       break;
     case IROp::NE:
       emit(out, "li", "t1, " + std::to_string(imm));
-      emit(out, "sub", destReg + ", " + destReg + ", t1");
+      emit(out, "sub", destReg + ", " + src1Reg + ", t1");
       emit(out, "snez", destReg + ", " + destReg);
       break;
     default:
@@ -646,25 +692,25 @@ void CodeGenerator::emitCompareOp(const IRInst& inst, std::ostream& out) {
   } else {
     switch (inst.op) {
     case IROp::LT:
-      emit(out, "slt", destReg + ", " + destReg + ", t1");
+      emit(out, "slt", destReg + ", " + src1Reg + ", " + src2Reg);
       break;
     case IROp::GT:
-      emit(out, "slt", destReg + ", t1, " + destReg);
+      emit(out, "slt", destReg + ", " + src2Reg + ", " + src1Reg);
       break;
     case IROp::LE:
-      emit(out, "slt", destReg + ", t1, " + destReg);
+      emit(out, "slt", destReg + ", " + src2Reg + ", " + src1Reg);
       emit(out, "xori", destReg + ", " + destReg + ", 1");
       break;
     case IROp::GE:
-      emit(out, "slt", destReg + ", " + destReg + ", t1");
+      emit(out, "slt", destReg + ", " + src1Reg + ", " + src2Reg);
       emit(out, "xori", destReg + ", " + destReg + ", 1");
       break;
     case IROp::EQ:
-      emit(out, "sub", destReg + ", " + destReg + ", t1");
+      emit(out, "sub", destReg + ", " + src1Reg + ", " + src2Reg);
       emit(out, "seqz", destReg + ", " + destReg);
       break;
     case IROp::NE:
-      emit(out, "sub", destReg + ", " + destReg + ", t1");
+      emit(out, "sub", destReg + ", " + src1Reg + ", " + src2Reg);
       emit(out, "snez", destReg + ", " + destReg);
       break;
     default:
