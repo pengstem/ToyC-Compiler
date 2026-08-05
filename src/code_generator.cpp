@@ -25,8 +25,14 @@ int alignTo(int value, int alignment) {
 
 int CodeGenerator::StackFrame::frameSizeBytes() const {
   const int reservedWords = 2 + static_cast<int>(usedCalleeSavedRegisters.size());
-  const int computedLocalBytes =
-      std::max(this->localBytes, static_cast<int>(localOffsets.size()) * kWordBytes);
+  // 局部变量栈槽数：取最大有效索引 +1（已分配寄存器的变量标记为 -1，不占槽）
+  int maxSlot = -1;
+  for (const auto& entry : localOffsets) {
+    if (entry.second > maxSlot) {
+      maxSlot = entry.second;
+    }
+  }
+  const int computedLocalBytes = std::max(localBytes, (maxSlot + 1) * kWordBytes);
   return alignTo((reservedWords * kWordBytes) + computedLocalBytes + outgoingArgumentBytes,
                  kStackAlignmentBytes);
 }
@@ -192,15 +198,43 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
     }
   }
 
-  // 更新 usedCalleeSavedRegisters：包含所有分配的 s 寄存器
+  // 已分配寄存器的局部变量无需栈槽：紧凑重编号，只统计未分配寄存器的变量
+  int stackSlotCount = 0;
+  for (auto& entry : frame.localOffsets) {
+    if (frame.regAlloc.find(entry.first) != frame.regAlloc.end()) {
+      entry.second = -1; // 标记：无栈槽
+    } else {
+      entry.second = stackSlotCount++;
+    }
+  }
+
+  // 统计实际被指令引用的 s 寄存器（避免保存未使用的寄存器，精简 prologue/epilogue）
+  std::vector<bool> regUsed(10, false); // 索引 0..9 对应 s2..s11
+  for (std::size_t i = function.begin; i < function.end; ++i) {
+    const auto& inst = ir_[i];
+    const Operand* operands[3] = {&inst.dest, &inst.src1, &inst.src2};
+    for (const Operand* op : operands) {
+      if (op->isLocalVar()) {
+        auto it = frame.regAlloc.find(op->name);
+        if (it != frame.regAlloc.end()) {
+          const int idx = it->second - 2;
+          if (idx >= 0 && idx < 10) {
+            regUsed[static_cast<std::size_t>(idx)] = true;
+          }
+        }
+      }
+    }
+  }
+
+  // 更新 usedCalleeSavedRegisters：只保存实际使用的 s 寄存器
   frame.usedCalleeSavedRegisters.clear();
   for (int r = 2; r <= 11; ++r) {
-    if (r < nextReg) {
+    if (r < nextReg && regUsed[static_cast<std::size_t>(r - 2)]) {
       frame.usedCalleeSavedRegisters.push_back("s" + std::to_string(r));
     }
   }
 
-  frame.localBytes = static_cast<int>(frame.localOffsets.size()) * kWordBytes;
+  frame.localBytes = stackSlotCount * kWordBytes;
   frame.outgoingArgumentBytes = maxOverflowArgs * kWordBytes;
   return frame;
 }
@@ -209,8 +243,44 @@ void CodeGenerator::generateFunction(const FunctionRange& function, std::ostream
   frame_ = analyzeStackFrame(function);
   currentFunction_ = function.name;
   currentParamIndex_ = 0;
+  tailCalls_ = detectTailCalls(function);
 
-  // 先生成到缓冲区，再做汇编级窥孔优化（合并比较+分支），最后输出
+  const auto isTailCallIndex = [this](std::size_t index) {
+    for (const auto& tc : tailCalls_) {
+      if (tc.callIndex == index) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // 第一遍：生成函数体（不含 prologue/epilogue），窥孔优化后扫描实际使用的 s 寄存器，
+  // 避免把被比较+分支窥孔合并吞掉的临时寄存器（如 slt 的结果）计入保存列表
+  std::ostringstream bodyOnly;
+  bool seenTailCall = false;
+  for (std::size_t i = function.begin; i < function.end; ++i) {
+    const auto& inst = ir_[i];
+    if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
+      continue;
+    }
+    if (inst.op == IROp::RETURN && seenTailCall) {
+      continue; // 尾调用后的 RETURN 不可达，跳过
+    }
+    if (inst.op == IROp::CALL && isTailCallIndex(i)) {
+      // 最小化尾调用序列（仅跳转），不影响 s 寄存器扫描
+      bodyOnly << "    j " << inst.src1.name << "\n";
+      seenTailCall = true;
+      continue;
+    }
+    generateInstruction(inst, bodyOnly);
+  }
+
+  std::ostringstream peepBody;
+  applyPeephole(bodyOnly.str(), peepBody);
+  frame_.usedCalleeSavedRegisters.clear();
+  scanUsedSRegisters(peepBody.str(), frame_.usedCalleeSavedRegisters);
+
+  // 第二遍：按最终帧布局重新生成（局部变量栈偏移依赖 usedCalleeSavedRegisters 数量）
   std::ostringstream body;
   emitRaw(body, "    .align 2\n");
   emitRaw(body, "    .globl " + function.name + "\n");
@@ -219,9 +289,27 @@ void CodeGenerator::generateFunction(const FunctionRange& function, std::ostream
 
   emitPrologue(frame_, body);
 
+  // 自递归尾调用跳回点：位于参数装载之前（复用当前栈帧，等价于循环）
+  body << ".L_" << function.name << "_body:\n";
+
+  currentParamIndex_ = 0;
+  seenTailCall = false;
   for (std::size_t i = function.begin; i < function.end; ++i) {
     const auto& inst = ir_[i];
     if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
+      continue;
+    }
+    if (inst.op == IROp::RETURN && seenTailCall) {
+      continue; // 尾调用后的 RETURN 不可达，跳过
+    }
+    if (inst.op == IROp::CALL && isTailCallIndex(i)) {
+      for (const auto& tc : tailCalls_) {
+        if (tc.callIndex == i) {
+          emitTailCall(tc, body);
+          break;
+        }
+      }
+      seenTailCall = true;
       continue;
     }
     generateInstruction(inst, body);
@@ -545,6 +633,104 @@ void CodeGenerator::applyPeephole(const std::string& asmText, std::ostream& out)
       }
     }
 
+    // 模式9: 立即数相等/不等比较 + 分支
+    // li t1, imm + sub rd, rs, t1 + seqz rd, rd + beqz rd, L -> addi rd, rs, -imm + beqz rd, L
+    // li t1, imm + sub rd, rs, t1 + snez rd, rd + bnez rd, L -> addi rd, rs, -imm + bnez rd, L
+    if (op == "li" && args.size() == 2 && args[0] == "t1" && i + 3 < n) {
+      int immVal = 0;
+      try {
+        immVal = std::stoi(args[1]);
+      } catch (...) {
+        immVal = 0;
+        if (args[1] == "-2147483648") {
+          // 超出 addi 范围，跳过
+        }
+      }
+      const AsmToken t1 = parseAsmLine(lines[i + 1]);
+      const AsmToken t2 = parseAsmLine(lines[i + 2]);
+      const AsmToken t3 = parseAsmLine(lines[i + 3]);
+      // 仅当 -imm 可用 addi 表示时才替换
+      // 四种组合：
+      //   seqz+beqz（跳转当 rs != imm）-> addi + bnez
+      //   snez+beqz（跳转当 rs == imm）-> addi + beqz
+      //   seqz+bnez（跳转当 rs == imm）-> addi + beqz
+      //   snez+bnez（跳转当 rs != imm）-> addi + bnez
+      if (immVal >= -2047 && immVal <= 2048) {
+        // sub rd, rs, t1：t1 是第三个操作数
+        if (t1.opcode == "sub" && t1.args.size() == 3 && t1.args[2] == "t1" &&
+            ((t2.opcode == "seqz" && t3.opcode == "beqz") ||
+             (t2.opcode == "snez" && t3.opcode == "bnez"))) {
+          const bool jumpWhenNe = (t2.opcode == "seqz"); // seqz+beqz 与 snez+bnez 都是跳转当不等
+          if (t2.args.size() == 2 && t2.args[0] == t1.args[0] && t2.args[1] == t1.args[0] &&
+              t3.args.size() == 2 && t3.args[0] == t1.args[0]) {
+            emit(out, "addi", t1.args[0] + ", " + t1.args[1] + ", " + std::to_string(-immVal));
+            emit(out, (jumpWhenNe ? "bnez" : "beqz"), t1.args[0] + ", " + t3.args[1]);
+            i += 3;
+            continue;
+          }
+        }
+        if (t1.opcode == "sub" && t1.args.size() == 3 && t1.args[2] == "t1" &&
+            ((t2.opcode == "seqz" && t3.opcode == "bnez") ||
+             (t2.opcode == "snez" && t3.opcode == "beqz"))) {
+          const bool jumpWhenEq = (t2.opcode == "snez"); // snez+beqz 与 seqz+bnez 都是跳转当相等
+          if (t2.args.size() == 2 && t2.args[0] == t1.args[0] && t2.args[1] == t1.args[0] &&
+              t3.args.size() == 2 && t3.args[0] == t1.args[0]) {
+            emit(out, "addi", t1.args[0] + ", " + t1.args[1] + ", " + std::to_string(-immVal));
+            emit(out, (jumpWhenEq ? "beqz" : "bnez"), t1.args[0] + ", " + t3.args[1]);
+            i += 3;
+            continue;
+          }
+        }
+      }
+    }
+
+    // 模式10: slti rd, rs, imm + xori rd, rd, 1 + beqz/bnez rd, L
+    // -> addi rd, rs, -imm + bltz/bgez rd, L（需 -imm 可表示）
+    // slti rd, rs, imm = rs < imm; xori 后 = rs >= imm
+    //   beqz（跳转当 rs < imm）-> bltz
+    //   bnez（跳转当 rs >= imm）-> bgez
+    if (op == "slti" && args.size() == 3 && i + 2 < n) {
+      int immVal = 0;
+      try {
+        immVal = std::stoi(args[2]);
+      } catch (...) {
+        immVal = 0;
+      }
+      const AsmToken t1 = parseAsmLine(lines[i + 1]);
+      const AsmToken t2 = parseAsmLine(lines[i + 2]);
+      if (immVal != -2048 && t1.opcode == "xori" && t1.args.size() == 3 && t1.args[0] == args[0] &&
+          t1.args[1] == args[0] && t1.args[2] == "1") {
+        if (t2.opcode == "beqz" && t2.args.size() == 2 && t2.args[0] == args[0]) {
+          emit(out, "addi", args[0] + ", " + args[1] + ", " + std::to_string(-immVal));
+          emit(out, "bltz", args[0] + ", " + t2.args[1]);
+          i += 2;
+          continue;
+        }
+        if (t2.opcode == "bnez" && t2.args.size() == 2 && t2.args[0] == args[0]) {
+          emit(out, "addi", args[0] + ", " + args[1] + ", " + std::to_string(-immVal));
+          emit(out, "bgez", args[0] + ", " + t2.args[1]);
+          i += 2;
+          continue;
+        }
+      }
+      // 模式11: slti rd, rs, 0/1 + beqz/bnez rd, L -> 零比较分支
+      //   slti rd, rs, 0 + beqz -> bgez rs（rs >= 0）; slti rd, rs, 0 + bnez -> bltz rs
+      //   slti rd, rs, 1 + beqz -> bgtz rs（rs > 0）; slti rd, rs, 1 + bnez -> blez rs
+      if ((immVal == 0 || immVal == 1) && i + 1 < n) {
+        const bool isOne = (immVal == 1);
+        if (t1.opcode == "beqz" && t1.args.size() == 2 && t1.args[0] == args[0]) {
+          emit(out, (isOne ? "bgtz" : "bgez"), args[1] + ", " + t1.args[1]);
+          ++i;
+          continue;
+        }
+        if (t1.opcode == "bnez" && t1.args.size() == 2 && t1.args[0] == args[0]) {
+          emit(out, (isOne ? "blez" : "bltz"), args[1] + ", " + t1.args[1]);
+          ++i;
+          continue;
+        }
+      }
+    }
+
     out << lines[i] << "\n";
   }
 }
@@ -713,12 +899,38 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
       }
       break;
     case IROp::DIV:
-      emit(out, "li", "t1, " + std::to_string(imm));
-      emit(out, "div", destReg + ", " + src1Reg + ", t1");
+      if (imm > 0 && (imm & (imm - 1)) == 0) {
+        // x / 2^n（向零取整）: t=(x>>31)>>(32-n); q=(x+t)>>n
+        const int shift = __builtin_ctz(static_cast<unsigned>(imm));
+        emit(out, "srai", "t1, " + src1Reg + ", 31");
+        emit(out, "srli", "t1, t1, " + std::to_string(32 - shift));
+        emit(out, "add", "t1, " + src1Reg + ", t1");
+        emit(out, "srai", destReg + ", t1, " + std::to_string(shift));
+      } else if (imm == -1) {
+        emit(out, "sub", destReg + ", x0, " + src1Reg);
+      } else {
+        emit(out, "li", "t1, " + std::to_string(imm));
+        emit(out, "div", destReg + ", " + src1Reg + ", t1");
+      }
       break;
     case IROp::MOD:
-      emit(out, "li", "t1, " + std::to_string(imm));
-      emit(out, "rem", destReg + ", " + src1Reg + ", t1");
+      if (imm > 0 && (imm & (imm - 1)) == 0) {
+        // x % 2^n = x - (x / 2^n) * 2^n（对任意符号正确的向零取模）
+        const int shift = __builtin_ctz(static_cast<unsigned>(imm));
+        emit(out, "srai", "t1, " + src1Reg + ", 31");
+        emit(out, "srli", "t1, t1, " + std::to_string(32 - shift));
+        emit(out, "add", "t1, " + src1Reg + ", t1");
+        emit(out, "srai", "t1, t1, " + std::to_string(shift));
+        emit(out, "slli", "t1, t1, " + std::to_string(shift));
+        emit(out, "sub", destReg + ", " + src1Reg + ", t1");
+      } else if (imm == 1) {
+        emit(out, "li", destReg + ", 0");
+      } else if (imm == -1) {
+        emit(out, "li", destReg + ", 0");
+      } else {
+        emit(out, "li", "t1, " + std::to_string(imm));
+        emit(out, "rem", destReg + ", " + src1Reg + ", t1");
+      }
       break;
     default:
       break;
@@ -871,6 +1083,110 @@ void CodeGenerator::emitCall(const IRInst& inst, std::ostream& out) {
   }
 }
 
+std::vector<CodeGenerator::TailCallInfo>
+CodeGenerator::detectTailCalls(const FunctionRange& function) const {
+  std::vector<TailCallInfo> result;
+  for (std::size_t i = function.begin; i + 1 < function.end; ++i) {
+    const auto& inst = ir_[i];
+    if (inst.op != IROp::CALL || !inst.src1.isFunc()) {
+      continue;
+    }
+    const auto& next = ir_[i + 1];
+    // 尾位置：CALL 之后立即是 RETURN，且 CALL 的结果（若有）正是该 RETURN 的返回值
+    bool tailPosition = false;
+    if (inst.dest.isLocalVar()) {
+      tailPosition =
+          (next.op == IROp::RETURN && next.dest.isLocalVar() && next.dest.name == inst.dest.name);
+    } else if (inst.dest.isNone()) {
+      tailPosition = (next.op == IROp::RETURN && next.dest.isNone());
+    }
+    if (!tailPosition) {
+      continue;
+    }
+    // 确保 CALL 之后除 RETURN 外没有其他指令（避免死代码之外的控制流）
+    bool trailingOnlyReturns = true;
+    for (std::size_t j = i + 2; j < function.end; ++j) {
+      if (ir_[j].op != IROp::RETURN) {
+        trailingOnlyReturns = false;
+        break;
+      }
+    }
+    if (!trailingOnlyReturns) {
+      continue;
+    }
+    // 检查是否有溢出参数（>8 个实参），尾调用下栈帧恢复会导致偏移错位，保守跳过
+    bool hasOverflowArgs = false;
+    for (std::size_t j = i; j > function.begin; --j) {
+      const auto& prev = ir_[j - 1];
+      if (prev.op == IROp::PARAM) {
+        if (prev.src1.immVal >= 8) {
+          hasOverflowArgs = true;
+          break;
+        }
+      } else {
+        break;
+      }
+    }
+    if (hasOverflowArgs) {
+      continue;
+    }
+    TailCallInfo info;
+    info.callIndex = i;
+    info.target = inst.src1.name;
+    info.isSelf = (inst.src1.name == function.name);
+    result.push_back(info);
+  }
+  return result;
+}
+
+void CodeGenerator::emitTailCall(const TailCallInfo& tailCall, std::ostream& out) const {
+  if (tailCall.isSelf) {
+    // 自递归尾调用：实参已在 a0-a7，直接跳回函数体入口（参数装载点），
+    // 复用当前栈帧，等价于把递归转换成循环，避免每次迭代的帧设置/恢复开销
+    emit(out, "j", ".L_" + frame_.functionName + "_body");
+    return;
+  }
+  // 实参已由前置 PARAM 指令装载到 a0-a7，恢复被调用者保存寄存器后直接跳转
+  int restoreOffset = -12;
+  for (const auto& reg : frame_.usedCalleeSavedRegisters) {
+    emit(out, "lw", reg + ", " + std::to_string(restoreOffset) + "(s0)");
+    restoreOffset -= 4;
+  }
+  emit(out, "lw", "ra, -4(s0)");
+  emit(out, "lw", "s0, -8(s0)");
+  emit(out, "addi", "sp, sp, " + std::to_string(frame_.frameSizeBytes()));
+  emit(out, "j", tailCall.target);
+}
+
+void CodeGenerator::scanUsedSRegisters(const std::string& asmText,
+                                       std::vector<std::string>& used) const {
+  std::vector<bool> seen(10, false);
+  std::istringstream iss(asmText);
+  std::string line;
+  while (std::getline(iss, line)) {
+    const AsmToken tok = parseAsmLine(line);
+    for (const auto& arg : tok.args) {
+      if (arg.size() >= 2 && arg[0] == 's' && arg.size() <= 3) {
+        const bool isSReg =
+            (arg == "s2" || arg == "s3" || arg == "s4" || arg == "s5" || arg == "s6" ||
+             arg == "s7" || arg == "s8" || arg == "s9" || arg == "s10" || arg == "s11");
+        if (isSReg) {
+          const int idx = (arg.size() == 3) ? (arg[1] - '0') * 10 + (arg[2] - '0') : (arg[1] - '0');
+          if (idx >= 2 && idx <= 11) {
+            seen[static_cast<std::size_t>(idx - 2)] = true;
+          }
+        }
+      }
+    }
+  }
+  used.clear();
+  for (int r = 2; r <= 11; ++r) {
+    if (seen[static_cast<std::size_t>(r - 2)]) {
+      used.push_back("s" + std::to_string(r));
+    }
+  }
+}
+
 std::string CodeGenerator::destRegOrT0(const Operand& dest) const {
   if (dest.isLocalVar()) {
     auto it = frame_.regAlloc.find(dest.name);
@@ -901,7 +1217,7 @@ int CodeGenerator::localOffset(const Operand& operand) const {
     return 0;
   }
   const auto it = frame_.localOffsets.find(operand.name);
-  if (it == frame_.localOffsets.end()) {
+  if (it == frame_.localOffsets.end() || it->second < 0) {
     return 0;
   }
   const int reservedWords = 2 + static_cast<int>(frame_.usedCalleeSavedRegisters.size());

@@ -1303,7 +1303,8 @@ void testIntegration_functionCall() {
   std::string asmOutput = out.str();
 
   if (asmOutput.find("add:") != std::string::npos && asmOutput.find("main:") != std::string::npos &&
-      asmOutput.find("call") != std::string::npos) {
+      (asmOutput.find("call") != std::string::npos ||
+       asmOutput.find("    j add\n") != std::string::npos)) {
     testPass();
   } else {
     testFail("function call RISC-V mismatch:\n" + asmOutput);

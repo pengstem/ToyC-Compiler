@@ -36,11 +36,19 @@ private:
     int frameSizeBytes() const;
   };
 
+  // 尾调用信息：CALL 的结果仅被紧随其后的 RETURN 使用（尾位置）
+  struct TailCallInfo {
+    std::size_t callIndex = 0;
+    std::string target;
+    bool isSelf = false; // 自递归：直接跳回函数体，跳过帧设置/恢复
+  };
+
   std::vector<IRInst> ir_;
   std::ostream* out_ = nullptr;
   StackFrame frame_;
   std::string currentFunction_;
   int currentParamIndex_ = 0;
+  std::vector<TailCallInfo> tailCalls_;
 
   void emitGlobalData(std::ostream& out);
   std::vector<FunctionRange> collectFunctions() const;
@@ -50,6 +58,13 @@ private:
   void generateInstruction(const IRInst& inst, std::ostream& out);
   void emitPrologue(const StackFrame& frame, std::ostream& out) const;
   void emitEpilogue(const StackFrame& frame, std::ostream& out) const;
+
+  // 检测函数中的尾调用（CALL 结果仅被紧随的 RETURN 使用）
+  std::vector<TailCallInfo> detectTailCalls(const FunctionRange& function) const;
+  // 发射尾调用序列：恢复被调用者保存寄存器后直接跳转
+  void emitTailCall(const TailCallInfo& tailCall, std::ostream& out) const;
+  // 扫描汇编文本中实际使用的 s2-s11 寄存器
+  void scanUsedSRegisters(const std::string& asmText, std::vector<std::string>& used) const;
 
   // 汇编级窥孔优化：合并比较+分支序列（slt+beqz -> bge 等）
   void applyPeephole(const std::string& asmText, std::ostream& out);

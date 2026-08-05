@@ -595,6 +595,7 @@ void countUses(const std::vector<IRInst>& ir, std::unordered_map<std::string, in
       useCount[inst.src2.name]++;
     }
     // RETURN 和 PARAM 的 dest 实际上是源操作数（被使用的值）
+    // 普通指令的 dest 是定义而非使用，不计数（否则会阻止 OP+ASSIGN 合并）
     if (inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
       if (inst.dest.isLocalVar()) {
         useCount[inst.dest.name]++;
@@ -865,26 +866,130 @@ void IRGenerator::optimizePass() {
     }
 
     // Pass 1: 合并 OP+ASSIGN 模式
+    // "OP t, a, b; ASSIGN x, t" -> "OP x, a, b"
+    // 同时把后续对 t 的引用替换为 x（仅限 x 未被重新赋值之前），
+    // 消除 sum = sum op expr 时多余的临时寄存器往返
     {
-      std::unordered_map<std::string, int> useCount;
-      countUses(ir, useCount);
-
       std::vector<IRInst> optimized;
       std::size_t i = 0;
       while (i < ir.size()) {
+        bool mergedHere = false;
         if (i + 1 < ir.size() && isCombinableOp(ir[i].op) && ir[i].dest.isLocalVar() &&
             ir[i + 1].op == IROp::ASSIGN && ir[i + 1].src1.isLocalVar() &&
-            ir[i + 1].src1.name == ir[i].dest.name && useCount[ir[i].dest.name] == 1 &&
+            ir[i + 1].src1.name == ir[i].dest.name && ir[i].dest.name != ir[i + 1].dest.name &&
             (ir[i + 1].dest.isLocalVar() || ir[i + 1].dest.isGlobalVar())) {
-          IRInst merged = ir[i];
-          merged.dest = ir[i + 1].dest;
-          optimized.push_back(merged);
-          i += 2;
-          changed = true;
-        } else {
+          const std::string tmp = ir[i].dest.name;
+          const std::string target = ir[i + 1].dest.name;
+          // 向后扫描：收集在 target 被重新赋值之前对 tmp 的引用
+          std::vector<std::size_t> refsToReplace;
+          bool ok = true;
+          for (std::size_t j = i + 2; j < ir.size(); ++j) {
+            const auto& inst = ir[j];
+            // 控制流/调用边界：保守停止
+            if (inst.op == IROp::LABEL || inst.op == IROp::BRANCH || inst.op == IROp::BEQZ ||
+                inst.op == IROp::BNEZ || inst.op == IROp::CALL) {
+              break;
+            }
+            // target 被重新赋值：之后的 tmp 引用不能再替换
+            // （RETURN/PARAM 的 dest 是读取而非赋值，须排除）
+            if (inst.op != IROp::RETURN && inst.op != IROp::PARAM) {
+              if (inst.dest.isLocalVar() && inst.dest.name == target) {
+                break;
+              }
+              if (inst.dest.isGlobalVar() && inst.dest.name == target) {
+                break;
+              }
+              // tmp 被重新定义（不再是 target 的值）
+              if (inst.dest.isLocalVar() && inst.dest.name == tmp) {
+                break;
+              }
+            }
+            // 记录 tmp 引用
+            const bool usesTmp = (inst.src1.isLocalVar() && inst.src1.name == tmp) ||
+                                 (inst.src2.isLocalVar() && inst.src2.name == tmp) ||
+                                 ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) &&
+                                  inst.dest.isLocalVar() && inst.dest.name == tmp);
+            if (usesTmp) {
+              refsToReplace.push_back(j);
+            }
+          }
+          if (ok) {
+            IRInst merged = ir[i];
+            merged.dest = ir[i + 1].dest;
+            optimized.push_back(merged);
+            // 将收集到的 tmp 引用替换为 target
+            for (const std::size_t idx : refsToReplace) {
+              if (ir[idx].src1.isLocalVar() && ir[idx].src1.name == tmp) {
+                ir[idx].src1 = Operand::localVar(target);
+              }
+              if (ir[idx].src2.isLocalVar() && ir[idx].src2.name == tmp) {
+                ir[idx].src2 = Operand::localVar(target);
+              }
+              if ((ir[idx].op == IROp::RETURN || ir[idx].op == IROp::PARAM) &&
+                  ir[idx].dest.isLocalVar() && ir[idx].dest.name == tmp) {
+                ir[idx].dest = Operand::localVar(target);
+              }
+            }
+            i += 2;
+            changed = true;
+            mergedHere = true;
+          }
+        }
+        if (!mergedHere) {
           optimized.push_back(ir[i]);
           i += 1;
         }
+      }
+      if (ir.size() != optimized.size()) {
+        ir = std::move(optimized);
+      }
+    }
+
+    // Pass 1.5: 公共子表达式消除（基本块内）
+    // 在无控制流的直线代码段内，若 (op, src1, src2) 已计算过且操作数未在块内被重新定义，
+    // 则复用之前的结果（IR 变量唯一命名，值一旦定义不再改变）
+    {
+      std::unordered_map<std::string, std::string> rename;   // 原名 → 复用名
+      std::unordered_map<std::string, std::string> valueMap; // (op,src1,src2) → 结果变量
+      std::vector<IRInst> optimized;
+      for (const auto& inst : ir) {
+        // 控制流/调用/内存边界：重置所有映射（保守处理）
+        if (inst.op == IROp::LABEL || inst.op == IROp::BRANCH || inst.op == IROp::BEQZ ||
+            inst.op == IROp::BNEZ || inst.op == IROp::CALL || inst.op == IROp::LOAD ||
+            inst.op == IROp::STORE || inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
+          valueMap.clear();
+        }
+        IRInst cur = inst;
+        // 源操作数重命名
+        if (cur.src1.isLocalVar()) {
+          auto it = rename.find(cur.src1.name);
+          if (it != rename.end()) {
+            cur.src1 = Operand::localVar(it->second);
+          }
+        }
+        if (cur.src2.isLocalVar()) {
+          auto it = rename.find(cur.src2.name);
+          if (it != rename.end()) {
+            cur.src2 = Operand::localVar(it->second);
+          }
+        }
+        if (isCombinableOp(cur.op) && cur.dest.isLocalVar() && isTempName(cur.dest.name) &&
+            cur.op != IROp::NOT && cur.src1.type != OperandType::NONE &&
+            cur.src2.type != OperandType::NONE && (cur.src1.isLocalVar() || cur.src1.isImm()) &&
+            (cur.src2.isLocalVar() || cur.src2.isImm())) {
+          const std::string key =
+              std::string(irOpToString(cur.op)) + "|" +
+              (cur.src1.isImm() ? std::to_string(cur.src1.immVal) : cur.src1.name) + "|" +
+              (cur.src2.isImm() ? std::to_string(cur.src2.immVal) : cur.src2.name);
+          auto it = valueMap.find(key);
+          if (it != valueMap.end()) {
+            rename[cur.dest.name] = it->second;
+            changed = true;
+            continue; // 冗余指令不再发射
+          }
+          valueMap[key] = cur.dest.name;
+        }
+        optimized.push_back(cur);
       }
       if (ir.size() != optimized.size()) {
         ir = std::move(optimized);
@@ -1004,6 +1109,91 @@ void IRGenerator::optimizePass() {
         ir = std::move(optimized);
       } else {
         ir = optimized;
+      }
+    }
+
+    // Pass 4: 循环不变代码外提（LICM）
+    // 针对反转后的循环结构：
+    //   BRANCH Lc; LABEL Lb; <body>; LABEL Lc; <cond>; BNEZ Lb
+    // 将 body 中循环不变（操作数不在循环内被定义）且无副作用（不含 DIV/MOD，避免除零陷阱）的
+    // 纯运算指令外提到循环入口之前。循环可能执行 0 次，但纯指令无副作用，外提安全。
+    {
+      std::vector<IRInst> optimized;
+      std::size_t i = 0;
+      bool licmChanged = false;
+      while (i < ir.size()) {
+        // 查找反转循环: BRANCH Lc
+        if (ir[i].op == IROp::BRANCH && i + 1 < ir.size() && ir[i + 1].op == IROp::LABEL) {
+          const std::string condLabel = ir[i].dest.name;
+          const std::string bodyLabel = ir[i + 1].dest.name;
+          // 向后扫描: LABEL condLabel 之后是 cond + BNEZ bodyLabel
+          std::size_t condIdx = i + 2;
+          for (; condIdx < ir.size(); ++condIdx) {
+            if (ir[condIdx].op == IROp::LABEL && ir[condIdx].dest.name == condLabel) {
+              break;
+            }
+          }
+          std::size_t bnezIdx = condIdx + 1;
+          for (; bnezIdx < ir.size(); ++bnezIdx) {
+            if (ir[bnezIdx].op == IROp::BNEZ && ir[bnezIdx].dest.name == bodyLabel) {
+              break;
+            }
+          }
+          if (condIdx < ir.size() && bnezIdx < ir.size()) {
+            // 收集循环范围内被定义的局部变量（body + cond）
+            std::unordered_map<std::string, bool> definedInLoop;
+            for (std::size_t k = i + 2; k < bnezIdx; ++k) {
+              if (ir[k].dest.isLocalVar()) {
+                definedInLoop[ir[k].dest.name] = true;
+              }
+            }
+            // 操作数必须在循环内不被定义
+            auto operandInvariant = [&](const Operand& op) {
+              if (!op.isLocalVar()) {
+                return true; // 立即数/全局常量视为不变（全局变量不可变）
+              }
+              return definedInLoop.count(op.name) == 0;
+            };
+            // 待外提指令与原序保留指令
+            // 注意范围从 i+1 开始：LABEL Lb 属于循环体，必须保留在原位（hoisted 之后），
+            // 否则 BNEZ Lb 会跳回已外提的指令，导致不变计算被重复执行
+            std::vector<IRInst> hoisted;
+            std::vector<IRInst> kept;
+            for (std::size_t k = i + 1; k < condIdx; ++k) {
+              const auto& inst = ir[k];
+              const bool pure =
+                  inst.op == IROp::ADD || inst.op == IROp::SUB || inst.op == IROp::MUL ||
+                  inst.op == IROp::NOT || inst.op == IROp::LT || inst.op == IROp::GT ||
+                  inst.op == IROp::LE || inst.op == IROp::GE || inst.op == IROp::EQ ||
+                  inst.op == IROp::NE ||
+                  (inst.op == IROp::ASSIGN && inst.dest.isLocalVar() && isTempName(inst.dest.name));
+              if (pure && inst.dest.isLocalVar() && isTempName(inst.dest.name) &&
+                  operandInvariant(inst.src1) && operandInvariant(inst.src2)) {
+                hoisted.push_back(inst);
+                licmChanged = true;
+              } else {
+                kept.push_back(inst);
+              }
+            }
+            if (!hoisted.empty()) {
+              optimized.push_back(ir[i]); // BRANCH Lc
+              for (auto& h : hoisted) {
+                optimized.push_back(h);
+              }
+              for (auto& ke : kept) {
+                optimized.push_back(ke);
+              }
+              i = condIdx; // 已处理 [i+2, condIdx)，跳到 LABEL Lc
+              continue;
+            }
+          }
+        }
+        optimized.push_back(ir[i]);
+        ++i;
+      }
+      if (licmChanged) {
+        ir = std::move(optimized);
+        changed = true;
       }
     }
   }
