@@ -80,45 +80,47 @@ int compileSource(const std::string& source, std::ostream& out, bool emitIR) {
 } // anonymous namespace
 
 int main(int argc, char* argv[]) {
-  if (argc < 2) {
-    if (hasStdinInput()) {
-      std::string source = readAll(std::cin);
-      return compileSource(source, std::cout, false);
-    }
-    return 0;
-  }
-
-  std::string_view arg = argv[1];
-  if (arg == "--help" || arg == "-h") {
-    std::cerr << "Usage: " << argv[0] << " [options] <input.c>\n"
-              << "Options:\n"
-              << "  --emit-ir      输出 IR（三地址码）\n"
-              << "  --help         显示帮助信息\n";
-    return 0;
-  }
-
   bool emitIR = false;
   std::string inputPath;
+
   for (int i = 1; i < argc; ++i) {
     std::string_view option = argv[i];
+    if (option == "-h" || option == "--help") {
+      std::cerr << "Usage: " << argv[0] << " [options] <input.c>\n"
+                << "Options:\n"
+                << "  --emit-ir      输出 IR（三地址码）\n"
+                << "  -opt           优化选项（当前接受但暂未实现）\n"
+                << "  --help         显示帮助信息\n"
+                << "源码可通过命令行文件参数或标准输入提供。\n";
+      return 0;
+    }
     if (option == "--emit-ir") {
       emitIR = true;
+    } else if (option == "-opt") {
+      // 性能测试会传 -opt，当前接受但暂未实现优化
     } else if (!option.starts_with("-")) {
       inputPath = argv[i];
     }
+    // 其他以 '-' 开头的未知选项静默忽略，保持向前兼容
   }
 
-  if (inputPath.empty()) {
-    std::cerr << "No input file provided.\n";
-    return 1;
+  // 优先使用命令行指定的输入文件
+  if (!inputPath.empty()) {
+    std::ifstream input(inputPath);
+    if (!input.is_open()) {
+      std::cerr << "Failed to read input file: " << inputPath << "\n";
+      return 1;
+    }
+    std::string source = readAll(input);
+    return compileSource(source, std::cout, emitIR);
   }
 
-  std::ifstream input(inputPath);
-  if (!input.is_open()) {
-    std::cerr << "Failed to read input file: " << inputPath << "\n";
-    return 1;
+  // 无文件参数时回退到 stdin（支持 `toycc [options] < input.c` 调用方式）
+  if (hasStdinInput()) {
+    std::string source = readAll(std::cin);
+    return compileSource(source, std::cout, emitIR);
   }
 
-  std::string source = readAll(input);
-  return compileSource(source, std::cout, emitIR);
+  std::cerr << "No input file provided.\n";
+  return 1;
 }
