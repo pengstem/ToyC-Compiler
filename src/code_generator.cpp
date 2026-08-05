@@ -1,6 +1,7 @@
 #include "code_generator.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <ostream>
 #include <sstream>
 #include <string>
@@ -19,6 +20,45 @@ int alignTo(int value, int alignment) {
     return value;
   }
   return value + alignment - remainder;
+}
+
+// Hacker's Delight magc：计算正数除数 d（2 <= d <= 2^31-1，非 2 的幂）的
+// magic number M 与 shift s，使 q = (mulh(x,M) [+ x]) >> s - (x>>31) 等于 x/d。
+bool computeSignedDivMagic(int32_t d, uint32_t& magic, int32_t& shift) {
+  if (d <= 1 || d == INT32_MIN) {
+    return false;
+  }
+  const uint32_t ad = static_cast<uint32_t>(d);
+  if ((ad & (ad - 1)) == 0) {
+    return false; // 2 的幂走移位路径
+  }
+  constexpr uint32_t two31 = 0x80000000u;
+  const uint32_t anc = two31 - 1 - two31 % ad;
+  int p = 31;
+  uint32_t q1 = two31 / anc;
+  uint32_t r1 = two31 - q1 * anc;
+  uint32_t q2 = two31 / ad;
+  uint32_t r2 = two31 - q2 * ad;
+  uint32_t delta;
+  do {
+    ++p;
+    q1 *= 2;
+    r1 *= 2;
+    if (r1 >= anc) {
+      ++q1;
+      r1 -= anc;
+    }
+    q2 *= 2;
+    r2 *= 2;
+    if (r2 >= ad) {
+      ++q2;
+      r2 -= ad;
+    }
+    delta = ad - r2;
+  } while (q1 < delta || (q1 == delta && r1 == 0));
+  magic = q2 + 1;
+  shift = p - 32;
+  return true;
 }
 
 } // namespace
@@ -889,6 +929,73 @@ void CodeGenerator::storeOperand(std::string_view reg, const Operand& operand, s
   }
 }
 
+bool CodeGenerator::emitMagicDiv(int imm, const std::string& srcReg, const std::string& destReg,
+                                 std::ostream& out) const {
+  if (imm == INT32_MIN) {
+    return false;
+  }
+  const int32_t ad = imm < 0 ? -imm : imm;
+  uint32_t magic;
+  int32_t shift;
+  if (!computeSignedDivMagic(ad, magic, shift)) {
+    return false;
+  }
+  const int32_t magicSigned = static_cast<int32_t>(magic);
+  emit(out, "li", "t1, " + std::to_string(magicSigned));
+  emit(out, "mulh", "t2, " + srcReg + ", t1");
+  if (magicSigned < 0) {
+    emit(out, "add", "t2, t2, " + srcReg);
+  }
+  if (shift > 0) {
+    emit(out, "srai", "t2, t2, " + std::to_string(shift));
+  }
+  emit(out, "srai", "t0, " + srcReg + ", 31");
+  emit(out, "sub", "t2, t2, t0");
+  if (imm < 0) {
+    emit(out, "sub", "t2, x0, t2");
+  }
+  if (destReg != "t2") {
+    emit(out, "mv", destReg + ", t2");
+  }
+  return true;
+}
+
+bool CodeGenerator::emitMagicMod(int imm, const std::string& srcReg, const std::string& destReg,
+                                 std::ostream& out) const {
+  if (imm == INT32_MIN) {
+    return false;
+  }
+  const int32_t ad = imm < 0 ? -imm : imm;
+  uint32_t magic;
+  int32_t shift;
+  if (!computeSignedDivMagic(ad, magic, shift)) {
+    return false;
+  }
+  const int32_t magicSigned = static_cast<int32_t>(magic);
+  // srcReg 可能为 t0：序列末尾会破坏 t0，先备份到 t3
+  const bool srcIsT0 = (srcReg == "t0");
+  if (srcIsT0) {
+    emit(out, "mv", "t3, t0");
+  }
+  emit(out, "li", "t1, " + std::to_string(magicSigned));
+  emit(out, "mulh", "t2, " + srcReg + ", t1");
+  if (magicSigned < 0) {
+    emit(out, "add", "t2, t2, " + srcReg);
+  }
+  if (shift > 0) {
+    emit(out, "srai", "t2, t2, " + std::to_string(shift));
+  }
+  emit(out, "srai", "t0, " + srcReg + ", 31");
+  emit(out, "sub", "t2, t2, t0");
+  if (imm < 0) {
+    emit(out, "sub", "t2, x0, t2");
+  }
+  emit(out, "li", "t1, " + std::to_string(imm));
+  emit(out, "mul", "t2, t2, t1");
+  emit(out, "sub", destReg + ", " + (srcIsT0 ? std::string("t3") : srcReg) + ", t2");
+  return true;
+}
+
 void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
   // 确定目标寄存器：若 dest 分配了寄存器则直接用该寄存器运算，避免 mv 往返
   std::string destReg = "t0";
@@ -1005,6 +1112,8 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
         emit(out, "srai", destReg + ", t1, " + std::to_string(shift));
       } else if (imm == -1) {
         emit(out, "sub", destReg + ", x0, " + src1Reg);
+      } else if (imm != 0 && imm != 1 && emitMagicDiv(imm, src1Reg, destReg, out)) {
+        // 已生成 magic 序列
       } else {
         emit(out, "li", "t1, " + std::to_string(imm));
         emit(out, "div", destReg + ", " + src1Reg + ", t1");
@@ -1024,6 +1133,8 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
         emit(out, "li", destReg + ", 0");
       } else if (imm == -1) {
         emit(out, "li", destReg + ", 0");
+      } else if (imm != 0 && emitMagicMod(imm, src1Reg, destReg, out)) {
+        // 已生成 magic 序列
       } else {
         emit(out, "li", "t1, " + std::to_string(imm));
         emit(out, "rem", destReg + ", " + src1Reg + ", t1");
@@ -1044,9 +1155,15 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
       emit(out, "mul", destReg + ", " + src1Reg + ", " + src2Reg);
       break;
     case IROp::DIV:
+      if (inst.src2.isImm() && emitMagicDiv(inst.src2.immVal, src1Reg, destReg, out)) {
+        break;
+      }
       emit(out, "div", destReg + ", " + src1Reg + ", " + src2Reg);
       break;
     case IROp::MOD:
+      if (inst.src2.isImm() && emitMagicMod(inst.src2.immVal, src1Reg, destReg, out)) {
+        break;
+      }
       emit(out, "rem", destReg + ", " + src1Reg + ", " + src2Reg);
       break;
     default:
