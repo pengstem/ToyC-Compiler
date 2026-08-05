@@ -29,6 +29,7 @@ private:
     int localBytes = 0;
     int outgoingArgumentBytes = 0;
     std::unordered_map<std::string, int> localOffsets;
+    std::unordered_map<std::string, int> regAlloc; // 局部变量 → s寄存器编号 (2-11)
     std::vector<std::string> usedCalleeSavedRegisters;
     std::string functionName;
 

@@ -88,6 +88,9 @@ private:
 
   // 生成全局声明 IR
   void genGlobalDecl(ASTNode* node);
+
+  // IR 优化 pass
+  void optimizePass();
 };
 
 } // namespace toycc

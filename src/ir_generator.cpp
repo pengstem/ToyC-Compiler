@@ -62,6 +62,8 @@ std::vector<IRInst> IRGenerator::generate(CompUnit& compUnit) {
     genGlobalDecl(node.get());
   }
 
+  optimizePass();
+
   return ir;
 }
 
@@ -554,6 +556,100 @@ Operand IRGenerator::genShortCircuit(BinaryExpr* expr) {
   }
 
   return result;
+}
+
+// ============================================================
+// IR 优化 pass
+// ============================================================
+
+namespace {
+
+bool isCombinableOp(IROp op) {
+  switch (op) {
+  case IROp::ADD:
+  case IROp::SUB:
+  case IROp::MUL:
+  case IROp::DIV:
+  case IROp::MOD:
+  case IROp::NOT:
+  case IROp::LT:
+  case IROp::GT:
+  case IROp::LE:
+  case IROp::GE:
+  case IROp::EQ:
+  case IROp::NE:
+    return true;
+  default:
+    return false;
+  }
+}
+
+void countUses(const std::vector<IRInst>& ir, std::unordered_map<std::string, int>& useCount) {
+  useCount.clear();
+  for (const auto& inst : ir) {
+    if (inst.src1.isLocalVar()) {
+      useCount[inst.src1.name]++;
+    }
+    if (inst.src2.isLocalVar()) {
+      useCount[inst.src2.name]++;
+    }
+    // RETURN 和 PARAM 的 dest 实际上是源操作数（被使用的值）
+    if (inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
+      if (inst.dest.isLocalVar()) {
+        useCount[inst.dest.name]++;
+      }
+    }
+  }
+}
+
+} // namespace
+
+void IRGenerator::optimizePass() {
+  // Pass 1: 合并 OP+ASSIGN 模式
+  // 当 OP %tmp, ... 紧跟 ASSIGN %dest, %tmp，且 %tmp 只被使用一次（就是这个 ASSIGN），
+  // 合并为 OP %dest, ...，消除临时变量的 store/load 往返
+  {
+    std::unordered_map<std::string, int> useCount;
+    countUses(ir, useCount);
+
+    std::vector<IRInst> optimized;
+    std::size_t i = 0;
+    while (i < ir.size()) {
+      if (i + 1 < ir.size() && isCombinableOp(ir[i].op) && ir[i].dest.isLocalVar() &&
+          ir[i + 1].op == IROp::ASSIGN && ir[i + 1].src1.isLocalVar() &&
+          ir[i + 1].src1.name == ir[i].dest.name && useCount[ir[i].dest.name] == 1 &&
+          (ir[i + 1].dest.isLocalVar() || ir[i + 1].dest.isGlobalVar())) {
+        // 合并：运算结果直接写入 ASSIGN 的目标
+        IRInst merged = ir[i];
+        merged.dest = ir[i + 1].dest;
+        optimized.push_back(merged);
+        i += 2;
+      } else {
+        optimized.push_back(ir[i]);
+        i += 1;
+      }
+    }
+    ir = std::move(optimized);
+  }
+
+  // Pass 2: 死代码消除 — 删除结果从未被使用的局部变量运算/赋值
+  // 注意：不删除对 GLOBAL_VAR 的赋值（可能有可观察副作用）
+  {
+    std::unordered_map<std::string, int> useCount;
+    countUses(ir, useCount);
+
+    std::vector<IRInst> optimized;
+    for (const auto& inst : ir) {
+      if (isCombinableOp(inst.op) && inst.dest.isLocalVar() && useCount[inst.dest.name] == 0) {
+        continue; // 运算结果从未被使用，删除
+      }
+      if (inst.op == IROp::ASSIGN && inst.dest.isLocalVar() && useCount[inst.dest.name] == 0) {
+        continue; // 赋值结果从未被使用，删除
+      }
+      optimized.push_back(inst);
+    }
+    ir = std::move(optimized);
+  }
 }
 
 } // namespace toycc

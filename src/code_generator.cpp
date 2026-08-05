@@ -97,18 +97,20 @@ std::vector<CodeGenerator::FunctionRange> CodeGenerator::collectFunctions() cons
 CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& function) const {
   StackFrame frame;
   frame.functionName = function.name;
-  frame.usedCalleeSavedRegisters = {"s1"};
   frame.localOffsets.clear();
+  frame.regAlloc.clear();
   frame.localBytes = 0;
   frame.outgoingArgumentBytes = 0;
 
   int localIndex = 0;
   int maxOverflowArgs = 0;
+  int nextReg = 2; // s2-s11 可用于局部变量分配
 
+  // 第一遍：收集所有局部变量
+  std::vector<std::string> varOrder; // 保持插入顺序
   for (std::size_t i = function.begin; i < function.end; ++i) {
     const auto& inst = ir_[i];
 
-    // 跟踪每个 CALL 之前的 PARAM 数量，计算溢出参数空间
     if (inst.op == IROp::PARAM) {
       const int argIndex = inst.src1.immVal;
       if (argIndex >= 8) {
@@ -120,6 +122,7 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
       if (inst.dest.type == OperandType::LOCAL_VAR) {
         if (frame.localOffsets.find(inst.dest.name) == frame.localOffsets.end()) {
           frame.localOffsets[inst.dest.name] = localIndex++;
+          varOrder.push_back(inst.dest.name);
         }
       }
       continue;
@@ -128,19 +131,47 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
     if (inst.dest.type == OperandType::LOCAL_VAR) {
       if (frame.localOffsets.find(inst.dest.name) == frame.localOffsets.end()) {
         frame.localOffsets[inst.dest.name] = localIndex++;
+        varOrder.push_back(inst.dest.name);
       }
     }
     if (inst.src1.type == OperandType::LOCAL_VAR) {
       if (frame.localOffsets.find(inst.src1.name) == frame.localOffsets.end()) {
         frame.localOffsets[inst.src1.name] = localIndex++;
+        varOrder.push_back(inst.src1.name);
       }
     }
     if (inst.src2.type == OperandType::LOCAL_VAR) {
       if (frame.localOffsets.find(inst.src2.name) == frame.localOffsets.end()) {
         frame.localOffsets[inst.src2.name] = localIndex++;
+        varOrder.push_back(inst.src2.name);
+      }
+    }
+    // RETURN 和 PARAM 的 dest 也是 LOCAL_VAR 使用
+    if (inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
+      if (inst.dest.type == OperandType::LOCAL_VAR) {
+        if (frame.localOffsets.find(inst.dest.name) == frame.localOffsets.end()) {
+          frame.localOffsets[inst.dest.name] = localIndex++;
+          varOrder.push_back(inst.dest.name);
+        }
       }
     }
   }
+
+  // 第二遍：为前 10 个局部变量分配 s2-s11 寄存器
+  for (const auto& varName : varOrder) {
+    if (nextReg <= 11) {
+      frame.regAlloc[varName] = nextReg++;
+    }
+  }
+
+  // 更新 usedCalleeSavedRegisters：包含所有分配的 s 寄存器
+  frame.usedCalleeSavedRegisters.clear();
+  for (int r = 2; r <= 11; ++r) {
+    if (r < nextReg) {
+      frame.usedCalleeSavedRegisters.push_back("s" + std::to_string(r));
+    }
+  }
+
   frame.localBytes = static_cast<int>(frame.localOffsets.size()) * kWordBytes;
   frame.outgoingArgumentBytes = maxOverflowArgs * kWordBytes;
   return frame;
@@ -323,6 +354,16 @@ void CodeGenerator::loadOperand(const Operand& operand, std::string_view reg, st
   }
 
   if (operand.type == OperandType::LOCAL_VAR) {
+    // 如果变量分配了寄存器，直接从寄存器复制（mv 比 lw 快）
+    auto it = frame_.regAlloc.find(operand.name);
+    if (it != frame_.regAlloc.end()) {
+      std::string sreg = "s" + std::to_string(it->second);
+      if (std::string(reg) != sreg) {
+        emit(out, "mv", std::string(reg) + ", " + sreg);
+      }
+      return;
+    }
+    // 否则从栈上加载
     const int offset = ensureLocalOffset(operand);
     emit(out, "lw", std::string(reg) + ", " + std::to_string(offset) + "(s0)");
     return;
@@ -347,6 +388,16 @@ void CodeGenerator::loadOperand(const Operand& operand, std::string_view reg, st
 
 void CodeGenerator::storeOperand(std::string_view reg, const Operand& operand, std::ostream& out) {
   if (operand.type == OperandType::LOCAL_VAR) {
+    // 如果变量分配了寄存器，直接存到寄存器（mv 比 sw 快）
+    auto it = frame_.regAlloc.find(operand.name);
+    if (it != frame_.regAlloc.end()) {
+      std::string sreg = "s" + std::to_string(it->second);
+      if (std::string(reg) != sreg) {
+        emit(out, "mv", sreg + ", " + std::string(reg));
+      }
+      return;
+    }
+    // 否则存到栈上
     const int offset = ensureLocalOffset(operand);
     emit(out, "sw", std::string(reg) + ", " + std::to_string(offset) + "(s0)");
     return;

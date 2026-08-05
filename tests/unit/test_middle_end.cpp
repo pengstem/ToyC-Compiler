@@ -1238,7 +1238,8 @@ void testIR_exprAsStmt() {
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
   auto ir = irGen.generate(*comp);
-  if (irContains(ir, "ADD") && irContains(ir, "RETURN #0")) {
+  // a+b; 的结果未被使用，死代码消除应删除 ADD；但 RETURN #0 应保留
+  if (irContains(ir, "RETURN #0") && !irContains(ir, "ADD")) {
     testPass();
   } else {
     testFail("expr as stmt IR mismatch:\n" + irToString(ir));
