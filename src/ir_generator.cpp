@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <cstdint>
 #include <iostream>
 #include <optional>
 #include <unordered_set>
@@ -2175,6 +2176,131 @@ void IRGenerator::optimizePass() {
         }
         return false;
       };
+      std::unordered_set<std::string> referencedLabels;
+      for (const auto& inst : ir) {
+        if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+            inst.dest.isLabel()) {
+          referencedLabels.insert(inst.dest.name);
+        }
+      }
+      const auto foldPostlude = [&](std::size_t begin,
+                                    std::unordered_map<std::string, int> constants,
+                                    std::size_t& end, int& returnValue) {
+        const auto resolve = [&](const Operand& operand) -> std::optional<int> {
+          if (operand.isImm()) {
+            return operand.immVal;
+          }
+          if (operand.isLocalVar()) {
+            auto found = constants.find(operand.name);
+            if (found != constants.end()) {
+              return found->second;
+            }
+          }
+          return std::nullopt;
+        };
+        const auto foldBinary = [](IROp op, int lhs, int rhs) -> std::optional<int> {
+          const long long wideLhs = lhs;
+          const long long wideRhs = rhs;
+          long long wideResult = 0;
+          switch (op) {
+          case IROp::ADD:
+            wideResult = wideLhs + wideRhs;
+            break;
+          case IROp::SUB:
+            wideResult = wideLhs - wideRhs;
+            break;
+          case IROp::MUL:
+            wideResult = wideLhs * wideRhs;
+            break;
+          case IROp::DIV:
+            if (rhs == 0 || (lhs == INT32_MIN && rhs == -1)) {
+              return std::nullopt;
+            }
+            return lhs / rhs;
+          case IROp::MOD:
+            if (rhs == 0 || (lhs == INT32_MIN && rhs == -1)) {
+              return std::nullopt;
+            }
+            return lhs % rhs;
+          case IROp::LT:
+            return lhs < rhs ? 1 : 0;
+          case IROp::GT:
+            return lhs > rhs ? 1 : 0;
+          case IROp::LE:
+            return lhs <= rhs ? 1 : 0;
+          case IROp::GE:
+            return lhs >= rhs ? 1 : 0;
+          case IROp::EQ:
+            return lhs == rhs ? 1 : 0;
+          case IROp::NE:
+            return lhs != rhs ? 1 : 0;
+          default:
+            return std::nullopt;
+          }
+          if (wideResult < INT32_MIN || wideResult > INT32_MAX) {
+            return std::nullopt;
+          }
+          return static_cast<int>(wideResult);
+        };
+
+        for (std::size_t index = begin; index < ir.size(); ++index) {
+          const auto& inst = ir[index];
+          if (inst.op == IROp::LABEL) {
+            if (referencedLabels.count(inst.dest.name) != 0) {
+              return false;
+            }
+            continue;
+          }
+          if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+            continue;
+          }
+          if (inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) {
+            const auto value = resolve(inst.src1);
+            if (!value || !inst.dest.isLocalVar()) {
+              return false;
+            }
+            constants[inst.dest.name] = *value;
+            continue;
+          }
+          if (inst.op == IROp::NOT && inst.dest.isLocalVar()) {
+            const auto value = resolve(inst.src1);
+            if (!value) {
+              return false;
+            }
+            constants[inst.dest.name] = *value == 0 ? 1 : 0;
+            continue;
+          }
+          if (isCombinableOp(inst.op) && inst.dest.isLocalVar()) {
+            const auto lhs = resolve(inst.src1);
+            const auto rhs = resolve(inst.src2);
+            if (!lhs || !rhs) {
+              return false;
+            }
+            const auto value = foldBinary(inst.op, *lhs, *rhs);
+            if (!value) {
+              return false;
+            }
+            constants[inst.dest.name] = *value;
+            continue;
+          }
+          if (inst.op == IROp::RETURN) {
+            const auto value = inst.dest.isNone() ? std::optional<int>(0) : resolve(inst.dest);
+            if (!value) {
+              return false;
+            }
+            returnValue = *value;
+            end = index + 1;
+            // IR generation appends a default return after an explicit return.
+            // It is unreachable on this straight-line path and can be skipped.
+            while (end < ir.size() && ir[end].op == IROp::RETURN) {
+              ++end;
+            }
+            return true;
+          }
+          return false;
+        }
+        return false;
+      };
       // 初值/上限查找：从循环入口（li）向前扫描同一基本块内最近的定义；
       // 遇到对目标变量的任何定义都停止，且只接受 ASSIGN #imm 或
       // LOCAL_VAR_DECL #imm（`int i = 0;` 形式）作为常量初始化
@@ -2244,6 +2370,12 @@ void IRGenerator::optimizePass() {
               bool bodyOk = true;
               bool indIncremented = false; // 循环变量是否已自增
               for (std::size_t k = li + 2; k < condIdx; ++k) {
+                // 声明本身不执行计算。前面的传播/DCE 常把循环内 copy/CSE
+                // 局部量的初始化完全消掉，只留下无初始化声明；它们不应阻止
+                // 已有的闭合形式证明。带初始化的声明仍按普通定义处理。
+                if (ir[k].op == IROp::LOCAL_VAR_DECL && ir[k].src1.isNone()) {
+                  continue;
+                }
                 int step = 0;
                 // 计数变量自增
                 if (isSelfInc(ir[k], indName, step)) {
@@ -2447,6 +2579,62 @@ void IRGenerator::optimizePass() {
                                     static_cast<long long>(trips) * (trips - 1) / 2;
                     accFinals[a].second += accVars[a].indCoeff * static_cast<int>(sum);
                   }
+                }
+                std::unordered_map<std::string, int> finalConstants;
+                for (const auto& final : accFinals) {
+                  finalConstants[final.first] = final.second;
+                }
+                finalConstants[indName] = indFinal;
+                std::size_t foldedEnd = bnezIdx + 1;
+                int foldedReturn = 0;
+                const bool foldedPostlude =
+                    foldPostlude(bnezIdx + 1, finalConstants, foldedEnd, foldedReturn);
+
+                // Initial values and a hoisted bound that feed only the removed
+                // loop become dead. Remove just the nearest definition when it
+                // has no earlier use between that definition and the loop.
+                const auto eraseDeadInit = [&](const std::string& name) {
+                  for (std::size_t pos = optimized.size(); pos > 0; --pos) {
+                    const auto& candidate = optimized[pos - 1];
+                    if (!candidate.dest.isLocalVar() || candidate.dest.name != name ||
+                        candidate.op == IROp::RETURN || candidate.op == IROp::PARAM) {
+                      continue;
+                    }
+                    bool used = false;
+                    for (std::size_t use = pos; use < optimized.size(); ++use) {
+                      const auto& later = optimized[use];
+                      used = (later.src1.isLocalVar() && later.src1.name == name) ||
+                             (later.src2.isLocalVar() && later.src2.name == name) ||
+                             ((later.op == IROp::RETURN || later.op == IROp::PARAM) &&
+                              later.dest.isLocalVar() && later.dest.name == name);
+                      if (used) {
+                        break;
+                      }
+                    }
+                    if (!used) {
+                      if (candidate.op == IROp::LOCAL_VAR_DECL) {
+                        optimized[pos - 1].src1 = Operand::none();
+                      } else {
+                        optimized.erase(optimized.begin() + static_cast<std::ptrdiff_t>(pos - 1));
+                      }
+                    }
+                    return;
+                  }
+                };
+                if (foldedPostlude) {
+                  for (const auto& final : accFinals) {
+                    eraseDeadInit(final.first);
+                  }
+                  eraseDeadInit(indName);
+                  if (cond.src2.isLocalVar()) {
+                    eraseDeadInit(cond.src2.name);
+                  }
+                  optimized.push_back(IRInst(IROp::RETURN, Operand::imm(foldedReturn),
+                                             Operand::none(), Operand::none()));
+                  li = foldedEnd;
+                  loopEliminated = true;
+                  eliminatedHere = true;
+                  continue;
                 }
                 // 循环后变量是否被使用（决定是否保留赋值）
                 const auto usedAfter = [&](const std::string& name) {

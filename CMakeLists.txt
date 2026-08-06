@@ -416,6 +416,43 @@ if(TOYCC_BUILD_TESTS)
         LABELS "toycc;performance;codegen"
         TIMEOUT "${TOYCC_TEST_TIMEOUT}"
       )
+
+      foreach(TOYCC_CLOSED_FORM_CASE IN ITEMS
+          "t_copy_loop.c;15"
+          "t_cse_loop.c;149")
+        list(GET TOYCC_CLOSED_FORM_CASE 0 TOYCC_CLOSED_FORM_FILE)
+        list(GET TOYCC_CLOSED_FORM_CASE 1 TOYCC_CLOSED_FORM_EXPECTED)
+        string(REPLACE ".c" "" TOYCC_CLOSED_FORM_ID "${TOYCC_CLOSED_FORM_FILE}")
+        add_test(
+          NAME "toycc.perf.${TOYCC_CLOSED_FORM_ID}-codegen"
+          COMMAND
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_closed_form_codegen.py"
+            --compiler "$<TARGET_FILE:toycc>"
+            --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/${TOYCC_CLOSED_FORM_FILE}"
+            --expected "${TOYCC_CLOSED_FORM_EXPECTED}"
+        )
+        set_tests_properties("toycc.perf.${TOYCC_CLOSED_FORM_ID}-codegen" PROPERTIES
+          LABELS "toycc;performance;codegen"
+          TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+        )
+      endforeach()
+
+      add_test(
+        NAME toycc.optimizer-codegen-differential
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz_optimizer_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --host-cc "${TOYCC_HOST_CC}"
+          --riscv-cc "${TOYCC_RISCV_CC}"
+          --qemu "${TOYCC_QEMU_RISCV32}"
+          --cases 32
+      )
+      set_tests_properties(toycc.optimizer-codegen-differential PROPERTIES
+        LABELS "toycc;differential;regression"
+        TIMEOUT 30
+      )
     endif()
   endif()
 endif()

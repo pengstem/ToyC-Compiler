@@ -909,6 +909,16 @@ void CodeGenerator::applyPeephole(const std::string& asmText, std::ostream& out)
     const auto& op = tok.opcode;
     const auto& args = tok.args;
 
+    // An unconditional jump to the immediately following label is a no-op.
+    if (op == "j" && args.size() == 1 && i + 1 < n) {
+      const std::string& nextLine = lines[i + 1];
+      const std::size_t first = nextLine.find_first_not_of(" \t");
+      const std::size_t last = nextLine.find_last_not_of(" \t");
+      if (first != std::string::npos && nextLine.substr(first, last - first + 1) == args[0] + ":") {
+        continue;
+      }
+    }
+
     // 模式12: sw rd, off + lw rd, off（同寄存器同偏移，且相邻）
     // 值刚从 rd 存入内存，寄存器 rd 仍持有该值，紧随其后的 lw 是冗余的。
     // 保留 sw（内存值不变），删除 lw（寄存器值不变），避免一次内存往返。

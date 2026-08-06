@@ -73,3 +73,6 @@ lv8/05_func_name.c
 lv8/06_complex_call.c
 lv8/07_recursion.c
 perf/t_hot_leaf_calls.c
+perf/t_copy_loop.c
+perf/t_cse_loop.c
+regression/f19_many_arguments.c
