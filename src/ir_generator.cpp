@@ -869,6 +869,41 @@ void IRGenerator::optimizePass() {
           inst.src2 = Operand::none();
           changed = true;
         }
+        // x % -1 = 0
+        if (inst.op == IROp::MOD && inst.src2.isImm() && inst.src2.immVal == -1) {
+          inst.op = IROp::ASSIGN;
+          inst.src1 = Operand::imm(0);
+          inst.src2 = Operand::none();
+          changed = true;
+        }
+      }
+    }
+
+    // Pass 0d: 取模重写 x % c -> x - (x / c) * c（c 为常量且 |c| > 1）
+    // 语义等价（C 的取模定义 x % c == x - (x/c)*c）。改写后除法指令可被
+    // Pass 1.5 CSE 共享：如 `i / 7 + i % 7` 只需计算一次 magic 除法，
+    // 消除代码生成阶段重复的 mulh 序列。
+    {
+      std::vector<IRInst> optimized;
+      bool modRewritten = false;
+      for (const auto& inst : ir) {
+        if (inst.op == IROp::MOD && inst.src2.isImm() &&
+            (inst.src2.immVal > 1 || inst.src2.immVal < -1)) {
+          const int c = inst.src2.immVal;
+          const std::string q = newTemp(); // x / c
+          const std::string m = newTemp(); // (x/c) * c
+          optimized.push_back(IRInst(IROp::DIV, Operand::localVar(q), inst.src1, Operand::imm(c)));
+          optimized.push_back(
+              IRInst(IROp::MUL, Operand::localVar(m), Operand::localVar(q), Operand::imm(c)));
+          optimized.push_back(IRInst(IROp::SUB, inst.dest, inst.src1, Operand::localVar(m)));
+          modRewritten = true;
+        } else {
+          optimized.push_back(inst);
+        }
+      }
+      if (modRewritten) {
+        ir = std::move(optimized);
+        changed = true;
       }
     }
 
@@ -929,7 +964,7 @@ void IRGenerator::optimizePass() {
           }
           // 仅当 tmp 的所有使用都位于可替换窗口内（含 ASSIGN 对自身的一处使用）
           // 才可合并；窗口外仍引用 tmp 则合并会产生悬垂引用
-          if (ok && mergeUseCount[tmp] == refsToReplace.size() + 1) {
+          if (ok && mergeUseCount[tmp] == static_cast<int>(refsToReplace.size() + 1)) {
             IRInst merged = ir[i];
             merged.dest = ir[i + 1].dest;
             optimized.push_back(merged);
