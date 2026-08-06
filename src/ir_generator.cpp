@@ -1372,7 +1372,7 @@ void IRGenerator::optimizePass() {
     // 在无控制流的直线代码段内，若 (op, src1, src2) 已计算过且操作数未在块内被重新定义，
     // 则复用之前的结果。用户变量可被重新赋值，须跟踪重定义并使相关条目失效。
     {
-      std::unordered_map<std::string, std::string> rename; // 原名 → 复用名（仅临时变量）
+      std::unordered_map<std::string, std::string> rename;   // 原名 → 复用名（仅临时变量）
       std::unordered_map<std::string, std::string> valueMap; // (op,src1,src2) → 结果变量
       std::unordered_map<std::string, std::vector<std::string>> varKeys; // 变量 → 引用它的 key
       std::vector<IRInst> optimized;
@@ -1894,13 +1894,13 @@ void IRGenerator::optimizePass() {
               // 自增，不允许其他指令。
               struct AccVar {
                 std::string name;
-                int step;      // 每次迭代的常量增量（可正可负）
-                int indCoeff;  // 循环变量系数（0=不加循环变量, +1/-1=加/减循环变量）
+                int step;     // 每次迭代的常量增量（可正可负）
+                int indCoeff; // 循环变量系数（0=不加循环变量, +1/-1=加/减循环变量）
               };
               std::vector<AccVar> accVars;
               int indStep = 0;
               bool bodyOk = true;
-              bool indIncremented = false;  // 循环变量是否已自增
+              bool indIncremented = false; // 循环变量是否已自增
               for (std::size_t k = li + 2; k < condIdx; ++k) {
                 int step = 0;
                 if (isSelfInc(ir[k], indName, step)) {
@@ -1923,10 +1923,10 @@ void IRGenerator::optimizePass() {
                 // 检查是否为已识别累加变量加/减循环变量（s += i 或 s -= i）
                 // 仅支持 i 自增之前的位置，此时 i 的值为当前迭代值
                 for (auto& acc : accVars) {
-                  if ((ir[k].op == IROp::ADD || ir[k].op == IROp::SUB) &&
-                      ir[k].dest.isLocalVar() && ir[k].dest.name == acc.name &&
-                      ir[k].src1.isLocalVar() && ir[k].src1.name == acc.name &&
-                      ir[k].src2.isLocalVar() && ir[k].src2.name == indName) {
+                  if ((ir[k].op == IROp::ADD || ir[k].op == IROp::SUB) && ir[k].dest.isLocalVar() &&
+                      ir[k].dest.name == acc.name && ir[k].src1.isLocalVar() &&
+                      ir[k].src1.name == acc.name && ir[k].src2.isLocalVar() &&
+                      ir[k].src2.name == indName) {
                     if (!indIncremented) {
                       acc.indCoeff += (ir[k].op == IROp::ADD) ? 1 : -1;
                       matched = true;
@@ -1940,10 +1940,9 @@ void IRGenerator::optimizePass() {
                   continue;
                 }
                 // 新增累加变量：ADD/SUB dest, dest, #imm 形式
-                if ((ir[k].op == IROp::ADD || ir[k].op == IROp::SUB) &&
-                    ir[k].dest.isLocalVar() && ir[k].src1.isLocalVar() &&
-                    ir[k].src1.name == ir[k].dest.name && ir[k].src2.isImm() &&
-                    ir[k].dest.name != indName) {
+                if ((ir[k].op == IROp::ADD || ir[k].op == IROp::SUB) && ir[k].dest.isLocalVar() &&
+                    ir[k].src1.isLocalVar() && ir[k].src1.name == ir[k].dest.name &&
+                    ir[k].src2.isImm() && ir[k].dest.name != indName) {
                   AccVar acc;
                   acc.name = ir[k].dest.name;
                   acc.step = (ir[k].op == IROp::ADD) ? ir[k].src2.immVal : -ir[k].src2.immVal;
@@ -1952,10 +1951,10 @@ void IRGenerator::optimizePass() {
                   continue;
                 }
                 // 新增累加变量：ADD/SUB dest, dest, indName 形式（s += i）
-                if ((ir[k].op == IROp::ADD || ir[k].op == IROp::SUB) &&
-                    ir[k].dest.isLocalVar() && ir[k].src1.isLocalVar() &&
-                    ir[k].src1.name == ir[k].dest.name && ir[k].src2.isLocalVar() &&
-                    ir[k].src2.name == indName && ir[k].dest.name != indName) {
+                if ((ir[k].op == IROp::ADD || ir[k].op == IROp::SUB) && ir[k].dest.isLocalVar() &&
+                    ir[k].src1.isLocalVar() && ir[k].src1.name == ir[k].dest.name &&
+                    ir[k].src2.isLocalVar() && ir[k].src2.name == indName &&
+                    ir[k].dest.name != indName) {
                   if (!indIncremented) {
                     AccVar acc;
                     acc.name = ir[k].dest.name;
@@ -1993,8 +1992,8 @@ void IRGenerator::optimizePass() {
                 }
                 accFinals.push_back({acc.name, accInit});
               }
-              if (bodyOk && !accVars.empty() && allAccInitKnown && indInitKnown &&
-                  upperKnown && indStep == 1) {
+              if (bodyOk && !accVars.empty() && allAccInitKnown && indInitKnown && upperKnown &&
+                  indStep == 1) {
                 // 迭代次数（编译期常数）
                 int trips = isLT ? (upper - indInit) : (upper - indInit + 1);
                 if (trips < 0) {
@@ -2060,7 +2059,7 @@ void IRGenerator::optimizePass() {
         changed = true;
       }
     }
-  }  // 结束迭代优化循环
+  } // 结束迭代优化循环
 
   // Pass 7: 循环展开（4 倍）—— 在迭代优化收敛后执行一次
   // 对未被 Pass 6 消除的反转循环，若循环体为直线代码（无内部分支），
@@ -2110,16 +2109,15 @@ void IRGenerator::optimizePass() {
             int indIncStep = 0;
             for (std::size_t k = i + 2; k < condIdx && straightLine; ++k) {
               const auto& inst = ir[k];
-              if (inst.op == IROp::LABEL || inst.op == IROp::BRANCH ||
-                  inst.op == IROp::BEQZ || inst.op == IROp::BNEZ ||
-                  inst.op == IROp::CALL || inst.op == IROp::RETURN) {
+              if (inst.op == IROp::LABEL || inst.op == IROp::BRANCH || inst.op == IROp::BEQZ ||
+                  inst.op == IROp::BNEZ || inst.op == IROp::CALL || inst.op == IROp::RETURN) {
                 straightLine = false;
                 break;
               }
               // 识别计数变量自增
-              if ((inst.op == IROp::ADD || inst.op == IROp::SUB) &&
-                  inst.dest.isLocalVar() && inst.dest.name == indName &&
-                  inst.src1.isLocalVar() && inst.src1.name == indName && inst.src2.isImm()) {
+              if ((inst.op == IROp::ADD || inst.op == IROp::SUB) && inst.dest.isLocalVar() &&
+                  inst.dest.name == indName && inst.src1.isLocalVar() &&
+                  inst.src1.name == indName && inst.src2.isImm()) {
                 indIncStep = (inst.op == IROp::ADD) ? inst.src2.immVal : -inst.src2.immVal;
                 indIncIdx = k;
               }
@@ -2160,14 +2158,14 @@ void IRGenerator::optimizePass() {
                 const std::string midLabel =
                     "L_unroll_mid_" + std::to_string(i) + "_" + std::to_string(copy);
                 // BNEZ midLabel（条件满足，继续下一次）
-                optimized.push_back(IRInst(IROp::BNEZ, Operand::label(midLabel),
-                                           ir[bnezIdx].src1, Operand::none()));
+                optimized.push_back(IRInst(IROp::BNEZ, Operand::label(midLabel), ir[bnezIdx].src1,
+                                           Operand::none()));
                 // BRANCH exitLabel（条件不满足，跳出循环）
-                optimized.push_back(IRInst(IROp::BRANCH, Operand::label(exitLabel),
-                                           Operand::none(), Operand::none()));
+                optimized.push_back(IRInst(IROp::BRANCH, Operand::label(exitLabel), Operand::none(),
+                                           Operand::none()));
                 // LABEL midLabel
-                optimized.push_back(IRInst(IROp::LABEL, Operand::label(midLabel),
-                                           Operand::none(), Operand::none()));
+                optimized.push_back(IRInst(IROp::LABEL, Operand::label(midLabel), Operand::none(),
+                                           Operand::none()));
               }
 
               // body_copy4：第 4 次执行
@@ -2176,14 +2174,14 @@ void IRGenerator::optimizePass() {
               }
 
               // 原循环尾: LABEL Lc; <cond>; BNEZ Lb
-              optimized.push_back(ir[condIdx]);    // LABEL Lc
+              optimized.push_back(ir[condIdx]); // LABEL Lc
               for (std::size_t k = condIdx + 1; k <= bnezIdx; ++k) {
                 optimized.push_back(ir[k]);
               }
 
               // LABEL exitLabel
-              optimized.push_back(IRInst(IROp::LABEL, Operand::label(exitLabel),
-                                         Operand::none(), Operand::none()));
+              optimized.push_back(
+                  IRInst(IROp::LABEL, Operand::label(exitLabel), Operand::none(), Operand::none()));
 
               i = bnezIdx + 1;
               unrolledHere = true;
