@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cctype>
 #include <iostream>
+#include <optional>
 #include <unordered_set>
 
 namespace toycc {
@@ -658,77 +659,391 @@ void IRGenerator::optimizePass() {
   while (changed && maxIterations-- > 0) {
     changed = false;
 
-    // Pass 0: 局部常量传播 + 复制传播
-    // constMap: 跟踪 ASSIGN x, #imm，在后续使用 x 的地方替换为 #imm
-    // copyMap:  跟踪 ASSIGN x, y(局部变量)，在后续使用 x 的地方替换为 y
-    // 遇到 LABEL/CALL/BRANCH 等控制流变化时保守清除所有映射
+    // Pass 0: 全局常量传播（基于基本块数据流）+ 块内复制传播
+    // 旧版单遍传播遇到任何 LABEL/BRANCH 就清空映射，导致循环之前的常量赋值
+    // 无法传播进循环体（如矩阵乘法中循环不变系数的计算被 LICM 外提后仍不能
+    // 折叠）。本 Pass 构造基本块 CFG，以格值（未定/常量/非常数）迭代收敛每个
+    // 块的入口状态，使常量赋值跨控制流边界传播，随后按入口状态重写指令。
     {
-      std::unordered_map<std::string, int> constMap;
-      std::unordered_map<std::string, std::string> copyMap;
-
-      auto resolveOperand = [&](Operand& op) {
-        if (!op.isLocalVar()) {
-          return;
+      // 只读全局变量（声明后从未被写入）：任何位置都可用其初值替换
+      std::unordered_set<std::string> writtenGlobals;
+      std::unordered_map<std::string, int> readOnlyGlobals;
+      std::unordered_set<std::string> allGlobals;
+      for (const auto& inst : ir) {
+        if (inst.dest.isGlobalVar()) {
+          allGlobals.insert(inst.dest.name);
+          // 任何以全局变量为目标的指令（除声明本身）都会修改它，
+          // 使该全局不再"只读"，不能按初值替换
+          if (inst.op != IROp::GLOBAL_VAR_DECL) {
+            writtenGlobals.insert(inst.dest.name);
+          }
         }
-        // 跟随复制链（最多 4 跳，避免潜在环路）
-        for (int hop = 0; hop < 4; ++hop) {
-          auto cit = constMap.find(op.name);
-          if (cit != constMap.end()) {
-            op = Operand::imm(cit->second);
-            changed = true;
-            return;
+      }
+      for (const auto& inst : ir) {
+        if (inst.op == IROp::GLOBAL_VAR_DECL && inst.dest.isGlobalVar() &&
+            writtenGlobals.count(inst.dest.name) == 0) {
+          readOnlyGlobals[inst.dest.name] = inst.src1.immVal;
+        }
+      }
+
+      // ---- 构建基本块：块内无分支，块以 LABEL/FUNC_BEGIN 开始 ----
+      std::vector<std::pair<std::size_t, std::size_t>> blocks;
+      {
+        std::size_t b = 0;
+        for (std::size_t i = 0; i < ir.size(); ++i) {
+          const bool terminator = ir[i].op == IROp::BRANCH || ir[i].op == IROp::BEQZ ||
+                                  ir[i].op == IROp::BNEZ || ir[i].op == IROp::RETURN ||
+                                  ir[i].op == IROp::FUNC_END;
+          const bool nextStarts = (i + 1 >= ir.size()) || ir[i + 1].op == IROp::LABEL ||
+                                  ir[i + 1].op == IROp::FUNC_BEGIN;
+          if (terminator || nextStarts) {
+            blocks.push_back({b, i});
+            b = i + 1;
           }
-          auto it = copyMap.find(op.name);
-          if (it == copyMap.end()) {
-            return;
+        }
+        if (b < ir.size()) {
+          blocks.push_back({b, ir.size() - 1});
+        }
+      }
+      if (blocks.empty()) {
+        blocks.push_back({0, ir.empty() ? 0 : ir.size() - 1});
+      }
+      // 标签 → 块索引
+      std::unordered_map<std::string, std::size_t> labelBlock;
+      for (std::size_t k = 0; k < blocks.size(); ++k) {
+        if (ir[blocks[k].first].op == IROp::LABEL) {
+          labelBlock[ir[blocks[k].first].dest.name] = k;
+        }
+      }
+      // 后继
+      std::vector<std::vector<std::size_t>> succs(blocks.size());
+      for (std::size_t k = 0; k < blocks.size(); ++k) {
+        const IRInst& last = ir[blocks[k].second];
+        const bool nextIsFunc =
+            blocks[k].second + 1 < ir.size() && ir[blocks[k].second + 1].op == IROp::FUNC_BEGIN;
+        if (last.op == IROp::BRANCH) {
+          if (last.dest.isLabel()) {
+            auto it = labelBlock.find(last.dest.name);
+            if (it != labelBlock.end()) {
+              succs[k].push_back(it->second);
+            }
           }
-          op = Operand::localVar(it->second);
-          changed = true;
+        } else if (last.op == IROp::BEQZ || last.op == IROp::BNEZ) {
+          if (last.dest.isLabel()) {
+            auto it = labelBlock.find(last.dest.name);
+            if (it != labelBlock.end()) {
+              succs[k].push_back(it->second);
+            }
+          }
+          if (k + 1 < blocks.size() && !nextIsFunc) {
+            succs[k].push_back(k + 1);
+          }
+        } else if (last.op != IROp::RETURN && last.op != IROp::FUNC_END) {
+          if (k + 1 < blocks.size() && !nextIsFunc) {
+            succs[k].push_back(k + 1);
+          }
+        }
+      }
+      // 前驱
+      std::vector<std::vector<std::size_t>> preds(blocks.size());
+      for (std::size_t k = 0; k < blocks.size(); ++k) {
+        for (const std::size_t s : succs[k]) {
+          preds[s].push_back(k);
+        }
+      }
+
+      // ---- 格值与数据流 ----
+      struct Lattice {
+        bool isTop = false;
+        bool isConst = false;
+        int val = 0;
+      };
+      using State = std::unordered_map<std::string, Lattice>;
+      const auto meetLattice = [](const Lattice& a, const Lattice& b) -> Lattice {
+        if (!a.isTop && !a.isConst) {
+          return b; // a 是 BOTTOM
+        }
+        if (!b.isTop && !b.isConst) {
+          return a; // b 是 BOTTOM
+        }
+        if (a.isTop || b.isTop) {
+          return Lattice{true, false, 0}; // TOP
+        }
+        if (a.val == b.val) {
+          return a;
+        }
+        return Lattice{true, false, 0};
+      };
+      const auto statesEqual = [](const State& a, const State& b) {
+        if (a.size() != b.size()) {
+          return false;
+        }
+        for (const auto& entry : a) {
+          auto it = b.find(entry.first);
+          if (it == b.end()) {
+            return false;
+          }
+          const Lattice& x = entry.second;
+          const Lattice& y = it->second;
+          if (x.isTop != y.isTop || x.isConst != y.isConst || x.val != y.val) {
+            return false;
+          }
+        }
+        return true;
+      };
+
+      // 二元运算常量折叠（与 Pass 0b 语义一致）
+      const auto foldConst = [](IROp op, int a, int b, int& out) -> bool {
+        switch (op) {
+        case IROp::ADD:
+          out = a + b;
+          return true;
+        case IROp::SUB:
+          out = a - b;
+          return true;
+        case IROp::MUL:
+          out = a * b;
+          return true;
+        case IROp::DIV:
+          if (b == 0) {
+            return false;
+          }
+          out = a / b;
+          return true;
+        case IROp::MOD:
+          if (b == 0) {
+            return false;
+          }
+          out = a % b;
+          return true;
+        case IROp::LT:
+          out = (a < b) ? 1 : 0;
+          return true;
+        case IROp::GT:
+          out = (a > b) ? 1 : 0;
+          return true;
+        case IROp::LE:
+          out = (a <= b) ? 1 : 0;
+          return true;
+        case IROp::GE:
+          out = (a >= b) ? 1 : 0;
+          return true;
+        case IROp::EQ:
+          out = (a == b) ? 1 : 0;
+          return true;
+        case IROp::NE:
+          out = (a != b) ? 1 : 0;
+          return true;
+        default:
+          return false;
         }
       };
 
-      auto invalidateDest = [&](const Operand& dest) {
-        if (!dest.isLocalVar()) {
-          return;
-        }
-        constMap.erase(dest.name);
-        copyMap.erase(dest.name);
-        // 指向 dest 的复制也失效（dest 值即将改变）
-        for (auto it = copyMap.begin(); it != copyMap.end();) {
-          if (it->second == dest.name) {
-            it = copyMap.erase(it);
+      // 单指令转移：更新状态 st（定义侧）
+      const auto transferInst = [&](State& st, const IRInst& inst) {
+        const auto resolveConst = [&](const Operand& op) -> std::optional<int> {
+          if (op.isImm()) {
+            return op.immVal;
+          }
+          if (op.isLocalVar()) {
+            auto it = st.find(op.name);
+            if (it != st.end() && it->second.isConst) {
+              return it->second.val;
+            }
+          }
+          return std::nullopt;
+        };
+        const auto setConst = [&](const Operand& op, int v) {
+          if (op.isLocalVar() || op.isGlobalVar()) {
+            st[op.name] = Lattice{false, true, v};
+          }
+        };
+        const auto setTop = [&](const Operand& op) {
+          if (op.isLocalVar() || op.isGlobalVar()) {
+            st[op.name] = Lattice{true, false, 0};
+          }
+        };
+        if (inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) {
+          if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+            return; // 无初始化：保持未定
+          }
+          if (auto v = resolveConst(inst.src1)) {
+            setConst(inst.dest, *v);
           } else {
-            ++it;
+            setTop(inst.dest);
           }
+          return;
         }
+        if (inst.op == IROp::GLOBAL_VAR_DECL) {
+          setConst(inst.dest, inst.src1.immVal);
+          return;
+        }
+        if (isCombinableOp(inst.op)) {
+          if (inst.op == IROp::NOT) {
+            if (auto a = resolveConst(inst.src1)) {
+              setConst(inst.dest, (*a == 0) ? 1 : 0);
+            } else {
+              setTop(inst.dest);
+            }
+            return;
+          }
+          const auto a = resolveConst(inst.src1);
+          const auto b = resolveConst(inst.src2);
+          if (a && b) {
+            int folded = 0;
+            if (foldConst(inst.op, *a, *b, folded)) {
+              setConst(inst.dest, folded);
+              return;
+            }
+          }
+          setTop(inst.dest);
+          return;
+        }
+        if (inst.op == IROp::CALL || inst.op == IROp::LOAD) {
+          setTop(inst.dest);
+          // 调用/内存读取可能改变全局变量：所有全局置 TOP。
+          // 局部变量不会被调用修改（无指针/数组按引用传递），保持原状态。
+          for (const auto& g : allGlobals) {
+            st[g] = Lattice{true, false, 0};
+          }
+          return;
+        }
+        if (inst.op == IROp::STORE) {
+          if (auto v = resolveConst(inst.src1)) {
+            setConst(inst.dest, *v);
+          } else {
+            setTop(inst.dest);
+          }
+          return;
+        }
+        // 其他指令（LABEL/分支/RETURN/PARAM/FUNC_*）：状态不变
       };
 
-      for (auto& inst : ir) {
-        // 控制流边界：清除所有映射（保守处理）
-        if (inst.op == IROp::LABEL || inst.op == IROp::BRANCH || inst.op == IROp::BEQZ ||
-            inst.op == IROp::BNEZ || inst.op == IROp::CALL) {
-          constMap.clear();
-          copyMap.clear();
-          if (inst.op != IROp::CALL) {
-            continue;
+      // ---- 迭代收敛块入口状态 ----
+      std::vector<State> in(blocks.size()), out(blocks.size());
+      bool converged = false;
+      while (!converged) {
+        converged = true;
+        for (std::size_t k = 0; k < blocks.size(); ++k) {
+          State newIn;
+          if (!preds[k].empty()) {
+            newIn = out[preds[k][0]];
+            for (std::size_t p = 1; p < preds[k].size(); ++p) {
+              State merged;
+              // meet：逐变量求交
+              std::unordered_set<std::string> names;
+              for (const auto& e : newIn) {
+                names.insert(e.first);
+              }
+              for (const auto& e : out[preds[k][p]]) {
+                names.insert(e.first);
+              }
+              for (const auto& n : names) {
+                Lattice a;
+                Lattice b;
+                auto ita = newIn.find(n);
+                if (ita != newIn.end()) {
+                  a = ita->second;
+                }
+                auto itb = out[preds[k][p]].find(n);
+                if (itb != out[preds[k][p]].end()) {
+                  b = itb->second;
+                }
+                merged[n] = meetLattice(a, b);
+              }
+              newIn = std::move(merged);
+            }
+          }
+          if (!statesEqual(newIn, in[k])) {
+            in[k] = std::move(newIn);
+            converged = false;
+          }
+          State newOut = in[k];
+          for (std::size_t idx = blocks[k].first; idx <= blocks[k].second; ++idx) {
+            transferInst(newOut, ir[idx]);
+          }
+          if (!statesEqual(newOut, out[k])) {
+            out[k] = std::move(newOut);
+            converged = false;
           }
         }
+      }
 
-        // 传播：将 src 中引用常量/复制变量的地方替换
-        resolveOperand(inst.src1);
-        resolveOperand(inst.src2);
-        if (inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
-          resolveOperand(inst.dest);
-        }
-
-        // 失效 dest 的旧映射（在记录新映射之前）
-        invalidateDest(inst.dest);
-
-        // 记录新映射
-        if (inst.op == IROp::ASSIGN && inst.dest.isLocalVar()) {
-          if (inst.src1.isImm()) {
-            constMap[inst.dest.name] = inst.src1.immVal;
-          } else if (inst.src1.isLocalVar() && inst.src1.name != inst.dest.name) {
+      // ---- 按入口状态重写指令 ----
+      for (std::size_t k = 0; k < blocks.size(); ++k) {
+        State st = in[k];
+        std::unordered_map<std::string, std::string> copyMap;
+        const auto resolveOperand = [&](Operand& op, bool compareSrc2) {
+          if (op.isLocalVar()) {
+            auto it = st.find(op.name);
+            if (it != st.end() && it->second.isConst) {
+              // 循环常量提升变量（k 前缀）作为比较指令 src2 时保留变量：
+              // 代码生成阶段将其预加载到寄存器，循环内比较收敛为单条 blt/bge；
+              // 若替换为立即数则退化为 li+slt/slti 两条指令，且大立即数无法
+              // 编码进 slti，每轮循环都要重新加载。
+              const bool keepK = compareSrc2 && !op.name.empty() && op.name[0] == 'k';
+              if (!keepK) {
+                op = Operand::imm(it->second.val);
+                changed = true;
+              }
+              return;
+            }
+            // 跟随复制链（最多 4 跳）
+            for (int hop = 0; hop < 4; ++hop) {
+              auto cit = copyMap.find(op.name);
+              if (cit == copyMap.end()) {
+                return;
+              }
+              op = Operand::localVar(cit->second);
+              changed = true;
+            }
+            return;
+          }
+          if (op.isGlobalVar()) {
+            auto git = readOnlyGlobals.find(op.name);
+            if (git != readOnlyGlobals.end()) {
+              op = Operand::imm(git->second);
+              changed = true;
+            }
+          }
+        };
+        const auto invalidateCopies = [&](const std::string& name) {
+          copyMap.erase(name);
+          for (auto it = copyMap.begin(); it != copyMap.end();) {
+            if (it->second == name) {
+              it = copyMap.erase(it);
+            } else {
+              ++it;
+            }
+          }
+        };
+        const auto isCompareOp = [](IROp op) {
+          return op == IROp::LT || op == IROp::GT || op == IROp::LE || op == IROp::GE ||
+                 op == IROp::EQ || op == IROp::NE;
+        };
+        for (std::size_t idx = blocks[k].first; idx <= blocks[k].second; ++idx) {
+          IRInst& inst = ir[idx];
+          if (inst.op != IROp::BEQZ && inst.op != IROp::BNEZ) {
+            resolveOperand(inst.src1, false);
+            resolveOperand(inst.src2, isCompareOp(inst.op));
+          }
+          if (inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
+            resolveOperand(inst.dest, false);
+          }
+          invalidateCopies(inst.dest.name);
+          if (inst.op == IROp::CALL) {
+            // 调用可能修改全局变量：值为全局变量的复制映射失效
+            for (auto it = copyMap.begin(); it != copyMap.end();) {
+              if (allGlobals.count(it->second) > 0) {
+                it = copyMap.erase(it);
+              } else {
+                ++it;
+              }
+            }
+          }
+          transferInst(st, inst);
+          if (inst.op == IROp::ASSIGN && inst.dest.isLocalVar() && inst.src1.isLocalVar() &&
+              inst.src1.name != inst.dest.name) {
             copyMap[inst.dest.name] = inst.src1.name;
           }
         }
@@ -879,6 +1194,58 @@ void IRGenerator::optimizePass() {
       }
     }
 
+    // Pass 0c2: 常量加法链合并
+    // ADD t, a, #c1; ADD d, t, #c2 → ADD d, a, #(c1+c2)（t 为临时变量，两条指令相邻）
+    // 将 `s = s + c1; s = s + c2; ...` 之类的累加链收敛为单条 addi，减少循环体指令数。
+    // - 若 q 仍以 t 为目标（ADD t, t, #c2）：改写后 t 继续有效，无需使用计数检查；
+    // - 否则（ADD d, t, #c2，d != t）：要求 t 除 q 外无其他使用，否则删除定义会悬垂。
+    {
+      std::unordered_map<std::string, int> chainUseCount;
+      countUses(ir, chainUseCount);
+      std::vector<IRInst> optimized;
+      std::size_t ci = 0;
+      bool chainMerged = false;
+      while (ci < ir.size()) {
+        bool mergedHere = false;
+        if (ci + 1 < ir.size() && ir[ci].op == IROp::ADD && ir[ci].src2.isImm() &&
+            ir[ci].dest.isLocalVar() && isTempName(ir[ci].dest.name)) {
+          const std::string t = ir[ci].dest.name;
+          const IRInst& q = ir[ci + 1];
+          if (q.op == IROp::ADD && q.src1.isLocalVar() && q.src1.name == t && q.src2.isImm()) {
+            const int combined = ir[ci].src2.immVal + q.src2.immVal;
+            if (q.dest.isLocalVar() && q.dest.name == t) {
+              // 情况 A：q 改写后仍定义 t，t 的后继使用读到的新值与改写前等价
+              IRInst merged = ir[ci];
+              merged.src2 = Operand::imm(combined);
+              optimized.push_back(merged);
+              --chainUseCount[t]; // q 的 src1 使用被消除
+              ci += 2;
+              mergedHere = true;
+              chainMerged = true;
+            } else if (chainUseCount[t] == 1) {
+              // 情况 B：q 不再定义 t，t 必须无其他使用
+              IRInst merged = q;
+              merged.src1 = ir[ci].src1;
+              merged.src2 = Operand::imm(combined);
+              optimized.push_back(merged);
+              --chainUseCount[t];
+              ci += 2;
+              mergedHere = true;
+              chainMerged = true;
+            }
+          }
+        }
+        if (!mergedHere) {
+          optimized.push_back(ir[ci]);
+          ++ci;
+        }
+      }
+      if (chainMerged) {
+        ir = std::move(optimized);
+        changed = true;
+      }
+    }
+
     // Pass 0d: 取模重写 x % c -> x - (x / c) * c（c 为常量且 |c| > 1）
     // 语义等价（C 的取模定义 x % c == x - (x/c)*c）。改写后除法指令可被
     // Pass 1.5 CSE 共享：如 `i / 7 + i % 7` 只需计算一次 magic 除法，
@@ -887,7 +1254,12 @@ void IRGenerator::optimizePass() {
       std::vector<IRInst> optimized;
       bool modRewritten = false;
       for (const auto& inst : ir) {
-        if (inst.op == IROp::MOD && inst.src2.isImm() &&
+        // 正 2 的幂取模跳过重写：代码生成阶段对已知非负操作数可直接用 andi（1 条），
+        // 即使符号未知的通用序列（约 6 条）也不比重写后的 div+mul+sub 差；
+        // 保留 MOD 还能配合非负分析省去整段序列。
+        const bool powerOfTwo = inst.src2.isImm() && inst.src2.immVal > 0 &&
+                                (inst.src2.immVal & (inst.src2.immVal - 1)) == 0;
+        if (inst.op == IROp::MOD && inst.src2.isImm() && !powerOfTwo &&
             (inst.src2.immVal > 1 || inst.src2.immVal < -1)) {
           const int c = inst.src2.immVal;
           const std::string q = newTemp(); // x / c
@@ -1249,21 +1621,49 @@ void IRGenerator::optimizePass() {
             // 否则 BNEZ Lb 会跳回已外提的指令，导致不变计算被重复执行
             std::vector<IRInst> hoisted;
             std::vector<IRInst> kept;
-            for (std::size_t k = i + 1; k < condIdx; ++k) {
+            // 用户变量外提安全条件：
+            //  1. 赋值位于循环体顶层的直线段内（无条件执行，且位于任何控制流之前），
+            //     保证该赋值"支配"循环内对它的所有读取，循环体外的读取不受影响；
+            //  2. 赋值之前没有对该变量的读取（避免把"读到循环前旧值"改为"读到新值"）。
+            // 满足后，外提等价于把不变值提前计算一次，循环内每次读取到的值不变。
+            bool straightLine = true;
+            std::unordered_set<std::string> readBeforeDef;
+            kept.push_back(ir[i + 1]); // LABEL Lb：循环体入口标签必须保留在原位
+            for (std::size_t k = i + 2; k < condIdx; ++k) {
               const auto& inst = ir[k];
+              // 控制流/调用/内存屏障：之后不再处于顶层直线段，停止用户变量外提
+              if (inst.op == IROp::LABEL || inst.op == IROp::BRANCH || inst.op == IROp::BEQZ ||
+                  inst.op == IROp::BNEZ || inst.op == IROp::CALL || inst.op == IROp::LOAD ||
+                  inst.op == IROp::STORE || inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
+                straightLine = false;
+                kept.push_back(inst);
+                continue;
+              }
               const bool pure =
                   inst.op == IROp::ADD || inst.op == IROp::SUB || inst.op == IROp::MUL ||
                   inst.op == IROp::NOT || inst.op == IROp::LT || inst.op == IROp::GT ||
                   inst.op == IROp::LE || inst.op == IROp::GE || inst.op == IROp::EQ ||
                   inst.op == IROp::NE ||
                   (inst.op == IROp::ASSIGN && inst.dest.isLocalVar() && isTempName(inst.dest.name));
-              if (pure && inst.dest.isLocalVar() && isTempName(inst.dest.name) &&
-                  defCount[inst.dest.name] == 1 && operandInvariant(inst.src1) &&
-                  operandInvariant(inst.src2)) {
+              const bool operandsInv = operandInvariant(inst.src1) && operandInvariant(inst.src2);
+              const bool canHoist = pure && inst.dest.isLocalVar() &&
+                                    defCount[inst.dest.name] == 1 && operandsInv &&
+                                    (isTempName(inst.dest.name) ||
+                                     (straightLine && readBeforeDef.count(inst.dest.name) == 0));
+              if (canHoist) {
                 hoisted.push_back(inst);
                 licmChanged = true;
               } else {
                 kept.push_back(inst);
+              }
+              // 记录直线段内被读取的变量（供后续用户变量赋值外提检查）
+              if (straightLine) {
+                if (inst.src1.isLocalVar()) {
+                  readBeforeDef.insert(inst.src1.name);
+                }
+                if (inst.src2.isLocalVar()) {
+                  readBeforeDef.insert(inst.src2.name);
+                }
               }
             }
             if (!hoisted.empty()) {
@@ -1417,6 +1817,169 @@ void IRGenerator::optimizePass() {
             inst.dest = Operand::localVar(newName);
           }
         }
+      }
+    }
+
+    // Pass 6: 常数迭代循环消除（闭合形式）
+    // 模式（循环反转后）：
+    //   <循环前> ASSIGN i, #i0; ASSIGN s, #s0;
+    //   BRANCH Lc; LABEL Lb; ADD s, s, #c; ADD i, i, #1;
+    //   LABEL Lc; LT t, i, k; BNEZ Lb; <循环后>
+    // 其中 k 为立即数（或循环前赋常数的 k 变量），循环体仅含 s、i 的自增。
+    // 此时迭代次数 T = max(0, k - i0)（LT）或 max(0, k - i0 + 1)（LE），
+    // s 的最终值 s0 + c*T 在编译期可算，整个循环替换为常量赋值。
+    {
+      const auto isSelfInc = [](const IRInst& inst, const std::string& name, int& step) {
+        if ((inst.op == IROp::ADD || inst.op == IROp::SUB) && inst.dest.isLocalVar() &&
+            inst.dest.name == name && inst.src1.isLocalVar() && inst.src1.name == name &&
+            inst.src2.isImm()) {
+          step = (inst.op == IROp::ADD) ? inst.src2.immVal : -inst.src2.immVal;
+          return true;
+        }
+        return false;
+      };
+      // 初值/上限查找：从循环入口（li）向前扫描同一基本块内最近的定义；
+      // 遇到对目标变量的任何定义都停止，且只接受 ASSIGN #imm 或
+      // LOCAL_VAR_DECL #imm（`int i = 0;` 形式）作为常量初始化
+      const auto findConstInit = [&](std::size_t li, const std::string& name, int& value) {
+        for (std::size_t k = li; k > 0; --k) {
+          const IRInst& prev = ir[k - 1];
+          if (prev.dest.isLocalVar() && prev.dest.name == name) {
+            const bool constInit =
+                (prev.op == IROp::ASSIGN || prev.op == IROp::LOCAL_VAR_DECL) && prev.src1.isImm();
+            if (constInit) {
+              value = prev.src1.immVal;
+              return true;
+            }
+            return false; // 定义不是常量初始化，无法确认初值
+          }
+          if (prev.op == IROp::LABEL || prev.op == IROp::BRANCH || prev.op == IROp::BEQZ ||
+              prev.op == IROp::BNEZ || prev.op == IROp::CALL) {
+            return false;
+          }
+        }
+        return false;
+      };
+      std::vector<IRInst> optimized;
+      std::size_t li = 0;
+      bool loopEliminated = false;
+      while (li < ir.size()) {
+        bool eliminatedHere = false;
+        if (ir[li].op == IROp::BRANCH && li + 1 < ir.size() && ir[li + 1].op == IROp::LABEL) {
+          const std::string condLabel = ir[li].dest.name;
+          const std::string bodyLabel = ir[li + 1].dest.name;
+          std::size_t condIdx = li + 2;
+          for (; condIdx < ir.size(); ++condIdx) {
+            if (ir[condIdx].op == IROp::LABEL && ir[condIdx].dest.name == condLabel) {
+              break;
+            }
+          }
+          std::size_t bnezIdx = condIdx + 1;
+          for (; bnezIdx < ir.size(); ++bnezIdx) {
+            if (ir[bnezIdx].op == IROp::BNEZ && ir[bnezIdx].dest.name == bodyLabel) {
+              break;
+            }
+          }
+          if (condIdx < ir.size() && bnezIdx < ir.size() && condIdx > li + 2) {
+            // 条件必须是 LT/LE 且 src1 为计数变量
+            const IRInst& cond = ir[condIdx + 1];
+            const bool isLT = cond.op == IROp::LT;
+            const bool isLE = cond.op == IROp::LE;
+            const std::string indName = (cond.src1.isLocalVar()) ? cond.src1.name : std::string();
+            if ((isLT || isLE) && !indName.empty()) {
+              // ---- 解析循环体：计数变量自增（步长 1）+ 一个累加变量自增 ----
+              std::string accName;
+              int accStep = 0;
+              int indStep = 0;
+              bool bodyOk = true;
+              for (std::size_t k = li + 2; k < condIdx; ++k) {
+                int step = 0;
+                if (isSelfInc(ir[k], indName, step)) {
+                  indStep += step;
+                  continue;
+                }
+                if (accName.empty()) {
+                  if (ir[k].op == IROp::ADD && ir[k].dest.isLocalVar() && ir[k].src1.isLocalVar() &&
+                      ir[k].src1.name == ir[k].dest.name && ir[k].src2.isImm() &&
+                      ir[k].dest.name != indName) {
+                    accName = ir[k].dest.name;
+                    accStep = ir[k].src2.immVal;
+                    continue;
+                  }
+                } else if (isSelfInc(ir[k], accName, step)) {
+                  accStep += step; // 累加：每条自增都会执行
+                  continue;
+                }
+                bodyOk = false;
+                break;
+              }
+              // 上限：立即数或循环前赋常数的 k 变量
+              int upper = 0;
+              bool upperKnown = false;
+              if (cond.src2.isImm()) {
+                upper = cond.src2.immVal;
+                upperKnown = true;
+              } else if (cond.src2.isLocalVar()) {
+                upperKnown = findConstInit(li, cond.src2.name, upper);
+              }
+              // s、i 初值
+              int accInit = 0;
+              int indInit = 0;
+              const bool accInitKnown = !accName.empty() && findConstInit(li, accName, accInit);
+              const bool indInitKnown = findConstInit(li, indName, indInit);
+              if (bodyOk && !accName.empty() && accInitKnown && indInitKnown && upperKnown &&
+                  indStep == 1) {
+                // 迭代次数（编译期常数）
+                int trips = isLT ? (upper - indInit) : (upper - indInit + 1);
+                if (trips < 0) {
+                  trips = 0;
+                }
+                const int accFinal = accInit + accStep * trips;
+                const bool ran = isLT ? (indInit < upper) : (indInit <= upper);
+                const int indFinal = ran ? upper : indInit;
+                // 循环后 s / i 是否被使用（决定是否保留赋值）
+                const auto usedAfter = [&](const std::string& name) {
+                  for (std::size_t k = bnezIdx + 1; k < ir.size(); ++k) {
+                    const auto& inst = ir[k];
+                    if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
+                      break; // 跨函数不追踪
+                    }
+                    if (inst.src1.isLocalVar() && inst.src1.name == name) {
+                      return true;
+                    }
+                    if (inst.src2.isLocalVar() && inst.src2.name == name) {
+                      return true;
+                    }
+                    if ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) &&
+                        inst.dest.isLocalVar() && inst.dest.name == name) {
+                      return true;
+                    }
+                  }
+                  return false;
+                };
+                if (usedAfter(accName)) {
+                  optimized.push_back(IRInst(IROp::ASSIGN, Operand::localVar(accName),
+                                             Operand::imm(accFinal), Operand::none()));
+                }
+                if (usedAfter(indName)) {
+                  optimized.push_back(IRInst(IROp::ASSIGN, Operand::localVar(indName),
+                                             Operand::imm(indFinal), Operand::none()));
+                }
+                li = bnezIdx + 1;
+                loopEliminated = true;
+                eliminatedHere = true;
+              }
+            }
+          }
+        }
+        if (!eliminatedHere) {
+          optimized.push_back(ir[li]);
+          ++li;
+        }
+      }
+      if (loopEliminated) {
+        ir = std::move(optimized);
+        changed = true;
       }
     }
   }

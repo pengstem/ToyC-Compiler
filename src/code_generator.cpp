@@ -246,8 +246,118 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
                      return useFreq[a] > useFreq[b];
                    });
 
+  // 临时变量 t 寄存器分配（t4-t6）：
+  // 若一个局部变量（含表达式临时与块内声明的临时变量）的所有引用（定义与使用）
+  // 同属一个基本块，且块内首次引用是定义（定义支配块内所有使用），则该变量的
+  // 存活区间不跨越任何可能破坏 t4-t6 的指令（CALL 会破坏所有 caller-saved），
+  // 可以安全地驻留在 t 寄存器，彻底消除"计算→落栈→重载"的内存往返。
+  // 多个互不重叠的变量共享 t4-t6；分配成功的变量不再占用栈槽，也不再参与 s 寄存器
+  // 竞争，把 s 寄存器让给循环内长期存活的用户变量。
+  frame.tempRegs.clear();
+  {
+    // 基本块编号：以控制流/调用为界
+    std::unordered_map<std::size_t, int> blockId;
+    int curBlock = 0;
+    for (std::size_t idx = function.begin; idx < function.end; ++idx) {
+      blockId[idx] = curBlock;
+      const auto& inst = ir_[idx];
+      if (inst.op == IROp::LABEL || inst.op == IROp::BRANCH || inst.op == IROp::BEQZ ||
+          inst.op == IROp::BNEZ || inst.op == IROp::CALL || inst.op == IROp::RETURN ||
+          inst.op == IROp::PARAM) {
+        ++curBlock;
+      }
+    }
+    // 收集每个局部变量的全部引用点：记录 (指令索引, 是否定义)
+    std::unordered_map<std::string, std::vector<std::pair<std::size_t, bool>>> varRefs;
+    for (std::size_t idx = function.begin; idx < function.end; ++idx) {
+      const auto& inst = ir_[idx];
+      const auto recordUse = [&](const Operand& op) {
+        if (op.isLocalVar()) {
+          varRefs[op.name].push_back({idx, false});
+        }
+      };
+      recordUse(inst.src1);
+      recordUse(inst.src2);
+      if (inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
+        recordUse(inst.dest);
+      }
+      if (inst.dest.isLocalVar()) {
+        varRefs[inst.dest.name].push_back({idx, true});
+      }
+    }
+    struct VarInterval {
+      std::size_t start = 0;
+      std::size_t end = 0;
+      std::string name;
+    };
+    std::vector<VarInterval> intervals;
+    for (const auto& entry : varRefs) {
+      const std::string& name = entry.first;
+      const auto& refs = entry.second;
+      if (refs.size() < 2) {
+        continue; // 只有单一引用（或纯定义无使用），无需分配
+      }
+      bool ok = true;
+      std::size_t first = refs.front().first;
+      std::size_t last = refs.front().first;
+      const int blk = blockId[first];
+      for (std::size_t r = 0; r < refs.size(); ++r) {
+        if (blockId[refs[r].first] != blk) {
+          ok = false;
+          break;
+        }
+        if (refs[r].first > last) {
+          last = refs[r].first;
+        }
+      }
+      if (!ok) {
+        continue;
+      }
+      // 首次引用必须是定义（保证进入基本块时寄存器先被写入再被读取）
+      if (!refs.front().second) {
+        continue;
+      }
+      if (last <= first) {
+        continue; // 引用集中在同一条指令（如 ASSIGN 自引用），无需分配
+      }
+      intervals.push_back({first, last, name});
+    }
+    std::sort(intervals.begin(), intervals.end(),
+              [](const VarInterval& a, const VarInterval& b) { return a.start < b.start; });
+    constexpr const char* kTempRegs[3] = {"t4", "t5", "t6"};
+    struct ActiveInterval {
+      std::size_t end = 0;
+      std::string name;
+      int reg = -1;
+    };
+    std::vector<ActiveInterval> active;
+    for (const auto& iv : intervals) {
+      active.erase(std::remove_if(active.begin(), active.end(),
+                                  [&](const ActiveInterval& a) { return a.end < iv.start; }),
+                   active.end());
+      bool used[3] = {false, false, false};
+      for (const auto& a : active) {
+        used[a.reg] = true;
+      }
+      int freeReg = -1;
+      for (int r = 0; r < 3; ++r) {
+        if (!used[r]) {
+          freeReg = r;
+          break;
+        }
+      }
+      if (freeReg >= 0) {
+        frame.tempRegs[iv.name] = kTempRegs[freeReg];
+        active.push_back({iv.end, iv.name, freeReg});
+      }
+    }
+  }
+
   // 为前 10 个高频局部变量分配 s2-s11 寄存器
   for (const auto& varName : varOrder) {
+    if (frame.tempRegs.find(varName) != frame.tempRegs.end()) {
+      continue; // 已分配到 t 寄存器，不再占用 s 寄存器
+    }
     if (nextReg <= 11) {
       frame.regAlloc[varName] = nextReg++;
     }
@@ -272,10 +382,11 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
     }
   }
 
-  // 已分配寄存器的局部变量无需栈槽：紧凑重编号，只统计未分配寄存器的变量
+  // 已分配寄存器（s 或 t）的局部变量无需栈槽：紧凑重编号，只统计未分配寄存器的变量
   int stackSlotCount = 0;
   for (auto& entry : frame.localOffsets) {
-    if (frame.regAlloc.find(entry.first) != frame.regAlloc.end()) {
+    if (frame.regAlloc.find(entry.first) != frame.regAlloc.end() ||
+        frame.tempRegs.find(entry.first) != frame.tempRegs.end()) {
       entry.second = -1; // 标记：无栈槽
     } else {
       entry.second = stackSlotCount++;
@@ -327,6 +438,24 @@ void CodeGenerator::generateFunction(const FunctionRange& function, std::ostream
   currentFunction_ = function.name;
   currentParamIndex_ = 0;
   tailCalls_ = detectTailCalls(function);
+  analyzeNonNegativeVars(function);
+
+  // 统计函数内每个局部变量的使用次数（供比较+分支融合判断：结果临时是否仅被分支使用）
+  irUseCount_.clear();
+  for (std::size_t idx = function.begin; idx < function.end; ++idx) {
+    const auto& inst = ir_[idx];
+    if (inst.src1.isLocalVar()) {
+      ++irUseCount_[inst.src1.name];
+    }
+    if (inst.src2.isLocalVar()) {
+      ++irUseCount_[inst.src2.name];
+    }
+    if (inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
+      if (inst.dest.isLocalVar()) {
+        ++irUseCount_[inst.dest.name];
+      }
+    }
+  }
 
   const auto isTailCallIndex = [this](std::size_t index) {
     for (const auto& tc : tailCalls_) {
@@ -341,21 +470,24 @@ void CodeGenerator::generateFunction(const FunctionRange& function, std::ostream
   // 避免把被比较+分支窥孔合并吞掉的临时寄存器（如 slt 的结果）计入保存列表
   std::ostringstream bodyOnly;
   bool seenTailCall = false;
-  for (std::size_t i = function.begin; i < function.end; ++i) {
+  for (std::size_t i = function.begin; i < function.end;) {
     const auto& inst = ir_[i];
     if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
+      ++i;
       continue;
     }
     if (inst.op == IROp::RETURN && seenTailCall) {
+      ++i;
       continue; // 尾调用后的 RETURN 不可达，跳过
     }
     if (inst.op == IROp::CALL && isTailCallIndex(i)) {
       // 最小化尾调用序列（仅跳转），不影响 s 寄存器扫描
       bodyOnly << "    j " << inst.src1.name << "\n";
       seenTailCall = true;
+      ++i;
       continue;
     }
-    generateInstruction(inst, bodyOnly);
+    i += generateInstruction(i, function.end, bodyOnly);
   }
 
   std::ostringstream peepBody;
@@ -385,12 +517,14 @@ void CodeGenerator::generateFunction(const FunctionRange& function, std::ostream
 
   currentParamIndex_ = 0;
   seenTailCall = false;
-  for (std::size_t i = function.begin; i < function.end; ++i) {
+  for (std::size_t i = function.begin; i < function.end;) {
     const auto& inst = ir_[i];
     if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
+      ++i;
       continue;
     }
     if (inst.op == IROp::RETURN && seenTailCall) {
+      ++i;
       continue; // 尾调用后的 RETURN 不可达，跳过
     }
     if (inst.op == IROp::CALL && isTailCallIndex(i)) {
@@ -401,9 +535,10 @@ void CodeGenerator::generateFunction(const FunctionRange& function, std::ostream
         }
       }
       seenTailCall = true;
+      ++i;
       continue;
     }
-    generateInstruction(inst, body);
+    i += generateInstruction(i, function.end, body);
   }
 
   body << ".L_" << function.name << "_exit:\n";
@@ -421,7 +556,10 @@ void CodeGenerator::generateFunction(const FunctionRange& function, std::ostream
   applyPeephole(body.str(), out);
 }
 
-void CodeGenerator::generateInstruction(const IRInst& inst, std::ostream& out) {
+std::size_t CodeGenerator::generateInstruction(std::size_t index, std::size_t end,
+                                               std::ostream& out) {
+  currentInstIndex_ = index;
+  const IRInst& inst = ir_[index];
   switch (inst.op) {
   case IROp::LOCAL_VAR_DECL: {
     if (inst.dest.type == OperandType::LOCAL_VAR) {
@@ -430,9 +568,8 @@ void CodeGenerator::generateInstruction(const IRInst& inst, std::ostream& out) {
         if (currentParamIndex_ < 8) {
           const std::string reg = "a" + std::to_string(currentParamIndex_);
           // 若 dest 在寄存器中，直接 mv 到该寄存器，避免 t0 中转
-          auto it = frame_.regAlloc.find(inst.dest.name);
-          if (it != frame_.regAlloc.end()) {
-            std::string destReg = "s" + std::to_string(it->second);
+          const std::string destReg = regForVar(inst.dest.name);
+          if (!destReg.empty()) {
             if (destReg != reg) {
               emit(out, "mv", destReg + ", " + reg);
             }
@@ -442,9 +579,8 @@ void CodeGenerator::generateInstruction(const IRInst& inst, std::ostream& out) {
           }
         } else {
           const int stackOffset = (currentParamIndex_ - 8) * kWordBytes;
-          auto it = frame_.regAlloc.find(inst.dest.name);
-          if (it != frame_.regAlloc.end()) {
-            std::string destReg = "s" + std::to_string(it->second);
+          const std::string destReg = regForVar(inst.dest.name);
+          if (!destReg.empty()) {
             emit(out, "lw", destReg + ", " + std::to_string(stackOffset) + "(s0)");
           } else {
             emit(out, "lw", "t0, " + std::to_string(stackOffset) + "(s0)");
@@ -489,8 +625,7 @@ void CodeGenerator::generateInstruction(const IRInst& inst, std::ostream& out) {
   case IROp::GE:
   case IROp::EQ:
   case IROp::NE:
-    emitCompareOp(inst, out);
-    break;
+    return emitCompareOrFuse(index, end, out);
   case IROp::PARAM: {
     const int argIndex = inst.src1.immVal;
     if (argIndex < 8) {
@@ -531,9 +666,8 @@ void CodeGenerator::generateInstruction(const IRInst& inst, std::ostream& out) {
   case IROp::BEQZ: {
     // 若条件变量已在寄存器中，直接使用该寄存器，省去 mv
     if (inst.src1.isLocalVar()) {
-      auto it = frame_.regAlloc.find(inst.src1.name);
-      if (it != frame_.regAlloc.end()) {
-        std::string reg = "s" + std::to_string(it->second);
+      const std::string reg = regForVar(inst.src1.name);
+      if (!reg.empty()) {
         out << "    beqz " << reg << ", " << asmLabel(inst.dest.name) << "\n";
         break;
       }
@@ -551,9 +685,8 @@ void CodeGenerator::generateInstruction(const IRInst& inst, std::ostream& out) {
   }
   case IROp::BNEZ: {
     if (inst.src1.isLocalVar()) {
-      auto it = frame_.regAlloc.find(inst.src1.name);
-      if (it != frame_.regAlloc.end()) {
-        std::string reg = "s" + std::to_string(it->second);
+      const std::string reg = regForVar(inst.src1.name);
+      if (!reg.empty()) {
         out << "    bnez " << reg << ", " << asmLabel(inst.dest.name) << "\n";
         break;
       }
@@ -593,6 +726,33 @@ void CodeGenerator::generateInstruction(const IRInst& inst, std::ostream& out) {
   case IROp::FUNC_END:
     break;
   }
+  return 1;
+}
+
+// 比较指令 + 紧随其后的分支融合：
+//   %t = LT/GT/LE/GE/EQ/NE a, b; BEQZ/BNEZ %t, L
+// 当 %t 仅被该分支使用（irUseCount_ == 1）时，不把比较结果落栈再重载，
+// 而是直接计算到 t0 后分支。生成的 slt/beqz（或 addi/beqz）序列紧凑相邻，
+// 由 applyPeephole 进一步合并为单条条件分支（blt/bge 等）。
+std::size_t CodeGenerator::emitCompareOrFuse(std::size_t index, std::size_t end,
+                                             std::ostream& out) {
+  const IRInst& inst = ir_[index];
+  if (index + 1 < end) {
+    const IRInst& br = ir_[index + 1];
+    if ((br.op == IROp::BEQZ || br.op == IROp::BNEZ) && br.src1.isLocalVar() &&
+        br.src1.name == inst.dest.name && inst.dest.isLocalVar() &&
+        irUseCount_[inst.dest.name] == 1) {
+      emitCompareInto(inst, "t0", out);
+      if (br.op == IROp::BEQZ) {
+        emit(out, "beqz", "t0, " + asmLabel(br.dest.name));
+      } else {
+        emit(out, "bnez", "t0, " + asmLabel(br.dest.name));
+      }
+      return 2;
+    }
+  }
+  emitCompareOp(inst, out);
+  return 1;
 }
 
 void CodeGenerator::emitPrologue(const StackFrame& frame, std::ostream& out) const {
@@ -685,6 +845,19 @@ void CodeGenerator::applyPeephole(const std::string& asmText, std::ostream& out)
     const AsmToken tok = parseAsmLine(lines[i]);
     const auto& op = tok.opcode;
     const auto& args = tok.args;
+
+    // 模式12: sw rd, off + lw rd, off（同寄存器同偏移，且相邻）
+    // 值刚从 rd 存入内存，寄存器 rd 仍持有该值，紧随其后的 lw 是冗余的。
+    // 保留 sw（内存值不变），删除 lw（寄存器值不变），避免一次内存往返。
+    if (op == "sw" && args.size() == 2 && i + 1 < n) {
+      const AsmToken next = parseAsmLine(lines[i + 1]);
+      if (next.opcode == "lw" && next.args.size() == 2 && next.args[0] == args[0] &&
+          next.args[1] == args[1]) {
+        out << lines[i] << "\n"; // 保留 sw
+        ++i;                     // 跳过冗余 lw
+        continue;
+      }
+    }
 
     // 模式0: 通用空操作消除
     //   mv rd, rd / addi rd, rd, 0 / sub rd, rd, 0 / xori rd, rd, 0
@@ -881,12 +1054,11 @@ void CodeGenerator::loadOperand(const Operand& operand, std::string_view reg, st
   }
 
   if (operand.type == OperandType::LOCAL_VAR) {
-    // 如果变量分配了寄存器，直接从寄存器复制（mv 比 lw 快）
-    auto it = frame_.regAlloc.find(operand.name);
-    if (it != frame_.regAlloc.end()) {
-      std::string sreg = "s" + std::to_string(it->second);
-      if (std::string(reg) != sreg) {
-        emit(out, "mv", std::string(reg) + ", " + sreg);
+    // 如果变量分配了寄存器（s 或 t），直接从寄存器复制（mv 比 lw 快）
+    const std::string varReg = regForVar(operand.name);
+    if (!varReg.empty()) {
+      if (std::string(reg) != varReg) {
+        emit(out, "mv", std::string(reg) + ", " + varReg);
       }
       return;
     }
@@ -924,12 +1096,11 @@ void CodeGenerator::loadOperand(const Operand& operand, std::string_view reg, st
 
 void CodeGenerator::storeOperand(std::string_view reg, const Operand& operand, std::ostream& out) {
   if (operand.type == OperandType::LOCAL_VAR) {
-    // 如果变量分配了寄存器，直接存到寄存器（mv 比 sw 快）
-    auto it = frame_.regAlloc.find(operand.name);
-    if (it != frame_.regAlloc.end()) {
-      std::string sreg = "s" + std::to_string(it->second);
-      if (std::string(reg) != sreg) {
-        emit(out, "mv", sreg + ", " + std::string(reg));
+    // 如果变量分配了寄存器（s 或 t），直接存到寄存器（mv 比 sw 快）
+    const std::string varReg = regForVar(operand.name);
+    if (!varReg.empty()) {
+      if (std::string(reg) != varReg) {
+        emit(out, "mv", varReg + ", " + std::string(reg));
       }
       return;
     }
@@ -1023,13 +1194,13 @@ bool CodeGenerator::emitMagicMod(int imm, const std::string& srcReg, const std::
 }
 
 void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
-  // 确定目标寄存器：若 dest 分配了寄存器则直接用该寄存器运算，避免 mv 往返
+  // 确定目标寄存器：若 dest 分配了寄存器（s 或 t）则直接用该寄存器运算，避免 mv 往返
   std::string destReg = "t0";
   bool destInReg = false;
   if (inst.dest.isLocalVar()) {
-    auto it = frame_.regAlloc.find(inst.dest.name);
-    if (it != frame_.regAlloc.end()) {
-      destReg = "s" + std::to_string(it->second);
+    const std::string reg = regForVar(inst.dest.name);
+    if (!reg.empty()) {
+      destReg = reg;
       destInReg = true;
     }
   } else if (inst.dest.isGlobalVar()) {
@@ -1059,9 +1230,8 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
   if (src2IsSmallImm) {
     imm = inst.src2.immVal;
   } else if (inst.src2.isLocalVar()) {
-    auto it = frame_.regAlloc.find(inst.src2.name);
-    if (it != frame_.regAlloc.end()) {
-      std::string reg = "s" + std::to_string(it->second);
+    const std::string reg = regForVar(inst.src2.name);
+    if (!reg.empty()) {
       // 若 src2 的寄存器就是 destReg，加载 src1 会覆盖 src2，需用 t1
       if (reg != destReg) {
         src2Reg = reg;
@@ -1076,9 +1246,9 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
   // 确定 src1 的寄存器：若已在寄存器中，直接用该寄存器运算，避免 mv 到 destReg
   std::string src1Reg = destReg;
   if (inst.src1.isLocalVar()) {
-    auto it = frame_.regAlloc.find(inst.src1.name);
-    if (it != frame_.regAlloc.end()) {
-      src1Reg = "s" + std::to_string(it->second);
+    const std::string reg = regForVar(inst.src1.name);
+    if (!reg.empty()) {
+      src1Reg = reg;
     } else {
       loadOperand(inst.src1, destReg, out);
       src1Reg = destReg;
@@ -1130,8 +1300,15 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
       break;
     case IROp::DIV:
       if (imm > 0 && (imm & (imm - 1)) == 0) {
-        // x / 2^n（向零取整）: t=(x>>31)>>(32-n); q=(x+t)>>n
+        // x / 2^n：已知非负时直接用算术右移（1 条指令）
         const int shift = __builtin_ctz(static_cast<unsigned>(imm));
+        const bool srcNonNeg =
+            inst.src1.isLocalVar() && isNonNegative(inst.src1.name, currentInstIndex_);
+        if (srcNonNeg) {
+          emit(out, "srai", destReg + ", " + src1Reg + ", " + std::to_string(shift));
+          break;
+        }
+        // 向零取整: t=(x>>31)>>(32-n); q=(x+t)>>n
         emit(out, "srai", "t1, " + src1Reg + ", 31");
         emit(out, "srli", "t1, t1, " + std::to_string(32 - shift));
         emit(out, "add", "t1, " + src1Reg + ", t1");
@@ -1147,8 +1324,15 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
       break;
     case IROp::MOD:
       if (imm > 0 && (imm & (imm - 1)) == 0) {
-        // x % 2^n = x - (x / 2^n) * 2^n（对任意符号正确的向零取模）
+        // x % 2^n：已知非负时直接掩码（1 条指令）
         const int shift = __builtin_ctz(static_cast<unsigned>(imm));
+        const bool srcNonNeg =
+            inst.src1.isLocalVar() && isNonNegative(inst.src1.name, currentInstIndex_);
+        if (srcNonNeg) {
+          emit(out, "andi", destReg + ", " + src1Reg + ", " + std::to_string(imm - 1));
+          break;
+        }
+        // x - (x / 2^n) * 2^n（对任意符号正确的向零取模）
         emit(out, "srai", "t1, " + src1Reg + ", 31");
         emit(out, "srli", "t1, t1, " + std::to_string(32 - shift));
         emit(out, "add", "t1, " + src1Reg + ", t1");
@@ -1203,13 +1387,13 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
 }
 
 void CodeGenerator::emitCompareOp(const IRInst& inst, std::ostream& out) {
-  // 确定目标寄存器：若 dest 分配了寄存器则直接用该寄存器
+  // 确定目标寄存器：若 dest 分配了寄存器（s 或 t）则直接用该寄存器
   std::string destReg = "t0";
   bool destInReg = false;
   if (inst.dest.isLocalVar()) {
-    auto it = frame_.regAlloc.find(inst.dest.name);
-    if (it != frame_.regAlloc.end()) {
-      destReg = "s" + std::to_string(it->second);
+    const std::string reg = regForVar(inst.dest.name);
+    if (!reg.empty()) {
+      destReg = reg;
       destInReg = true;
     }
   } else if (inst.dest.isGlobalVar()) {
@@ -1220,6 +1404,18 @@ void CodeGenerator::emitCompareOp(const IRInst& inst, std::ostream& out) {
     }
   }
 
+  emitCompareInto(inst, destReg, out);
+
+  if (!destInReg) {
+    storeOperand(destReg, inst.dest, out);
+  }
+}
+
+// 将比较结果计算到 destReg（调用方负责结果的存储/使用，此处不落栈）
+void CodeGenerator::emitCompareInto(const IRInst& inst, std::string_view destReg,
+                                    std::ostream& out) {
+  const std::string dest = std::string(destReg);
+
   // 确定 src2 的寄存器：若已在寄存器中且不是 destReg，直接用该寄存器
   const bool src2IsSmallImm =
       inst.src2.isImm() && inst.src2.immVal >= -2048 && inst.src2.immVal <= 2047;
@@ -1229,10 +1425,9 @@ void CodeGenerator::emitCompareOp(const IRInst& inst, std::ostream& out) {
   if (src2IsSmallImm) {
     imm = inst.src2.immVal;
   } else if (inst.src2.isLocalVar()) {
-    auto it = frame_.regAlloc.find(inst.src2.name);
-    if (it != frame_.regAlloc.end()) {
-      std::string reg = "s" + std::to_string(it->second);
-      if (reg != destReg) {
+    const std::string reg = regForVar(inst.src2.name);
+    if (!reg.empty()) {
+      if (reg != dest) {
         src2Reg = reg;
         src2InReg = true;
       }
@@ -1243,45 +1438,45 @@ void CodeGenerator::emitCompareOp(const IRInst& inst, std::ostream& out) {
   }
 
   // 确定 src1 的寄存器：若已在寄存器中，直接用该寄存器做比较，避免 mv 到 destReg
-  std::string src1Reg = destReg;
+  std::string src1Reg = dest;
   if (inst.src1.isLocalVar()) {
-    auto it = frame_.regAlloc.find(inst.src1.name);
-    if (it != frame_.regAlloc.end()) {
-      src1Reg = "s" + std::to_string(it->second);
+    const std::string reg = regForVar(inst.src1.name);
+    if (!reg.empty()) {
+      src1Reg = reg;
     } else {
-      loadOperand(inst.src1, destReg, out);
-      src1Reg = destReg;
+      loadOperand(inst.src1, dest, out);
+      src1Reg = dest;
     }
   } else {
-    loadOperand(inst.src1, destReg, out);
-    src1Reg = destReg;
+    loadOperand(inst.src1, dest, out);
+    src1Reg = dest;
   }
 
   if (src2IsSmallImm) {
     switch (inst.op) {
     case IROp::LT:
-      emit(out, "slti", destReg + ", " + src1Reg + ", " + std::to_string(imm));
+      emit(out, "slti", dest + ", " + src1Reg + ", " + std::to_string(imm));
       break;
     case IROp::GT:
       emit(out, "li", "t1, " + std::to_string(imm));
-      emit(out, "slt", destReg + ", t1, " + src1Reg);
+      emit(out, "slt", dest + ", t1, " + src1Reg);
       break;
     case IROp::LE:
-      emit(out, "slti", destReg + ", " + src1Reg + ", " + std::to_string(imm + 1));
+      emit(out, "slti", dest + ", " + src1Reg + ", " + std::to_string(imm + 1));
       break;
     case IROp::GE:
-      emit(out, "slti", destReg + ", " + src1Reg + ", " + std::to_string(imm));
-      emit(out, "xori", destReg + ", " + destReg + ", 1");
+      emit(out, "slti", dest + ", " + src1Reg + ", " + std::to_string(imm));
+      emit(out, "xori", dest + ", " + dest + ", 1");
       break;
     case IROp::EQ:
       emit(out, "li", "t1, " + std::to_string(imm));
-      emit(out, "sub", destReg + ", " + src1Reg + ", t1");
-      emit(out, "seqz", destReg + ", " + destReg);
+      emit(out, "sub", dest + ", " + src1Reg + ", t1");
+      emit(out, "seqz", dest + ", " + dest);
       break;
     case IROp::NE:
       emit(out, "li", "t1, " + std::to_string(imm));
-      emit(out, "sub", destReg + ", " + src1Reg + ", t1");
-      emit(out, "snez", destReg + ", " + destReg);
+      emit(out, "sub", dest + ", " + src1Reg + ", t1");
+      emit(out, "snez", dest + ", " + dest);
       break;
     default:
       break;
@@ -1289,34 +1484,30 @@ void CodeGenerator::emitCompareOp(const IRInst& inst, std::ostream& out) {
   } else {
     switch (inst.op) {
     case IROp::LT:
-      emit(out, "slt", destReg + ", " + src1Reg + ", " + src2Reg);
+      emit(out, "slt", dest + ", " + src1Reg + ", " + src2Reg);
       break;
     case IROp::GT:
-      emit(out, "slt", destReg + ", " + src2Reg + ", " + src1Reg);
+      emit(out, "slt", dest + ", " + src2Reg + ", " + src1Reg);
       break;
     case IROp::LE:
-      emit(out, "slt", destReg + ", " + src2Reg + ", " + src1Reg);
-      emit(out, "xori", destReg + ", " + destReg + ", 1");
+      emit(out, "slt", dest + ", " + src2Reg + ", " + src1Reg);
+      emit(out, "xori", dest + ", " + dest + ", 1");
       break;
     case IROp::GE:
-      emit(out, "slt", destReg + ", " + src1Reg + ", " + src2Reg);
-      emit(out, "xori", destReg + ", " + destReg + ", 1");
+      emit(out, "slt", dest + ", " + src1Reg + ", " + src2Reg);
+      emit(out, "xori", dest + ", " + dest + ", 1");
       break;
     case IROp::EQ:
-      emit(out, "sub", destReg + ", " + src1Reg + ", " + src2Reg);
-      emit(out, "seqz", destReg + ", " + destReg);
+      emit(out, "sub", dest + ", " + src1Reg + ", " + src2Reg);
+      emit(out, "seqz", dest + ", " + dest);
       break;
     case IROp::NE:
-      emit(out, "sub", destReg + ", " + src1Reg + ", " + src2Reg);
-      emit(out, "snez", destReg + ", " + destReg);
+      emit(out, "sub", dest + ", " + src1Reg + ", " + src2Reg);
+      emit(out, "snez", dest + ", " + dest);
       break;
     default:
       break;
     }
-  }
-
-  if (!destInReg) {
-    storeOperand(destReg, inst.dest, out);
   }
 }
 
@@ -1385,6 +1576,184 @@ CodeGenerator::detectTailCalls(const FunctionRange& function) const {
   return result;
 }
 
+// 分析函数内反转循环的计数变量及非负表达式，记录变量恒非负的 IR 索引范围：
+//   BRANCH Lc; LABEL Lb; <body>; LABEL Lc; <cond>; BNEZ Lb
+// 若计数变量初值非负（#imm, imm>=0），且循环体内对其的所有定义都是正步长
+// 自增（i = i + c, c>0），则该变量在循环体内恒非负。在此基础上按基本块
+// 直线传播：非负 + 非负（或非负立即数）的 ADD/ASSIGN 结果也非负。
+// 范围内 2 的幂常量除法/取模可直接用 srai/andi（负数的 C 除/模语义不同，
+// 因此范围必须精确限定到循环体/传播窗口内，循环外重新赋值不受影响）。
+void CodeGenerator::analyzeNonNegativeVars(const FunctionRange& function) {
+  nonNegativeRanges_.clear();
+  const auto addRange = [&](const std::string& name, std::size_t begin, std::size_t end) {
+    if (begin >= end) {
+      return;
+    }
+    nonNegativeRanges_[name].push_back(NonNegRange{begin, end});
+  };
+
+  // 第一遍：识别循环计数变量种子，记录其循环体范围
+  for (std::size_t i = function.begin; i + 1 < function.end; ++i) {
+    if (ir_[i].op != IROp::BRANCH || !ir_[i].dest.isLabel()) {
+      continue;
+    }
+    if (ir_[i + 1].op != IROp::LABEL) {
+      continue;
+    }
+    const std::string condLabel = ir_[i].dest.name;
+    const std::string bodyLabel = ir_[i + 1].dest.name;
+    // 定位条件标签与循环回跳
+    std::size_t ci = i + 2;
+    for (; ci < function.end; ++ci) {
+      if (ir_[ci].op == IROp::LABEL && ir_[ci].dest.name == condLabel) {
+        break;
+      }
+    }
+    if (ci >= function.end) {
+      continue;
+    }
+    std::size_t bi = ci + 1;
+    for (; bi < function.end; ++bi) {
+      if (ir_[bi].op == IROp::BNEZ && ir_[bi].dest.name == bodyLabel) {
+        break;
+      }
+    }
+    if (bi >= function.end || bi == ci + 1) {
+      continue;
+    }
+    // 条件块最后一条必须是 LT/LE（继续循环的比较），其 src1 为计数变量
+    const IRInst& cond = ir_[bi - 1];
+    if ((cond.op != IROp::LT && cond.op != IROp::LE) || !cond.src1.isLocalVar()) {
+      continue;
+    }
+    const std::string indName = cond.src1.name;
+    // 初值非负：循环入口前最近定义必须为 ASSIGN/LOCAL_VAR_DECL #imm(>=0)
+    bool initNonNeg = false;
+    for (std::size_t k = i; k > function.begin; --k) {
+      const IRInst& prev = ir_[k - 1];
+      if (prev.dest.isLocalVar() && prev.dest.name == indName) {
+        if ((prev.op == IROp::ASSIGN || prev.op == IROp::LOCAL_VAR_DECL) && prev.src1.isImm() &&
+            prev.src1.immVal >= 0) {
+          initNonNeg = true;
+        }
+        break;
+      }
+      if (prev.op == IROp::LABEL || prev.op == IROp::BRANCH || prev.op == IROp::BEQZ ||
+          prev.op == IROp::BNEZ || prev.op == IROp::CALL || prev.op == IROp::FUNC_BEGIN) {
+        break;
+      }
+    }
+    if (!initNonNeg) {
+      continue;
+    }
+    // 循环体内（含条件块）对计数变量的所有定义都必须是正步长自增
+    bool onlySelfInc = true;
+    for (std::size_t k = i + 2; k < bi; ++k) {
+      const IRInst& inst = ir_[k];
+      if (!inst.dest.isLocalVar() || inst.dest.name != indName) {
+        continue;
+      }
+      const bool selfInc = (inst.op == IROp::ADD || inst.op == IROp::SUB) &&
+                           inst.src1.isLocalVar() && inst.src1.name == indName && inst.src2.isImm();
+      if (!selfInc) {
+        onlySelfInc = false;
+        break;
+      }
+      const int step = (inst.op == IROp::ADD) ? inst.src2.immVal : -inst.src2.immVal;
+      if (step <= 0) {
+        onlySelfInc = false;
+        break;
+      }
+    }
+    if (onlySelfInc) {
+      // 循环体 [i+2, bi) 内恒非负；条件块（bi-1 的 LT/LE）中 i 尚未自增到
+      // 本轮末值，但仍由上一轮的非负值 + 正步长得到，同样非负，一并覆盖。
+      addRange(indName, i + 2, bi + 1);
+    }
+  }
+
+  // 第二遍：按基本块直线传播非负（块边界处清空，仅保留循环种子已覆盖的范围）。
+  // 逐条记录"由非负源产生的定义"范围 [defIdx, nextDefIdx)。
+  std::vector<std::pair<std::string, std::size_t>> curNonNeg; // 变量 -> 最近定义索引
+  const auto flushWindow = [&](std::size_t end) {
+    // curNonNeg 中每项的有效范围 [defIdx, end)，作为传播结果追加
+    for (const auto& entry : curNonNeg) {
+      addRange(entry.first, entry.second, end);
+    }
+    curNonNeg.clear();
+  };
+  for (std::size_t idx = function.begin; idx < function.end; ++idx) {
+    const IRInst& inst = ir_[idx];
+    // 基本块边界：分支/标签/调用/返回后传播窗口结束（保守）
+    if (inst.op == IROp::LABEL || inst.op == IROp::BRANCH || inst.op == IROp::BEQZ ||
+        inst.op == IROp::BNEZ || inst.op == IROp::CALL || inst.op == IROp::RETURN ||
+        inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
+      flushWindow(idx);
+      continue;
+    }
+    // 先判定源操作数（RISC-V read-before-write：dest 与 src 同名时，
+    // 本指令读取的是旧值，须先查 src 再使 dest 的旧传播失效）
+    const auto srcNonNeg = [&](const Operand& op, std::size_t atIdx) {
+      if (op.isImm()) {
+        return op.immVal >= 0;
+      }
+      if (op.isLocalVar()) {
+        for (const auto& entry : curNonNeg) {
+          if (entry.first == op.name) {
+            return true;
+          }
+        }
+        // 循环计数变量等种子范围同样视为非负源
+        return isNonNegative(op.name, atIdx);
+      }
+      return false;
+    };
+    bool isNonNegDef = false;
+    if ((inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) && inst.src1.isImm() &&
+        inst.src1.immVal >= 0) {
+      isNonNegDef = true;
+    } else if (inst.op == IROp::ASSIGN && inst.src1.isLocalVar() && srcNonNeg(inst.src1, idx)) {
+      isNonNegDef = true;
+    } else if (inst.op == IROp::ADD && inst.dest.isLocalVar() && srcNonNeg(inst.src1, idx) &&
+               srcNonNeg(inst.src2, idx)) {
+      isNonNegDef = true;
+    } else if ((inst.op == IROp::DIV || inst.op == IROp::MOD) && inst.dest.isLocalVar() &&
+               srcNonNeg(inst.src1, idx) && inst.src2.isImm() && inst.src2.immVal > 0) {
+      // 非负 / 正 与 非负 % 正 的结果仍非负
+      isNonNegDef = true;
+    }
+    // 移除此指令重新定义的变量（其旧传播失效）；先提交旧窗口再移除，
+    // 避免"定义后立即被重定义"（如 ADD t6; DIV t6, t6）丢失非负范围
+    if (inst.dest.isLocalVar()) {
+      for (auto it = curNonNeg.begin(); it != curNonNeg.end();) {
+        if (it->first == inst.dest.name) {
+          addRange(it->first, it->second, idx);
+          it = curNonNeg.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+    if (isNonNegDef && inst.dest.isLocalVar()) {
+      curNonNeg.emplace_back(inst.dest.name, idx);
+    }
+  }
+  flushWindow(function.end);
+}
+
+bool CodeGenerator::isNonNegative(const std::string& name, std::size_t index) const {
+  auto it = nonNegativeRanges_.find(name);
+  if (it == nonNegativeRanges_.end()) {
+    return false;
+  }
+  for (const auto& range : it->second) {
+    if (index >= range.begin && index < range.end) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void CodeGenerator::emitTailCall(const TailCallInfo& tailCall, std::ostream& out) const {
   if (tailCall.isSelf) {
     // 自递归尾调用：实参已在 a0-a7，直接跳回函数体入口（参数装载点），
@@ -1435,9 +1804,9 @@ void CodeGenerator::scanUsedSRegisters(const std::string& asmText,
 
 std::string CodeGenerator::destRegOrT0(const Operand& dest) const {
   if (dest.isLocalVar()) {
-    auto it = frame_.regAlloc.find(dest.name);
-    if (it != frame_.regAlloc.end()) {
-      return "s" + std::to_string(it->second);
+    const std::string reg = regForVar(dest.name);
+    if (!reg.empty()) {
+      return reg;
     }
   }
   if (dest.isGlobalVar()) {
@@ -1451,12 +1820,28 @@ std::string CodeGenerator::destRegOrT0(const Operand& dest) const {
 
 bool CodeGenerator::isDestInReg(const Operand& dest) const {
   if (dest.isLocalVar()) {
-    return frame_.regAlloc.find(dest.name) != frame_.regAlloc.end();
+    return varHasReg(dest.name);
   }
   if (dest.isGlobalVar()) {
     return frame_.globalRegAlloc.find(dest.name) != frame_.globalRegAlloc.end();
   }
   return false;
+}
+
+std::string CodeGenerator::regForVar(const std::string& name) const {
+  auto it = frame_.regAlloc.find(name);
+  if (it != frame_.regAlloc.end()) {
+    return "s" + std::to_string(it->second);
+  }
+  auto tit = frame_.tempRegs.find(name);
+  if (tit != frame_.tempRegs.end()) {
+    return tit->second;
+  }
+  return std::string();
+}
+
+bool CodeGenerator::varHasReg(const std::string& name) const {
+  return !regForVar(name).empty();
 }
 
 std::string CodeGenerator::asmLabel(const std::string& label) const {

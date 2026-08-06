@@ -31,6 +31,7 @@ private:
     std::unordered_map<std::string, int> localOffsets;
     std::unordered_map<std::string, int> regAlloc;       // 局部变量 → s寄存器编号 (2-11)
     std::unordered_map<std::string, int> globalRegAlloc; // 全局变量 → s寄存器编号 (2-11)
+    std::unordered_map<std::string, std::string> tempRegs; // 临时变量 → t寄存器 (t4-t6)
     std::vector<std::string> usedCalleeSavedRegisters;
     std::string functionName;
 
@@ -50,18 +51,35 @@ private:
   std::string currentFunction_;
   int currentParamIndex_ = 0;
   std::vector<TailCallInfo> tailCalls_;
+  // 每个局部变量在函数内的使用次数（用于判断比较结果是否仅被紧随分支使用，从而融合为条件分支）
+  std::unordered_map<std::string, int> irUseCount_;
+  // 变量在 [begin, end) 的 IR 指令索引范围内恒非负（循环计数变量、由非负
+  // 操作数组成的 ADD/ASSIGN 临时等）。2 的幂常量除法/取模在该范围内可替换
+  // 为单条 srai/andi（负数的 C 除/模语义不同，须按位置精确限定）。
+  struct NonNegRange {
+    std::size_t begin = 0;
+    std::size_t end = 0;
+  };
+  std::unordered_map<std::string, std::vector<NonNegRange>> nonNegativeRanges_;
+  // 当前正在生成的 IR 指令索引（供按位置查询非负性）
+  std::size_t currentInstIndex_ = 0;
 
   void emitGlobalData(std::ostream& out);
   std::vector<FunctionRange> collectFunctions() const;
   StackFrame analyzeStackFrame(const FunctionRange& function) const;
 
   void generateFunction(const FunctionRange& function, std::ostream& out);
-  void generateInstruction(const IRInst& inst, std::ostream& out);
+  // 生成第 index 条 IR 指令；若与下一条比较+分支融合，返回消耗的指令数（1 或 2）
+  std::size_t generateInstruction(std::size_t index, std::size_t end, std::ostream& out);
   void emitPrologue(const StackFrame& frame, std::ostream& out) const;
   void emitEpilogue(const StackFrame& frame, std::ostream& out) const;
 
   // 检测函数中的尾调用（CALL 结果仅被紧随的 RETURN 使用）
   std::vector<TailCallInfo> detectTailCalls(const FunctionRange& function) const;
+  // 分析函数内反转循环的计数变量及非负表达式，记录变量恒非负的 IR 索引范围
+  void analyzeNonNegativeVars(const FunctionRange& function);
+  // 查询变量 name 在 IR 索引 index 处是否已知非负
+  bool isNonNegative(const std::string& name, std::size_t index) const;
   // 发射尾调用序列：恢复被调用者保存寄存器后直接跳转
   void emitTailCall(const TailCallInfo& tailCall, std::ostream& out) const;
   // 扫描汇编文本中实际使用的 s2-s11 寄存器
@@ -73,6 +91,10 @@ private:
   void loadOperand(const Operand& operand, std::string_view reg, std::ostream& out);
   void storeOperand(std::string_view reg, const Operand& operand, std::ostream& out);
   void emitBinaryOp(const IRInst& inst, std::ostream& out);
+  // 比较指令：若结果临时仅被紧随其后的 BEQZ/BNEZ 使用，融合为条件分支（不落栈）
+  std::size_t emitCompareOrFuse(std::size_t index, std::size_t end, std::ostream& out);
+  // 将比较结果计算到指定寄存器（不落栈），供融合分支复用
+  void emitCompareInto(const IRInst& inst, std::string_view destReg, std::ostream& out);
   void emitCompareOp(const IRInst& inst, std::ostream& out);
   void emitCall(const IRInst& inst, std::ostream& out);
 
@@ -85,6 +107,9 @@ private:
   // 若 dest 局部变量分配了寄存器则返回该寄存器名，否则返回 "t0"
   std::string destRegOrT0(const Operand& dest) const;
   bool isDestInReg(const Operand& dest) const;
+  // 统一查询变量绑定的寄存器（s2-s11 或 t4-t6），未绑定返回空串
+  std::string regForVar(const std::string& name) const;
+  bool varHasReg(const std::string& name) const;
 
   std::string asmLabel(const std::string& label) const;
   std::string globalSymbol(const std::string& name) const;
