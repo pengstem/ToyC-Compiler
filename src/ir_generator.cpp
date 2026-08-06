@@ -1,5 +1,6 @@
 #include "ir_generator.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cctype>
 #include <iostream>
@@ -66,6 +67,7 @@ std::vector<IRInst> IRGenerator::generate(CompUnit& compUnit) {
     genGlobalDecl(node.get());
   }
 
+  inlinePass();
   optimizePass();
 
   return ir;
@@ -486,10 +488,16 @@ Operand IRGenerator::genExpr(Expr* expr) {
   }
 
   if (auto* callExpr = dynamic_cast<CallExpr*>(expr)) {
-    // 生成参数传递
-    for (size_t i = 0; i < callExpr->args.size(); ++i) {
-      Operand argVal = genExpr(callExpr->args[i].get());
-      emit(IROp::PARAM, argVal, Operand::imm(static_cast<int>(i)));
+    // 先求值全部实参，再按序发射 PARAM。
+    // 若边求值边发射 PARAM：外层实参先载入 a0-a7，内层嵌套调用的
+    // PARAM 会覆盖它们（caller-saved），导致外层实参丢失（正确性 bug）。
+    std::vector<Operand> argVals;
+    argVals.reserve(callExpr->args.size());
+    for (auto& arg : callExpr->args) {
+      argVals.push_back(genExpr(arg.get()));
+    }
+    for (size_t i = 0; i < argVals.size(); ++i) {
+      emit(IROp::PARAM, std::move(argVals[i]), Operand::imm(static_cast<int>(i)));
     }
 
     Symbol* funcSym = symTable.lookupFunction(callExpr->funcName);
@@ -651,6 +659,266 @@ bool isPureCondInst(const IRInst& inst) {
 }
 
 } // namespace
+
+// ============================================================
+// 函数内联 pass（在 optimizePass 之前运行）
+// ============================================================
+
+void IRGenerator::inlinePass() {
+  constexpr std::size_t kInlineLimit = 24;
+
+  // 多轮迭代：内联可能引入新的可内联调用（如 f(g(x))）。
+  // 每轮重新收集函数区间，因为前一轮的内联替换会使旧下标失效。
+  bool any = true;
+  for (int rounds = 0; any && rounds < 64; ++rounds) {
+    any = false;
+
+    // 函数定义区间
+    struct FuncInfo {
+      std::size_t begin = 0;
+      std::size_t end = 0;
+      int paramCount = 0;
+      std::vector<std::string> paramVars; // 按声明顺序的 IR 参数名
+    };
+    std::unordered_map<std::string, FuncInfo> funcs;
+    for (std::size_t i = 0; i < ir.size(); ++i) {
+      if (ir[i].op == IROp::FUNC_BEGIN && ir[i].dest.isFunc()) {
+        FuncInfo info;
+        info.begin = i;
+        info.end = i + 1;
+        while (info.end < ir.size() && ir[info.end].op != IROp::FUNC_END)
+          ++info.end;
+        for (std::size_t k = info.begin + 1; k < info.end; ++k) {
+          if (ir[k].op == IROp::LOCAL_VAR_DECL && ir[k].src1.isParam()) {
+            ++info.paramCount;
+            info.paramVars.push_back(ir[k].dest.name);
+          }
+        }
+        funcs[ir[i].dest.name] = std::move(info);
+      }
+    }
+    if (funcs.empty())
+      break;
+
+    // 调用图可达性：reach[f] = f 经定义函数（传递）调用的函数集合
+    std::unordered_map<std::string, std::unordered_set<std::string>> reach;
+    for (const auto& [fname, finfo] : funcs) {
+      auto& r = reach[fname];
+      std::vector<std::string> stack{fname};
+      while (!stack.empty()) {
+        std::string cur = std::move(stack.back());
+        stack.pop_back();
+        auto fit = funcs.find(cur);
+        if (fit == funcs.end())
+          continue;
+        for (std::size_t k = fit->second.begin + 1; k < fit->second.end; ++k) {
+          if (ir[k].op == IROp::CALL && ir[k].src1.isFunc() && r.insert(ir[k].src1.name).second) {
+            stack.push_back(ir[k].src1.name);
+          }
+        }
+      }
+    }
+
+    // 参数是否在函数体中被写（被写则实参必须物化到临时变量）
+    std::unordered_map<std::string, std::unordered_set<std::string>> writtenParams;
+    for (const auto& [fname, finfo] : funcs) {
+      for (std::size_t k = finfo.begin + 1; k < finfo.end; ++k) {
+        if (ir[k].dest.isLocalVar()) {
+          writtenParams[fname].insert(ir[k].dest.name);
+        }
+      }
+    }
+
+    // 函数体大小：排除参数声明、无初始化局部声明、标签、FUNC_END
+    auto bodySize = [&](const FuncInfo& f) {
+      std::size_t n = 0;
+      for (std::size_t k = f.begin + 1; k < f.end; ++k) {
+        const auto& inst = ir[k];
+        if (inst.op == IROp::LABEL || inst.op == IROp::FUNC_END)
+          continue;
+        if (inst.op == IROp::LOCAL_VAR_DECL && (inst.src1.isParam() || inst.src1.isNone()))
+          continue;
+        ++n;
+      }
+      return n;
+    };
+
+    struct Candidate {
+      std::size_t callIndex;    // CALL 指令下标
+      std::size_t paramStart;   // 该调用点第一个 PARAM 的下标
+      std::vector<IRInst> body; // 变换后的内联体
+    };
+    std::vector<Candidate> cands;
+
+    std::string curFunc;
+    for (std::size_t ci = 0; ci < ir.size(); ++ci) {
+      if (ir[ci].op == IROp::FUNC_BEGIN) {
+        curFunc = ir[ci].dest.name;
+        continue;
+      }
+      if (ir[ci].op == IROp::FUNC_END) {
+        curFunc.clear();
+        continue;
+      }
+      if (ir[ci].op != IROp::CALL || !ir[ci].src1.isFunc())
+        continue;
+
+      const std::string& callee = ir[ci].src1.name;
+      auto fit = funcs.find(callee);
+      if (fit == funcs.end())
+        continue; // 未定义（库函数）不内联
+      const FuncInfo& f = fit->second;
+      // 递归（含相互递归）不内联；经 callee 可达 caller（会产生调用环）不内联
+      if (reach[callee].count(callee) || reach[callee].count(curFunc))
+        continue;
+      if (bodySize(f) > kInlineLimit)
+        continue;
+
+      // 收集紧邻 CALL 之前的 PARAM 指令（应连续，索引 0..n-1）
+      std::vector<Operand> argVals;
+      std::size_t p = ci;
+      while (p > 0 && ir[p - 1].op == IROp::PARAM)
+        --p;
+      bool ok = true;
+      for (std::size_t k = p; k < ci; ++k) {
+        if (ir[k].src1.isImm() && ir[k].src1.immVal == static_cast<int>(argVals.size())) {
+          argVals.push_back(ir[k].dest);
+        } else {
+          ok = false;
+          break;
+        }
+      }
+      if (!ok || argVals.size() != static_cast<std::size_t>(f.paramCount))
+        continue;
+
+      // 变换函数体：参数映射、标签重命名、RETURN 改写
+      const std::unordered_set<std::string>& wp = writtenParams[callee];
+      std::unordered_map<std::string, Operand> paramMap;
+      std::vector<IRInst> body;
+      for (std::size_t i = 0; i < static_cast<std::size_t>(f.paramCount); ++i) {
+        const std::string& pv = f.paramVars[i];
+        if (wp.count(pv)) {
+          // 形参被写：实参物化到新鲜临时变量。
+          // 用 p 前缀而非 t%d：mapTmp 会重命名函数体复制的 t 名，
+          // 若物化临时也是 t 名会被误重命名，造成悬垂引用
+          Operand fresh = Operand::localVar("p" + std::to_string(tempCounter++));
+          paramMap[pv] = fresh;
+          body.emplace_back(IROp::ASSIGN, fresh, argVals[i], Operand::none());
+        } else {
+          // 形参只读：直接复用实参操作数（立即数/变量均可）
+          paramMap[pv] = argVals[i];
+        }
+      }
+
+      auto mapOp = [&](const Operand& op) -> Operand {
+        if (op.isLocalVar() && paramMap.count(op.name))
+          return paramMap[op.name];
+        return op;
+      };
+
+      // 临时变量重命名：t%d 由 tempCounter 生成、跨函数重名（generate() 每函数
+      // 重置计数），内联复制进调用者后必须换成唯一名，否则复制传播/合并会
+      // 把不同函数同名临时混为一谈（use 计数错误 → 优化失效）
+      std::unordered_map<std::string, std::string> tempRename;
+      auto mapTmp = [&](const Operand& op) -> Operand {
+        if (op.isLocalVar() && isTempName(op.name)) {
+          auto it = tempRename.find(op.name);
+          if (it == tempRename.end()) {
+            it = tempRename.emplace(op.name, newTemp()).first;
+          }
+          return Operand::localVar(it->second);
+        }
+        return op;
+      };
+
+      std::unordered_map<std::string, std::string> labelMap;
+      auto mapLabel = [&](const std::string& l) {
+        auto it = labelMap.find(l);
+        if (it == labelMap.end())
+          it = labelMap.emplace(l, newLabel()).first;
+        return it->second;
+      };
+
+      const Operand retTemp = ir[ci].dest.isNone() ? Operand::none() : Operand::localVar(newTemp());
+      const std::string endLabel = newLabel();
+      bool hasReturnBranch = false; // 已有中间返回跳转 → 末尾默认返回不可达，可跳过
+      for (std::size_t k = f.begin + 1; k < f.end; ++k) {
+        const IRInst& inst = ir[k];
+        if (inst.op == IROp::FUNC_END)
+          continue;
+        if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isParam())
+          continue; // 参数声明已替换
+        if (inst.op == IROp::RETURN) {
+          const bool isLast = (k + 1 >= f.end);
+          if (isLast && hasReturnBranch)
+            continue; // 不可达（前有 return 跳转）
+          if (!retTemp.isNone()) {
+            Operand rv = inst.dest.isNone() ? Operand::imm(0) : mapTmp(mapOp(inst.dest));
+            body.emplace_back(IROp::ASSIGN, retTemp, std::move(rv), Operand::none());
+          }
+          if (!isLast) {
+            body.emplace_back(IROp::BRANCH, Operand::label(endLabel), Operand::none(),
+                              Operand::none());
+            hasReturnBranch = true;
+          }
+          continue;
+        }
+        // 一般指令：重命名参数引用、临时变量与标签（用户变量名全局唯一）
+        IRInst copy(inst.op, mapTmp(mapOp(inst.dest)), mapTmp(mapOp(inst.src1)),
+                    mapTmp(mapOp(inst.src2)));
+        if (copy.op == IROp::LABEL && copy.dest.isLabel()) {
+          copy.dest = Operand::label(mapLabel(copy.dest.name));
+        }
+        if ((copy.op == IROp::BRANCH || copy.op == IROp::BEQZ || copy.op == IROp::BNEZ) &&
+            copy.dest.isLabel()) {
+          copy.dest = Operand::label(mapLabel(copy.dest.name));
+        }
+        body.push_back(std::move(copy));
+      }
+      // 返回汇聚点 + 结果回传
+      body.emplace_back(IROp::LABEL, Operand::label(endLabel), Operand::none(), Operand::none());
+      if (!ir[ci].dest.isNone()) {
+        body.emplace_back(IROp::ASSIGN, ir[ci].dest, retTemp, Operand::none());
+      }
+      // 清理紧邻目标标签的跳转（j L; L: 是无操作，会打断后续循环分析）
+      for (std::size_t k = 0; k + 1 < body.size();) {
+        if (body[k].op == IROp::BRANCH && body[k].dest.isLabel() && body[k + 1].op == IROp::LABEL &&
+            body[k + 1].dest.name == body[k].dest.name) {
+          body.erase(body.begin() + static_cast<std::ptrdiff_t>(k));
+        } else {
+          ++k;
+        }
+      }
+      // 移除无引用的标签（内联后多余的 endLabel 会阻断块内复制传播/合并）
+      std::unordered_set<std::string> usedLabels;
+      for (const auto& inst : body) {
+        if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+            inst.dest.isLabel()) {
+          usedLabels.insert(inst.dest.name);
+        }
+      }
+      for (std::size_t k = 0; k < body.size();) {
+        if (body[k].op == IROp::LABEL && !usedLabels.count(body[k].dest.name)) {
+          body.erase(body.begin() + static_cast<std::ptrdiff_t>(k));
+        } else {
+          ++k;
+        }
+      }
+      cands.push_back({ci, p, std::move(body)});
+    }
+
+    // 倒序应用替换，保证未处理调用点下标有效
+    std::sort(cands.begin(), cands.end(),
+              [](const Candidate& a, const Candidate& b) { return a.callIndex > b.callIndex; });
+    for (auto& c : cands) {
+      ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(c.paramStart),
+               ir.begin() + static_cast<std::ptrdiff_t>(c.callIndex) + 1);
+      ir.insert(ir.begin() + static_cast<std::ptrdiff_t>(c.paramStart), c.body.begin(),
+                c.body.end());
+      any = true;
+    }
+  }
+}
 
 void IRGenerator::optimizePass() {
   // 迭代优化直到 IR 不再变化（常量传播 → 折叠 → 合并 → DCE 可能级联触发）
@@ -1372,7 +1640,7 @@ void IRGenerator::optimizePass() {
     // 在无控制流的直线代码段内，若 (op, src1, src2) 已计算过且操作数未在块内被重新定义，
     // 则复用之前的结果。用户变量可被重新赋值，须跟踪重定义并使相关条目失效。
     {
-      std::unordered_map<std::string, std::string> rename;   // 原名 → 复用名（仅临时变量）
+      std::unordered_map<std::string, std::string> rename; // 原名 → 复用名（仅临时变量）
       std::unordered_map<std::string, std::string> valueMap; // (op,src1,src2) → 结果变量
       std::unordered_map<std::string, std::vector<std::string>> varKeys; // 变量 → 引用它的 key
       std::vector<IRInst> optimized;
@@ -1914,108 +2182,65 @@ void IRGenerator::optimizePass() {
                   indIncremented = true;
                   continue;
                 }
-                // 临时变量定义：t = i * #c 或 t = #c * i（循环变量乘常量）
-                if (ir[k].op == IROp::MUL && ir[k].dest.isLocalVar() && !indIncremented) {
+                // 临时变量定义：t = L1 op L2，其中 L 是立即数 / 归纳变量 / 已知线性临时变量
+                // （支持组合：t2 = t1 + i，t1 = i*c → t2 = (c+1)*i）
+                if ((ir[k].op == IROp::MUL || ir[k].op == IROp::ADD || ir[k].op == IROp::SUB ||
+                     ir[k].op == IROp::ASSIGN) &&
+                    ir[k].dest.isLocalVar() && !indIncremented) {
                   const auto& d = ir[k].dest;
-                  const auto& s1 = ir[k].src1;
-                  const auto& s2 = ir[k].src2;
                   bool isTempDef = true;
-                  // t 不能是归纳变量或已识别的累加变量
                   if (d.name == indName)
                     isTempDef = false;
+                  // 允许 dest == src1：Pass 5 复用同名临时后出现
+                  // `ADD t, t, i`（t 的新定义 = 旧 t 值 + i）。线性组合用
+                  // 映射中旧值参与，随后覆盖为新定义，语义正确。
                   for (const auto& acc : accVars) {
                     if (acc.name == d.name)
                       isTempDef = false;
                   }
                   if (isTempDef) {
-                    TempLin tl;
-                    if (s1.isLocalVar() && s1.name == indName && s2.isImm()) {
-                      tl.indCoeff = s2.immVal;
-                      tempLinMap[d.name] = tl;
-                      continue;
+                    auto linOf = [&](const Operand& op) -> std::optional<TempLin> {
+                      if (op.isImm())
+                        return TempLin{0, op.immVal};
+                      if (op.isLocalVar()) {
+                        if (op.name == indName)
+                          return TempLin{1, 0};
+                        auto it = tempLinMap.find(op.name);
+                        if (it != tempLinMap.end())
+                          return it->second;
+                      }
+                      return std::nullopt;
+                    };
+                    const auto l1 = linOf(ir[k].src1);
+                    const auto l2 = linOf(ir[k].src2);
+                    if (l1 && l2) {
+                      TempLin tl;
+                      if (ir[k].op == IROp::MUL) {
+                        // t = L1 * L2：两边都含归纳变量则非线性
+                        if (l1->indCoeff != 0 && l2->indCoeff != 0) {
+                          // 不作为线性临时变量，交给后续检查
+                        } else {
+                          tl.indCoeff =
+                              l1->indCoeff * l2->constOffset + l2->indCoeff * l1->constOffset;
+                          tl.constOffset = l1->constOffset * l2->constOffset;
+                          tempLinMap[d.name] = tl;
+                          continue;
+                        }
+                      } else if (ir[k].op == IROp::ADD) {
+                        tl.indCoeff = l1->indCoeff + l2->indCoeff;
+                        tl.constOffset = l1->constOffset + l2->constOffset;
+                        tempLinMap[d.name] = tl;
+                        continue;
+                      } else if (ir[k].op == IROp::SUB) {
+                        tl.indCoeff = l1->indCoeff - l2->indCoeff;
+                        tl.constOffset = l1->constOffset - l2->constOffset;
+                        tempLinMap[d.name] = tl;
+                        continue;
+                      } else { // ASSIGN：t = L1
+                        tempLinMap[d.name] = *l1;
+                        continue;
+                      }
                     }
-                    if (s2.isLocalVar() && s2.name == indName && s1.isImm()) {
-                      tl.indCoeff = s1.immVal;
-                      tempLinMap[d.name] = tl;
-                      continue;
-                    }
-                  }
-                }
-                // 临时变量定义：t = i + #c, t = #c + i, t = i - #c, t = i
-                if ((ir[k].op == IROp::ADD || ir[k].op == IROp::SUB) && ir[k].dest.isLocalVar() &&
-                    !indIncremented) {
-                  const auto& d = ir[k].dest;
-                  const auto& s1 = ir[k].src1;
-                  const auto& s2 = ir[k].src2;
-                  bool isTempDef = true;
-                  if (d.name == indName)
-                    isTempDef = false;
-                  if (s1.isLocalVar() && s1.name == d.name)
-                    isTempDef = false; // 自赋值，不是临时定义
-                  for (const auto& acc : accVars) {
-                    if (acc.name == d.name)
-                      isTempDef = false;
-                  }
-                  if (isTempDef) {
-                    TempLin tl;
-                    // t = i + #c
-                    if (s1.isLocalVar() && s1.name == indName && s2.isImm() &&
-                        ir[k].op == IROp::ADD) {
-                      tl.indCoeff = 1;
-                      tl.constOffset = s2.immVal;
-                      tempLinMap[d.name] = tl;
-                      continue;
-                    }
-                    // t = #c + i
-                    if (s2.isLocalVar() && s2.name == indName && s1.isImm() &&
-                        ir[k].op == IROp::ADD) {
-                      tl.indCoeff = 1;
-                      tl.constOffset = s1.immVal;
-                      tempLinMap[d.name] = tl;
-                      continue;
-                    }
-                    // t = i - #c
-                    if (s1.isLocalVar() && s1.name == indName && s2.isImm() &&
-                        ir[k].op == IROp::SUB) {
-                      tl.indCoeff = 1;
-                      tl.constOffset = -s2.immVal;
-                      tempLinMap[d.name] = tl;
-                      continue;
-                    }
-                    // t = i （ASSIGN t, i）
-                    if (ir[k].op == IROp::ADD && s1.isLocalVar() && s1.name == indName &&
-                        s2.isImm() && s2.immVal == 0) {
-                      tl.indCoeff = 1;
-                      tempLinMap[d.name] = tl;
-                      continue;
-                    }
-                    // t = #c （ASSIGN t, #c 被合并为 ADD t, #c, #0? 实际是 ASSIGN）
-                    // ASSIGN 不会到这里，跳过
-                  }
-                }
-                // ASSIGN 临时变量 = 立即数
-                if (ir[k].op == IROp::ASSIGN && ir[k].dest.isLocalVar() && !indIncremented) {
-                  const auto& d = ir[k].dest;
-                  const auto& s1 = ir[k].src1;
-                  bool isTempDef = true;
-                  if (d.name == indName)
-                    isTempDef = false;
-                  for (const auto& acc : accVars) {
-                    if (acc.name == d.name)
-                      isTempDef = false;
-                  }
-                  if (isTempDef && s1.isImm()) {
-                    TempLin tl;
-                    tl.constOffset = s1.immVal;
-                    tempLinMap[d.name] = tl;
-                    continue;
-                  }
-                  // ASSIGN t, i
-                  if (isTempDef && s1.isLocalVar() && s1.name == indName) {
-                    TempLin tl;
-                    tl.indCoeff = 1;
-                    tempLinMap[d.name] = tl;
-                    continue;
                   }
                 }
                 // 检查是否为已识别累加变量的再次常量自增

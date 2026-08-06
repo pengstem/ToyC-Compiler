@@ -89,6 +89,9 @@ struct Operand {
   bool isFunc() const {
     return type == OperandType::FUNC;
   }
+  bool isParam() const {
+    return type == OperandType::PARAM;
+  }
   bool isNone() const {
     return type == OperandType::NONE;
   }
