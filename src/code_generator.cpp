@@ -64,6 +64,9 @@ bool computeSignedDivMagic(int32_t d, uint32_t& magic, int32_t& shift) {
 } // namespace
 
 int CodeGenerator::StackFrame::frameSizeBytes() const {
+  if (!needsFrame()) {
+    return 0;
+  }
   const int reservedWords = 2 + static_cast<int>(usedCalleeSavedRegisters.size());
   // 局部变量栈槽数：取最大有效索引 +1（已分配寄存器的变量标记为 -1，不占槽）
   int maxSlot = -1;
@@ -75,6 +78,11 @@ int CodeGenerator::StackFrame::frameSizeBytes() const {
   const int computedLocalBytes = std::max(localBytes, (maxSlot + 1) * kWordBytes);
   return alignTo((reservedWords * kWordBytes) + computedLocalBytes + outgoingArgumentBytes,
                  kStackAlignmentBytes);
+}
+
+bool CodeGenerator::StackFrame::needsFrame() const {
+  return hasCall || hasStackParameters || localBytes != 0 || outgoingArgumentBytes != 0 ||
+         !usedCalleeSavedRegisters.empty();
 }
 
 void CodeGenerator::generateDefaultMain(std::ostream& out) {
@@ -146,12 +154,15 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
   frame.functionName = function.name;
   frame.localOffsets.clear();
   frame.regAlloc.clear();
+  frame.leafRegAlloc.clear();
   frame.localBytes = 0;
   frame.outgoingArgumentBytes = 0;
 
   int localIndex = 0;
   int maxOverflowArgs = 0;
   int nextReg = 2; // s2-s11 可用于局部变量分配
+  int incomingParamIndex = 0;
+  std::unordered_map<std::string, int> incomingParamRegs;
 
   // 第一遍：收集所有局部变量
   std::vector<std::string> varOrder; // 保持插入顺序
@@ -170,6 +181,14 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
         if (frame.localOffsets.find(inst.dest.name) == frame.localOffsets.end()) {
           frame.localOffsets[inst.dest.name] = localIndex++;
           varOrder.push_back(inst.dest.name);
+        }
+        if (inst.src1.isParam()) {
+          if (incomingParamIndex < 8) {
+            incomingParamRegs[inst.dest.name] = incomingParamIndex;
+          } else {
+            frame.hasStackParameters = true;
+          }
+          ++incomingParamIndex;
         }
       }
       continue;
@@ -233,6 +252,7 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
       globalUseFreq[inst.dest.name]++;
     }
   }
+  frame.hasCall = hasCall;
 
   // 按使用频率降序排列，优先为高频变量分配寄存器（循环计数器等）
   // 循环常量提升变量（'k' 前缀）无条件优先，保证循环内比较变成寄存器比较
@@ -247,12 +267,9 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
                    });
 
   // 临时变量 t 寄存器分配（t4-t6）：
-  // 若一个局部变量（含表达式临时与块内声明的临时变量）的所有引用（定义与使用）
-  // 同属一个基本块，且块内首次引用是定义（定义支配块内所有使用），则该变量的
-  // 存活区间不跨越任何可能破坏 t4-t6 的指令（CALL 会破坏所有 caller-saved），
-  // 可以安全地驻留在 t 寄存器，彻底消除"计算→落栈→重载"的内存往返。
-  // 多个互不重叠的变量共享 t4-t6；分配成功的变量不再占用栈槽，也不再参与 s 寄存器
-  // 竞争，把 s 寄存器让给循环内长期存活的用户变量。
+  // 一个 IR 名可能被临时回收 pass 在多个基本块内重新定义。把每次定义切成独立
+  // live range，只要求每段的使用不跨基本块/调用，再按所有分段的冲突关系着色。
+  // 这避免把互不同时存活的分支临时各占一个 s 寄存器并在每次叶函数调用时保存。
   frame.tempRegs.clear();
   {
     // 基本块编号：以控制流/调用为界
@@ -285,12 +302,16 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
         varRefs[inst.dest.name].push_back({idx, true});
       }
     }
-    struct VarInterval {
+    struct LiveRange {
       std::size_t start = 0;
       std::size_t end = 0;
-      std::string name;
+      int block = 0;
     };
-    std::vector<VarInterval> intervals;
+    struct VarRanges {
+      std::string name;
+      std::vector<LiveRange> ranges;
+    };
+    std::vector<VarRanges> candidates;
     for (const auto& entry : varRefs) {
       const std::string& name = entry.first;
       const auto& refs = entry.second;
@@ -298,65 +319,99 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
         continue; // 只有单一引用（或纯定义无使用），无需分配
       }
       bool ok = true;
-      std::size_t first = refs.front().first;
-      std::size_t last = refs.front().first;
-      const int blk = blockId[first];
-      for (std::size_t r = 0; r < refs.size(); ++r) {
-        if (blockId[refs[r].first] != blk) {
+      bool haveDefinition = false;
+      VarRanges var;
+      var.name = name;
+      for (const auto& ref : refs) {
+        if (ref.second) {
+          var.ranges.push_back({ref.first, ref.first, blockId[ref.first]});
+          haveDefinition = true;
+          continue;
+        }
+        if (!haveDefinition || var.ranges.empty() ||
+            blockId[ref.first] != var.ranges.back().block) {
           ok = false;
           break;
         }
-        if (refs[r].first > last) {
-          last = refs[r].first;
+        if (ref.first > var.ranges.back().end) {
+          var.ranges.back().end = ref.first;
         }
       }
-      if (!ok) {
+      var.ranges.erase(
+          std::remove_if(var.ranges.begin(), var.ranges.end(),
+                         [](const LiveRange& range) { return range.start == range.end; }),
+          var.ranges.end());
+      if (!ok || var.ranges.empty()) {
         continue;
       }
-      // 首次引用必须是定义（保证进入基本块时寄存器先被写入再被读取）
-      if (!refs.front().second) {
-        continue;
-      }
-      if (last <= first) {
-        continue; // 引用集中在同一条指令（如 ASSIGN 自引用），无需分配
-      }
-      intervals.push_back({first, last, name});
+      candidates.push_back(std::move(var));
     }
-    std::sort(intervals.begin(), intervals.end(),
-              [](const VarInterval& a, const VarInterval& b) { return a.start < b.start; });
+    std::sort(candidates.begin(), candidates.end(), [](const VarRanges& a, const VarRanges& b) {
+      return a.ranges.front().start < b.ranges.front().start;
+    });
     constexpr const char* kTempRegs[3] = {"t4", "t5", "t6"};
-    struct ActiveInterval {
-      std::size_t end = 0;
-      std::string name;
-      int reg = -1;
+    std::vector<std::vector<LiveRange>> assigned(3);
+    const auto overlaps = [](const LiveRange& a, const LiveRange& b) {
+      return a.start <= b.end && b.start <= a.end;
     };
-    std::vector<ActiveInterval> active;
-    for (const auto& iv : intervals) {
-      active.erase(std::remove_if(active.begin(), active.end(),
-                                  [&](const ActiveInterval& a) { return a.end < iv.start; }),
-                   active.end());
-      bool used[3] = {false, false, false};
-      for (const auto& a : active) {
-        used[a.reg] = true;
+    for (const auto& candidate : candidates) {
+      int color = -1;
+      for (int r = 0; r < 3 && color < 0; ++r) {
+        bool conflicts = false;
+        for (const auto& range : candidate.ranges) {
+          for (const auto& occupied : assigned[static_cast<std::size_t>(r)]) {
+            if (overlaps(range, occupied)) {
+              conflicts = true;
+              break;
+            }
+          }
+          if (conflicts) {
+            break;
+          }
+        }
+        if (!conflicts) {
+          color = r;
+        }
       }
-      int freeReg = -1;
-      for (int r = 0; r < 3; ++r) {
-        if (!used[r]) {
-          freeReg = r;
+      if (color >= 0) {
+        frame.tempRegs[candidate.name] = kTempRegs[color];
+        auto& occupied = assigned[static_cast<std::size_t>(color)];
+        occupied.insert(occupied.end(), candidate.ranges.begin(), candidate.ranges.end());
+      }
+    }
+  }
+
+  // 叶函数没有 CALL，不需要跨调用保值。优先把形参固定到其 ABI 输入寄存器，
+  // 其余高频长期值使用空闲的 a0-a7；这既避免参数平行搬运互相覆盖，也免去
+  // s2-s11 的逐调用保存/恢复。块内短生命周期仍由上面的 t4-t6 承担。
+  if (!hasCall) {
+    bool usedArgRegs[8] = {false, false, false, false, false, false, false, false};
+    for (const auto& entry : incomingParamRegs) {
+      if (frame.tempRegs.find(entry.first) == frame.tempRegs.end()) {
+        frame.leafRegAlloc[entry.first] = "a" + std::to_string(entry.second);
+        usedArgRegs[entry.second] = true;
+      }
+    }
+    for (const auto& varName : varOrder) {
+      if (frame.tempRegs.find(varName) != frame.tempRegs.end() ||
+          frame.leafRegAlloc.find(varName) != frame.leafRegAlloc.end()) {
+        continue;
+      }
+      for (int r = 0; r < 8; ++r) {
+        if (!usedArgRegs[r]) {
+          frame.leafRegAlloc[varName] = "a" + std::to_string(r);
+          usedArgRegs[r] = true;
           break;
         }
-      }
-      if (freeReg >= 0) {
-        frame.tempRegs[iv.name] = kTempRegs[freeReg];
-        active.push_back({iv.end, iv.name, freeReg});
       }
     }
   }
 
   // 为前 10 个高频局部变量分配 s2-s11 寄存器
   for (const auto& varName : varOrder) {
-    if (frame.tempRegs.find(varName) != frame.tempRegs.end()) {
-      continue; // 已分配到 t 寄存器，不再占用 s 寄存器
+    if (frame.tempRegs.find(varName) != frame.tempRegs.end() ||
+        frame.leafRegAlloc.find(varName) != frame.leafRegAlloc.end()) {
+      continue; // 已分配到 caller-saved 寄存器，不再占用 s 寄存器
     }
     if (nextReg <= 11) {
       frame.regAlloc[varName] = nextReg++;
@@ -386,7 +441,8 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
   int stackSlotCount = 0;
   for (auto& entry : frame.localOffsets) {
     if (frame.regAlloc.find(entry.first) != frame.regAlloc.end() ||
-        frame.tempRegs.find(entry.first) != frame.tempRegs.end()) {
+        frame.tempRegs.find(entry.first) != frame.tempRegs.end() ||
+        frame.leafRegAlloc.find(entry.first) != frame.leafRegAlloc.end()) {
       entry.second = -1; // 标记：无栈槽
     } else {
       entry.second = stackSlotCount++;
@@ -757,6 +813,9 @@ std::size_t CodeGenerator::emitCompareOrFuse(std::size_t index, std::size_t end,
 
 void CodeGenerator::emitPrologue(const StackFrame& frame, std::ostream& out) const {
   const int frameSize = frame.frameSizeBytes();
+  if (frameSize == 0) {
+    return;
+  }
   emit(out, "addi", "sp, sp, -" + std::to_string(frameSize));
   // 在更新 s0 之前保存 ra 和旧 s0（使用 sp 相对偏移）
   emit(out, "sw", "ra, " + std::to_string(frameSize - 4) + "(sp)");
@@ -772,6 +831,10 @@ void CodeGenerator::emitPrologue(const StackFrame& frame, std::ostream& out) con
 }
 
 void CodeGenerator::emitEpilogue(const StackFrame& frame, std::ostream& out) const {
+  if (!frame.needsFrame()) {
+    emit(out, "ret", "");
+    return;
+  }
   int restoreOffset = -12;
   for (const auto& reg : frame.usedCalleeSavedRegisters) {
     emit(out, "lw", reg + ", " + std::to_string(restoreOffset) + "(s0)");
@@ -1219,6 +1282,40 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
       storeOperand(destReg, inst.dest, out);
     }
     return;
+  }
+
+  // RISC-V 没有“立即数减寄存器”指令。若目标与右操作数共用寄存器，通用
+  // 调度会先把右值 mv 到 t1，再用 li 覆盖目标，共需 3 条。改用空闲 scratch
+  // 保存立即数即可原地完成，热循环中的 `x = 1 - x` 每轮少 1 条指令。
+  if (inst.op == IROp::SUB && inst.src1.isImm() && inst.src2.isLocalVar()) {
+    const std::string rhsReg = regForVar(inst.src2.name);
+    if (!rhsReg.empty() && rhsReg == destReg) {
+      if (inst.src1.immVal == 0) {
+        emit(out, "sub", destReg + ", x0, " + rhsReg);
+      } else {
+        const std::string scratch = (destReg == "t0") ? "t2" : "t0";
+        emit(out, "li", scratch + ", " + std::to_string(inst.src1.immVal));
+        emit(out, "sub", destReg + ", " + scratch + ", " + rhsReg);
+      }
+      if (!destInReg) {
+        storeOperand(destReg, inst.dest, out);
+      }
+      return;
+    }
+  }
+
+  // 若 `x = invariant - x` 的左值已在另一寄存器，RISC-V 允许 rd 与 rs2
+  // 相同，可直接原地读取旧 x 后写回，避免通用路径先 mv 备份右操作数。
+  if (inst.op == IROp::SUB && inst.src1.isLocalVar() && inst.src2.isLocalVar()) {
+    const std::string lhsReg = regForVar(inst.src1.name);
+    const std::string rhsReg = regForVar(inst.src2.name);
+    if (!lhsReg.empty() && rhsReg == destReg && lhsReg != destReg) {
+      emit(out, "sub", destReg + ", " + lhsReg + ", " + rhsReg);
+      if (!destInReg) {
+        storeOperand(destReg, inst.dest, out);
+      }
+      return;
+    }
   }
 
   // 确定 src2 的寄存器：若已在寄存器中且不是 destReg，直接用该寄存器
@@ -1829,6 +1926,10 @@ bool CodeGenerator::isDestInReg(const Operand& dest) const {
 }
 
 std::string CodeGenerator::regForVar(const std::string& name) const {
+  auto lit = frame_.leafRegAlloc.find(name);
+  if (lit != frame_.leafRegAlloc.end()) {
+    return lit->second;
+  }
   auto it = frame_.regAlloc.find(name);
   if (it != frame_.regAlloc.end()) {
     return "s" + std::to_string(it->second);

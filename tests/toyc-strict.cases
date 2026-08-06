@@ -72,3 +72,4 @@ lv8/04_param_name.c
 lv8/05_func_name.c
 lv8/06_complex_call.c
 lv8/07_recursion.c
+perf/t_hot_leaf_calls.c

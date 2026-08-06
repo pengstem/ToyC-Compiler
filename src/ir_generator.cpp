@@ -666,6 +666,9 @@ bool isPureCondInst(const IRInst& inst) {
 
 void IRGenerator::inlinePass() {
   constexpr std::size_t kInlineLimit = 24;
+  // 循环中的调用会按迭代次数重复支付调用、参数搬运和被调函数帧开销。
+  // 对热调用点使用更高但仍有上限的预算；循环外仍保持保守阈值，避免无谓膨胀。
+  constexpr std::size_t kLoopInlineLimit = 96;
 
   // 多轮迭代：内联可能引入新的可内联调用（如 f(g(x))）。
   // 每轮重新收集函数区间，因为前一轮的内联替换会使旧下标失效。
@@ -700,6 +703,32 @@ void IRGenerator::inlinePass() {
     if (funcs.empty())
       break;
 
+    // 由回边构造自然循环的线性区间。while 在反转前后分别以 BRANCH/BNEZ
+    // 跳向前方 LABEL，调用点落在 [target, backedge] 内即为热调用。
+    std::unordered_map<std::string, std::size_t> labelPositions;
+    for (std::size_t i = 0; i < ir.size(); ++i) {
+      if (ir[i].op == IROp::LABEL && ir[i].dest.isLabel()) {
+        labelPositions[ir[i].dest.name] = i;
+      }
+    }
+    std::vector<std::pair<std::size_t, std::size_t>> loopRanges;
+    for (std::size_t i = 0; i < ir.size(); ++i) {
+      const auto& inst = ir[i];
+      if ((inst.op != IROp::BRANCH && inst.op != IROp::BEQZ && inst.op != IROp::BNEZ) ||
+          !inst.dest.isLabel()) {
+        continue;
+      }
+      auto target = labelPositions.find(inst.dest.name);
+      if (target != labelPositions.end() && target->second < i) {
+        loopRanges.emplace_back(target->second, i);
+      }
+    }
+    const auto isLoopCall = [&](std::size_t index) {
+      return std::any_of(loopRanges.begin(), loopRanges.end(), [&](const auto& range) {
+        return index >= range.first && index <= range.second;
+      });
+    };
+
     // 调用图可达性：reach[f] = f 经定义函数（传递）调用的函数集合
     std::unordered_map<std::string, std::unordered_set<std::string>> reach;
     for (const auto& [fname, finfo] : funcs) {
@@ -723,7 +752,11 @@ void IRGenerator::inlinePass() {
     std::unordered_map<std::string, std::unordered_set<std::string>> writtenParams;
     for (const auto& [fname, finfo] : funcs) {
       for (std::size_t k = finfo.begin + 1; k < finfo.end; ++k) {
-        if (ir[k].dest.isLocalVar()) {
+        // 参数声明建立初始绑定，不是函数体对参数的写入。把它误计为写入会让
+        // 每个内联参数都先物化到新临时，热循环中平白增加一次 mv。
+        const bool isParameterDecl = ir[k].op == IROp::LOCAL_VAR_DECL && ir[k].src1.isParam();
+        const bool destIsUse = ir[k].op == IROp::RETURN || ir[k].op == IROp::PARAM;
+        if (!isParameterDecl && !destIsUse && ir[k].dest.isLocalVar()) {
           writtenParams[fname].insert(ir[k].dest.name);
         }
       }
@@ -771,7 +804,8 @@ void IRGenerator::inlinePass() {
       // 递归（含相互递归）不内联；经 callee 可达 caller（会产生调用环）不内联
       if (reach[callee].count(callee) || reach[callee].count(curFunc))
         continue;
-      if (bodySize(f) > kInlineLimit)
+      const std::size_t inlineLimit = isLoopCall(ci) ? kLoopInlineLimit : kInlineLimit;
+      if (bodySize(f) > inlineLimit)
         continue;
 
       // 收集紧邻 CALL 之前的 PARAM 指令（应连续，索引 0..n-1）
@@ -1241,15 +1275,14 @@ void IRGenerator::optimizePass() {
       for (std::size_t k = 0; k < blocks.size(); ++k) {
         State st = in[k];
         std::unordered_map<std::string, std::string> copyMap;
-        const auto resolveOperand = [&](Operand& op, bool compareSrc2) {
+        const auto resolveOperand = [&](Operand& op) {
           if (op.isLocalVar()) {
             auto it = st.find(op.name);
             if (it != st.end() && it->second.isConst) {
-              // 循环常量提升变量（k 前缀）作为比较指令 src2 时保留变量：
-              // 代码生成阶段将其预加载到寄存器，循环内比较收敛为单条 blt/bge；
-              // 若替换为立即数则退化为 li+slt/slti 两条指令，且大立即数无法
-              // 编码进 slti，每轮循环都要重新加载。
-              const bool keepK = compareSrc2 && !op.name.empty() && op.name[0] == 'k';
+              // k 前缀是有意物化到寄存器的循环常量。保留其所有使用，既让
+              // 比较收敛为 blt/bge，也允许 `x = k - x` 复用同一寄存器；若
+              // 重新传播成立即数，热循环会退化为每轮 li/slti。
+              const bool keepK = !op.name.empty() && op.name[0] == 'k';
               if (!keepK) {
                 op = Operand::imm(it->second.val);
                 changed = true;
@@ -1285,18 +1318,14 @@ void IRGenerator::optimizePass() {
             }
           }
         };
-        const auto isCompareOp = [](IROp op) {
-          return op == IROp::LT || op == IROp::GT || op == IROp::LE || op == IROp::GE ||
-                 op == IROp::EQ || op == IROp::NE;
-        };
         for (std::size_t idx = blocks[k].first; idx <= blocks[k].second; ++idx) {
           IRInst& inst = ir[idx];
           if (inst.op != IROp::BEQZ && inst.op != IROp::BNEZ) {
-            resolveOperand(inst.src1, false);
-            resolveOperand(inst.src2, isCompareOp(inst.op));
+            resolveOperand(inst.src1);
+            resolveOperand(inst.src2);
           }
           if (inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
-            resolveOperand(inst.dest, false);
+            resolveOperand(inst.dest);
           }
           invalidateCopies(inst.dest.name);
           if (inst.op == IROp::CALL) {
@@ -1640,7 +1669,7 @@ void IRGenerator::optimizePass() {
     // 在无控制流的直线代码段内，若 (op, src1, src2) 已计算过且操作数未在块内被重新定义，
     // 则复用之前的结果。用户变量可被重新赋值，须跟踪重定义并使相关条目失效。
     {
-      std::unordered_map<std::string, std::string> rename; // 原名 → 复用名（仅临时变量）
+      std::unordered_map<std::string, std::string> rename;   // 原名 → 复用名（仅临时变量）
       std::unordered_map<std::string, std::string> valueMap; // (op,src1,src2) → 结果变量
       std::unordered_map<std::string, std::vector<std::string>> varKeys; // 变量 → 引用它的 key
       std::vector<IRInst> optimized;
@@ -1766,22 +1795,62 @@ void IRGenerator::optimizePass() {
               }
               // 要求循环尾跳转紧邻 LABEL e（标准 while 结构）
               if (foundEnd && lastBranchC != 0 && lastBranchC + 1 == k) {
-                // 常量提升：若条件块最后一条指令是 src2 为立即数的比较，
-                // 将该立即数提升到循环外的临时变量，使比较变成寄存器比较，
-                // 便于代码生成阶段将 slt+bnez 合并为单条条件分支 blt/bge
-                if (j > i + 1) {
-                  IRInst& lastCond = ir[j - 1];
-                  const bool isCmpOp = lastCond.op == IROp::LT || lastCond.op == IROp::LE ||
-                                       lastCond.op == IROp::GT || lastCond.op == IROp::GE ||
-                                       lastCond.op == IROp::EQ || lastCond.op == IROp::NE;
-                  if (isCmpOp && lastCond.src2.isImm()) {
-                    // 使用 'k' 前缀标记循环常量提升变量，代码生成阶段优先分配寄存器
-                    const std::string constVar = "k" + std::to_string(tempCounter++);
-                    optimized.push_back(IRInst(IROp::ASSIGN, Operand::localVar(constVar),
-                                               Operand::imm(lastCond.src2.immVal),
-                                               Operand::none()));
-                    lastCond.src2 = Operand::localVar(constVar);
+                // 将循环内关系比较的大多数立即数提升并共享到循环外寄存器。
+                // 这样 `slti + beqz` 可收敛为单条 bge/blt；0/1 的 LT/GE 已能
+                // 由窥孔变成 bgez/bgtz 等单指令分支，保留立即数可节省寄存器。
+                std::unordered_map<int, std::string> loopConstants;
+                std::vector<std::pair<int, std::string>> constantOrder;
+                std::unordered_set<int> reverseSubConstants;
+                for (std::size_t m = j + 1; m < lastBranchC; ++m) {
+                  const auto& inst = ir[m];
+                  if (inst.op == IROp::SUB && inst.src1.isImm() && inst.dest.isLocalVar() &&
+                      inst.src2.isLocalVar() && inst.dest.name == inst.src2.name) {
+                    reverseSubConstants.insert(inst.src1.immVal);
                   }
+                }
+                const auto hoistCompareConstant = [&](IRInst& compare) {
+                  const bool isRelational = compare.op == IROp::LT || compare.op == IROp::LE ||
+                                            compare.op == IROp::GT || compare.op == IROp::GE;
+                  if (!isRelational || !compare.src2.isImm()) {
+                    return;
+                  }
+                  const int value = compare.src2.immVal;
+                  const bool hasDirectZeroOneBranch =
+                      (compare.op == IROp::LT || compare.op == IROp::GE) &&
+                      (value == 0 || value == 1) && reverseSubConstants.count(value) == 0;
+                  if (hasDirectZeroOneBranch) {
+                    return;
+                  }
+                  auto found = loopConstants.find(value);
+                  if (found == loopConstants.end()) {
+                    const std::string name = "k" + std::to_string(tempCounter++);
+                    found = loopConstants.emplace(value, name).first;
+                    constantOrder.emplace_back(value, name);
+                  }
+                  compare.src2 = Operand::localVar(found->second);
+                };
+                for (std::size_t m = j + 1; m < lastBranchC; ++m) {
+                  hoistCompareConstant(ir[m]);
+                }
+                for (std::size_t m = i + 1; m < j; ++m) {
+                  hoistCompareConstant(ir[m]);
+                }
+                // 若同一常量还用于 `x = c - x`，复用已提升寄存器；后端可直接
+                // 发射 `sub x, kc, x`，不再每轮 li 常量。
+                for (std::size_t m = j + 1; m < lastBranchC; ++m) {
+                  auto& inst = ir[m];
+                  if (inst.op != IROp::SUB || !inst.src1.isImm() || !inst.dest.isLocalVar() ||
+                      !inst.src2.isLocalVar() || inst.dest.name != inst.src2.name) {
+                    continue;
+                  }
+                  auto constant = loopConstants.find(inst.src1.immVal);
+                  if (constant != loopConstants.end()) {
+                    inst.src1 = Operand::localVar(constant->second);
+                  }
+                }
+                for (const auto& entry : constantOrder) {
+                  optimized.push_back(IRInst(IROp::ASSIGN, Operand::localVar(entry.second),
+                                             Operand::imm(entry.first), Operand::none()));
                 }
                 // 变换:
                 // 1. 在 LABEL b 之前插入 BRANCH c（首次进入先测试）

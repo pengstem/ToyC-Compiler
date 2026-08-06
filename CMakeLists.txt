@@ -403,6 +403,19 @@ if(TOYCC_BUILD_TESTS)
           TIMEOUT "${TOYCC_TEST_TIMEOUT}"
         )
       endforeach()
+
+      add_test(
+        NAME toycc.perf.hot-call-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_hot_call_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_hot_leaf_calls.c"
+      )
+      set_tests_properties(toycc.perf.hot-call-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
     endif()
   endif()
 endif()

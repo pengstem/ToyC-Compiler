@@ -28,14 +28,19 @@ private:
     int frameSize = 16;
     int localBytes = 0;
     int outgoingArgumentBytes = 0;
+    bool hasCall = false;
+    bool hasStackParameters = false;
     std::unordered_map<std::string, int> localOffsets;
-    std::unordered_map<std::string, int> regAlloc;       // 局部变量 → s寄存器编号 (2-11)
-    std::unordered_map<std::string, int> globalRegAlloc; // 全局变量 → s寄存器编号 (2-11)
+    std::unordered_map<std::string, int> regAlloc; // 局部变量 → s寄存器编号 (2-11)
+    // 无调用叶函数可安全使用 caller-saved 参数寄存器，无需在序言/尾声保存。
+    std::unordered_map<std::string, std::string> leafRegAlloc;
+    std::unordered_map<std::string, int> globalRegAlloc;   // 全局变量 → s寄存器编号 (2-11)
     std::unordered_map<std::string, std::string> tempRegs; // 临时变量 → t寄存器 (t4-t6)
     std::vector<std::string> usedCalleeSavedRegisters;
     std::string functionName;
 
     int frameSizeBytes() const;
+    bool needsFrame() const;
   };
 
   // 尾调用信息：CALL 的结果仅被紧随其后的 RETURN 使用（尾位置）
