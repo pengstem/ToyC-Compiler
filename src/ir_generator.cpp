@@ -1887,26 +1887,136 @@ void IRGenerator::optimizePass() {
             const bool isLE = cond.op == IROp::LE;
             const std::string indName = (cond.src1.isLocalVar()) ? cond.src1.name : std::string();
             if ((isLT || isLE) && !indName.empty()) {
-              // ---- 解析循环体：计数变量自增（步长 1）+ 多个累加变量自增 ----
-              // 支持任意数量的累加变量（如 s1 += c1; s2 += c2; s3 -= c3;），
-              // 每个累加变量可以是自身加/减常量，或加/减循环变量（s += i，
-              // 等差数列求和）。循环体只允许出现计数变量自增和这些累加变量
-              // 自增，不允许其他指令。
+              // ---- 解析循环体：计数变量自增 + 临时变量（循环变量线性函数）+ 累加变量 ----
+              // 支持任意数量的累加变量，每个累加变量可以是自身加/减常量、加/减循环变量、
+              // 或加/减循环变量的线性函数（通过临时变量 t = i*c 间接累加）。
+              // 临时变量必须是循环变量的线性函数：t = i*c, t = i+c, t = i, t = c 等。
               struct AccVar {
                 std::string name;
                 int step;     // 每次迭代的常量增量（可正可负）
                 int indCoeff; // 循环变量系数（0=不加循环变量, +1/-1=加/减循环变量）
               };
+              // 临时变量的线性表示：value = indCoeff * i + constOffset
+              struct TempLin {
+                int indCoeff = 0;
+                int constOffset = 0;
+              };
+              std::unordered_map<std::string, TempLin> tempLinMap;
               std::vector<AccVar> accVars;
               int indStep = 0;
               bool bodyOk = true;
               bool indIncremented = false; // 循环变量是否已自增
               for (std::size_t k = li + 2; k < condIdx; ++k) {
                 int step = 0;
+                // 计数变量自增
                 if (isSelfInc(ir[k], indName, step)) {
                   indStep += step;
                   indIncremented = true;
                   continue;
+                }
+                // 临时变量定义：t = i * #c 或 t = #c * i（循环变量乘常量）
+                if (ir[k].op == IROp::MUL && ir[k].dest.isLocalVar() && !indIncremented) {
+                  const auto& d = ir[k].dest;
+                  const auto& s1 = ir[k].src1;
+                  const auto& s2 = ir[k].src2;
+                  bool isTempDef = true;
+                  // t 不能是归纳变量或已识别的累加变量
+                  if (d.name == indName)
+                    isTempDef = false;
+                  for (const auto& acc : accVars) {
+                    if (acc.name == d.name)
+                      isTempDef = false;
+                  }
+                  if (isTempDef) {
+                    TempLin tl;
+                    if (s1.isLocalVar() && s1.name == indName && s2.isImm()) {
+                      tl.indCoeff = s2.immVal;
+                      tempLinMap[d.name] = tl;
+                      continue;
+                    }
+                    if (s2.isLocalVar() && s2.name == indName && s1.isImm()) {
+                      tl.indCoeff = s1.immVal;
+                      tempLinMap[d.name] = tl;
+                      continue;
+                    }
+                  }
+                }
+                // 临时变量定义：t = i + #c, t = #c + i, t = i - #c, t = i
+                if ((ir[k].op == IROp::ADD || ir[k].op == IROp::SUB) && ir[k].dest.isLocalVar() &&
+                    !indIncremented) {
+                  const auto& d = ir[k].dest;
+                  const auto& s1 = ir[k].src1;
+                  const auto& s2 = ir[k].src2;
+                  bool isTempDef = true;
+                  if (d.name == indName)
+                    isTempDef = false;
+                  if (s1.isLocalVar() && s1.name == d.name)
+                    isTempDef = false; // 自赋值，不是临时定义
+                  for (const auto& acc : accVars) {
+                    if (acc.name == d.name)
+                      isTempDef = false;
+                  }
+                  if (isTempDef) {
+                    TempLin tl;
+                    // t = i + #c
+                    if (s1.isLocalVar() && s1.name == indName && s2.isImm() &&
+                        ir[k].op == IROp::ADD) {
+                      tl.indCoeff = 1;
+                      tl.constOffset = s2.immVal;
+                      tempLinMap[d.name] = tl;
+                      continue;
+                    }
+                    // t = #c + i
+                    if (s2.isLocalVar() && s2.name == indName && s1.isImm() &&
+                        ir[k].op == IROp::ADD) {
+                      tl.indCoeff = 1;
+                      tl.constOffset = s1.immVal;
+                      tempLinMap[d.name] = tl;
+                      continue;
+                    }
+                    // t = i - #c
+                    if (s1.isLocalVar() && s1.name == indName && s2.isImm() &&
+                        ir[k].op == IROp::SUB) {
+                      tl.indCoeff = 1;
+                      tl.constOffset = -s2.immVal;
+                      tempLinMap[d.name] = tl;
+                      continue;
+                    }
+                    // t = i （ASSIGN t, i）
+                    if (ir[k].op == IROp::ADD && s1.isLocalVar() && s1.name == indName &&
+                        s2.isImm() && s2.immVal == 0) {
+                      tl.indCoeff = 1;
+                      tempLinMap[d.name] = tl;
+                      continue;
+                    }
+                    // t = #c （ASSIGN t, #c 被合并为 ADD t, #c, #0? 实际是 ASSIGN）
+                    // ASSIGN 不会到这里，跳过
+                  }
+                }
+                // ASSIGN 临时变量 = 立即数
+                if (ir[k].op == IROp::ASSIGN && ir[k].dest.isLocalVar() && !indIncremented) {
+                  const auto& d = ir[k].dest;
+                  const auto& s1 = ir[k].src1;
+                  bool isTempDef = true;
+                  if (d.name == indName)
+                    isTempDef = false;
+                  for (const auto& acc : accVars) {
+                    if (acc.name == d.name)
+                      isTempDef = false;
+                  }
+                  if (isTempDef && s1.isImm()) {
+                    TempLin tl;
+                    tl.constOffset = s1.immVal;
+                    tempLinMap[d.name] = tl;
+                    continue;
+                  }
+                  // ASSIGN t, i
+                  if (isTempDef && s1.isLocalVar() && s1.name == indName) {
+                    TempLin tl;
+                    tl.indCoeff = 1;
+                    tempLinMap[d.name] = tl;
+                    continue;
+                  }
                 }
                 // 检查是否为已识别累加变量的再次常量自增
                 bool matched = false;
@@ -1921,7 +2031,6 @@ void IRGenerator::optimizePass() {
                   continue;
                 }
                 // 检查是否为已识别累加变量加/减循环变量（s += i 或 s -= i）
-                // 仅支持 i 自增之前的位置，此时 i 的值为当前迭代值
                 for (auto& acc : accVars) {
                   if ((ir[k].op == IROp::ADD || ir[k].op == IROp::SUB) && ir[k].dest.isLocalVar() &&
                       ir[k].dest.name == acc.name && ir[k].src1.isLocalVar() &&
@@ -1934,6 +2043,24 @@ void IRGenerator::optimizePass() {
                       bodyOk = false;
                     }
                     break;
+                  }
+                }
+                if (matched) {
+                  continue;
+                }
+                // 检查是否为累加变量加/减临时变量（s += t，t 是循环变量线性函数）
+                for (auto& acc : accVars) {
+                  if ((ir[k].op == IROp::ADD || ir[k].op == IROp::SUB) && ir[k].dest.isLocalVar() &&
+                      ir[k].dest.name == acc.name && ir[k].src1.isLocalVar() &&
+                      ir[k].src1.name == acc.name && ir[k].src2.isLocalVar()) {
+                    auto tit = tempLinMap.find(ir[k].src2.name);
+                    if (tit != tempLinMap.end() && !indIncremented) {
+                      int sign = (ir[k].op == IROp::ADD) ? 1 : -1;
+                      acc.indCoeff += sign * tit->second.indCoeff;
+                      acc.step += sign * tit->second.constOffset;
+                      matched = true;
+                      break;
+                    }
                   }
                 }
                 if (matched) {
@@ -1965,6 +2092,21 @@ void IRGenerator::optimizePass() {
                   }
                   bodyOk = false;
                   break;
+                }
+                // 新增累加变量：ADD/SUB dest, dest, temp 形式（s += t，t 是临时变量）
+                if ((ir[k].op == IROp::ADD || ir[k].op == IROp::SUB) && ir[k].dest.isLocalVar() &&
+                    ir[k].src1.isLocalVar() && ir[k].src1.name == ir[k].dest.name &&
+                    ir[k].src2.isLocalVar() && ir[k].dest.name != indName) {
+                  auto tit = tempLinMap.find(ir[k].src2.name);
+                  if (tit != tempLinMap.end() && !indIncremented) {
+                    AccVar acc;
+                    acc.name = ir[k].dest.name;
+                    int sign = (ir[k].op == IROp::ADD) ? 1 : -1;
+                    acc.indCoeff = sign * tit->second.indCoeff;
+                    acc.step = sign * tit->second.constOffset;
+                    accVars.push_back(acc);
+                    continue;
+                  }
                 }
                 bodyOk = false;
                 break;
@@ -2061,14 +2203,15 @@ void IRGenerator::optimizePass() {
     }
   } // 结束迭代优化循环
 
-  // Pass 7: 循环展开（4 倍）—— 在迭代优化收敛后执行一次
+  // Pass 7: 循环展开（2 倍）—— 在迭代优化收敛后执行一次
   // 对未被 Pass 6 消除的反转循环，若循环体为直线代码（无内部分支），
-  // 展开循环体 4 倍以减少分支开销。仅展开满足以下条件的循环：
+  // 展开循环体 2 倍以减少分支开销。仅展开满足以下条件的循环：
   //   1. 反转循环结构：BRANCH Lc; LABEL Lb; <body>; LABEL Lc; <cond>; BNEZ Lb
   //   2. 循环体为直线代码（无 LABEL/BRANCH/BEQZ/BNEZ/CALL/RETURN）
   //   3. 条件为 LT/LE，计数变量自增步长为常量
-  //   4. 循环体不超过 16 条指令（避免代码膨胀）
-  // 展开策略：复制循环体 4 次，每次之间插入中间条件检查，减少 75% 分支。
+  //   4. 循环体不超过 24 条指令（避免代码膨胀）
+  // 展开策略：复制循环体，第一次执行后检查中间条件，若满足继续第二次，
+  // 否则跳出。第二次执行后走原有的循环尾条件。
   {
     std::vector<IRInst> optimized;
     std::size_t i = 0;
@@ -2101,7 +2244,7 @@ void IRGenerator::optimizePass() {
             // 循环体 [i+2, condIdx) 必须是直线代码
             bool straightLine = true;
             std::size_t bodyLen = condIdx - (i + 2);
-            if (bodyLen == 0 || bodyLen > 16) {
+            if (bodyLen == 0 || bodyLen > 24) {
               straightLine = false;
             }
             // 检查循环体无分支/调用，并识别计数变量自增
@@ -2123,21 +2266,17 @@ void IRGenerator::optimizePass() {
               }
             }
             if (straightLine && indIncIdx < ir.size() && indIncStep != 0) {
-              // 展开 4 倍：
+              // 展开 2 倍：
               // 原始: BRANCH Lc; LABEL Lb; <body>; LABEL Lc; <cond>; BNEZ Lb
               // 展开: BRANCH Lc; LABEL Lb;
-              //       <body_1>;                    // 第 1 次
-              //       <cond_mid>; BNEZ L_mid1;    // 条件检查（满足则继续）
-              //       BRANCH L_exit;              // 不满足则跳出
-              //       LABEL L_mid1; <body_2>;     // 第 2 次
-              //       <cond_mid>; BNEZ L_mid2;
-              //       BRANCH L_exit; LABEL L_mid2;
-              //       <body_3>;                    // 第 3 次
-              //       <cond_mid>; BNEZ L_mid3;
-              //       BRANCH L_exit; LABEL L_mid3;
-              //       <body_4>;                    // 第 4 次
-              //       LABEL Lc; <cond>; BNEZ Lb;  // 原循环尾条件
+              //       <body_copy1>;              // 第一次执行
+              //       <cond_mid>; BNEZ L_mid;    // 中间条件检查（满足则继续）
+              //       BRANCH L_exit;             // 不满足则跳出
+              //       LABEL L_mid;
+              //       <body_copy2>;              // 第二次执行
+              //       LABEL Lc; <cond>; BNEZ Lb; // 原循环尾条件
               //       LABEL L_exit;
+              const std::string midLabel = "L_unroll_mid_" + std::to_string(i);
               const std::string exitLabel = "L_unroll_exit_" + std::to_string(i);
 
               // BRANCH Lc（首跳）
@@ -2145,30 +2284,26 @@ void IRGenerator::optimizePass() {
               // LABEL Lb
               optimized.push_back(ir[i + 1]);
 
-              // 3 次中间展开（body + mid cond + BNEZ + BRANCH exit + LABEL mid）
-              for (int copy = 0; copy < 3; ++copy) {
-                // body_copy
-                for (std::size_t k = i + 2; k < condIdx; ++k) {
-                  optimized.push_back(ir[k]);
-                }
-                // 中间条件检查：复制条件块
-                for (std::size_t k = condIdx + 1; k < bnezIdx; ++k) {
-                  optimized.push_back(ir[k]);
-                }
-                const std::string midLabel =
-                    "L_unroll_mid_" + std::to_string(i) + "_" + std::to_string(copy);
-                // BNEZ midLabel（条件满足，继续下一次）
-                optimized.push_back(IRInst(IROp::BNEZ, Operand::label(midLabel), ir[bnezIdx].src1,
-                                           Operand::none()));
-                // BRANCH exitLabel（条件不满足，跳出循环）
-                optimized.push_back(IRInst(IROp::BRANCH, Operand::label(exitLabel), Operand::none(),
-                                           Operand::none()));
-                // LABEL midLabel
-                optimized.push_back(IRInst(IROp::LABEL, Operand::label(midLabel), Operand::none(),
-                                           Operand::none()));
+              // body_copy1：复制循环体，保持原样
+              for (std::size_t k = i + 2; k < condIdx; ++k) {
+                optimized.push_back(ir[k]);
               }
 
-              // body_copy4：第 4 次执行
+              // 中间条件检查：复制条件块，BNEZ 改为跳到 midLabel
+              for (std::size_t k = condIdx + 1; k < bnezIdx; ++k) {
+                optimized.push_back(ir[k]);
+              }
+              // BNEZ midLabel（条件满足，继续第二次执行）
+              optimized.push_back(
+                  IRInst(IROp::BNEZ, Operand::label(midLabel), ir[bnezIdx].src1, Operand::none()));
+              // BRANCH exitLabel（条件不满足，跳出循环）
+              optimized.push_back(IRInst(IROp::BRANCH, Operand::label(exitLabel), Operand::none(),
+                                         Operand::none()));
+              // LABEL midLabel
+              optimized.push_back(
+                  IRInst(IROp::LABEL, Operand::label(midLabel), Operand::none(), Operand::none()));
+
+              // body_copy2：再次复制循环体
               for (std::size_t k = i + 2; k < condIdx; ++k) {
                 optimized.push_back(ir[k]);
               }
