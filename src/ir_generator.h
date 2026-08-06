@@ -91,6 +91,9 @@ private:
 
   // IR 优化 pass
   void optimizePass();
+
+  // 函数内联 pass（在 optimizePass 之前运行）
+  void inlinePass();
 };
 
 } // namespace toycc
