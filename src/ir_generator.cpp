@@ -1,7 +1,9 @@
 #include "ir_generator.h"
 
 #include <cassert>
+#include <cctype>
 #include <iostream>
+#include <unordered_set>
 
 namespace toycc {
 
@@ -281,7 +283,12 @@ Operand IRGenerator::genExpr(Expr* expr) {
           lhs = Operand::localVar(irName);
         }
       }
-      emit(IROp::ASSIGN, lhs, rhs);
+      // 自赋值（如 `t = t;`）是纯复制无操作，跳过发射避免产生
+      // `ASSIGN x, x` 与后续 pass 交互产生悬垂引用（fuzz FAIL_80）
+      const bool selfAssign = lhs.isLocalVar() && rhs.isLocalVar() && lhs.name == rhs.name;
+      if (!selfAssign) {
+        emit(IROp::ASSIGN, lhs, rhs);
+      }
       return lhs;
     }
 
@@ -721,7 +728,7 @@ void IRGenerator::optimizePass() {
         if (inst.op == IROp::ASSIGN && inst.dest.isLocalVar()) {
           if (inst.src1.isImm()) {
             constMap[inst.dest.name] = inst.src1.immVal;
-          } else if (inst.src1.isLocalVar()) {
+          } else if (inst.src1.isLocalVar() && inst.src1.name != inst.dest.name) {
             copyMap[inst.dest.name] = inst.src1.name;
           }
         }
@@ -870,6 +877,10 @@ void IRGenerator::optimizePass() {
     // 同时把后续对 t 的引用替换为 x（仅限 x 未被重新赋值之前），
     // 消除 sum = sum op expr 时多余的临时寄存器往返
     {
+      // tmp 全 IR 使用次数：若 tmp 在替换窗口之外仍有使用（如复制传播
+      // 产生的跨长距离引用），合并会删掉 tmp 的定义留下悬垂引用，必须跳过
+      std::unordered_map<std::string, int> mergeUseCount;
+      countUses(ir, mergeUseCount);
       std::vector<IRInst> optimized;
       std::size_t i = 0;
       while (i < ir.size()) {
@@ -890,6 +901,17 @@ void IRGenerator::optimizePass() {
                 inst.op == IROp::BNEZ || inst.op == IROp::CALL) {
               break;
             }
+            // 记录 tmp 引用（必须先于重定义检查：`ASSIGN target, tmp` 这类指令
+            // 同时使用 tmp 并重新定义 target，若先 break 会漏替换，导致悬垂引用；
+            // 例如 `t = expr; t = t;` 经复制传播后变成 `ASSIGN t, tmp`，
+            // 其 tmp 定义随后被本次合并消除）
+            const bool usesTmp = (inst.src1.isLocalVar() && inst.src1.name == tmp) ||
+                                 (inst.src2.isLocalVar() && inst.src2.name == tmp) ||
+                                 ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) &&
+                                  inst.dest.isLocalVar() && inst.dest.name == tmp);
+            if (usesTmp) {
+              refsToReplace.push_back(j);
+            }
             // target 被重新赋值：之后的 tmp 引用不能再替换
             // （RETURN/PARAM 的 dest 是读取而非赋值，须排除）
             if (inst.op != IROp::RETURN && inst.op != IROp::PARAM) {
@@ -904,16 +926,10 @@ void IRGenerator::optimizePass() {
                 break;
               }
             }
-            // 记录 tmp 引用
-            const bool usesTmp = (inst.src1.isLocalVar() && inst.src1.name == tmp) ||
-                                 (inst.src2.isLocalVar() && inst.src2.name == tmp) ||
-                                 ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) &&
-                                  inst.dest.isLocalVar() && inst.dest.name == tmp);
-            if (usesTmp) {
-              refsToReplace.push_back(j);
-            }
           }
-          if (ok) {
+          // 仅当 tmp 的所有使用都位于可替换窗口内（含 ASSIGN 对自身的一处使用）
+          // 才可合并；窗口外仍引用 tmp 则合并会产生悬垂引用
+          if (ok && mergeUseCount[tmp] == refsToReplace.size() + 1) {
             IRInst merged = ir[i];
             merged.dest = ir[i + 1].dest;
             optimized.push_back(merged);
@@ -1166,9 +1182,15 @@ void IRGenerator::optimizePass() {
             std::unordered_map<std::string, bool> definedInLoop;
             // 循环内被写入的全局变量：读取它们的表达式不能视为循环不变
             std::unordered_map<std::string, bool> storedGlobals;
+            // 循环内每个局部变量被定义的次数：外提指令的目标在循环内只能定义
+            // 一次（即本次）。链式表达式（如 %t15 = c; %t15 = %t15 % 15; ...）复用
+            // 同一临时名，若把链首的常量赋值外提，循环体后续再定义 %t15 会覆盖
+            // 外提值，第二次迭代起读到陈旧结果，破坏语义。
+            std::unordered_map<std::string, int> defCount;
             for (std::size_t k = i + 2; k < bnezIdx; ++k) {
               if (ir[k].dest.isLocalVar()) {
                 definedInLoop[ir[k].dest.name] = true;
+                ++defCount[ir[k].dest.name];
               } else if (ir[k].dest.isGlobalVar()) {
                 storedGlobals[ir[k].dest.name] = true;
               }
@@ -1201,7 +1223,8 @@ void IRGenerator::optimizePass() {
                   inst.op == IROp::NE ||
                   (inst.op == IROp::ASSIGN && inst.dest.isLocalVar() && isTempName(inst.dest.name));
               if (pure && inst.dest.isLocalVar() && isTempName(inst.dest.name) &&
-                  operandInvariant(inst.src1) && operandInvariant(inst.src2)) {
+                  defCount[inst.dest.name] == 1 && operandInvariant(inst.src1) &&
+                  operandInvariant(inst.src2)) {
                 hoisted.push_back(inst);
                 licmChanged = true;
               } else {
@@ -1229,6 +1252,136 @@ void IRGenerator::optimizePass() {
       if (licmChanged) {
         ir = std::move(optimized);
         changed = true;
+      }
+    }
+  }
+
+  // Pass 5: 单次使用临时变量复用（single-use temp recycling）。
+  // 必须在 pass 0-4 全部收敛后运行一次：长表达式链的每个中间结果都是单次使用
+  // 的临时变量，变量总数 O(链长)，超出寄存器池后全部落栈，每轮循环栈读写往返。
+  // 该 Pass 在线性扫描中维护"已消费可复用"的名字池，让这些临时复用一个名字，
+  // 使循环体变量总数降到寄存器池以内，彻底消除栈往返。注意该 Pass 不能参与
+  // 上面的迭代循环：改名后若让 pass 0-4 重新分析，会把条件块内指令误判为
+  // 循环不变量外提（LICM），破坏语义。
+  {
+    std::unordered_map<std::string, int> useCount;
+    for (const auto& inst : ir) {
+      if (inst.src1.isLocalVar()) {
+        ++useCount[inst.src1.name];
+      }
+      if (inst.src2.isLocalVar()) {
+        ++useCount[inst.src2.name];
+      }
+      if ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) && inst.dest.isLocalVar()) {
+        ++useCount[inst.dest.name];
+      }
+    }
+
+    // 仅复用编译器生成的临时（newTemp 命名：t 后跟纯数字），用户变量与循环提升
+    // 变量（k 前缀）保持原名。
+    const auto isCompilerTemp = [](const std::string& name) {
+      if (name.empty() || name[0] != 't') {
+        return false;
+      }
+      for (std::size_t k = 1; k < name.size(); ++k) {
+        if (!std::isdigit(static_cast<unsigned char>(name[k]))) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    std::unordered_map<std::string, std::string> renameMap; // old -> new
+    std::unordered_map<std::string, int> activeCount;       // new 名字的活跃引用数
+    std::vector<std::string> freePool;                      // activeCount==0 的可复用名字
+    // 当前基本块内被定义的名字。只有块内定义的名字才能进入 freePool 复用：
+    // 循环不变提升（LICM 外提）的临时定义在循环前的基本块，却在循环体内被消费；
+    // 若将其名字复用给循环体内新临时，会在循环内重新定义该名字，覆盖外提值，
+    // 第二次迭代起读到陈旧结果（fuzz FAIL_17 根因）。基本块以 LABEL 为界，
+    // 跨块复用无法保证跨回边安全，故在 LABEL 处清空 freePool 与 blockDefined。
+    std::unordered_set<std::string> blockDefined;
+
+    const auto resolveOperand = [&](Operand& op) {
+      if (!op.isLocalVar()) {
+        return;
+      }
+      auto it = renameMap.find(op.name);
+      if (it != renameMap.end()) {
+        op = Operand::localVar(it->second);
+      }
+    };
+
+    for (auto& inst : ir) {
+      // 基本块边界：前块释放的名字不可复用（可能被回边重新进入，且可能是
+      // 从循环前提升进块的 live-in 值）
+      if (inst.op == IROp::LABEL) {
+        freePool.clear();
+        blockDefined.clear();
+      }
+      // 记录本指令消费的旧名字（resolve 前快照，release 在 resolve 之后用）
+      const std::string oldSrc1 = inst.src1.isLocalVar() ? inst.src1.name : std::string();
+      const std::string oldSrc2 = inst.src2.isLocalVar() ? inst.src2.name : std::string();
+      const std::string oldDest =
+          ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) && inst.dest.isLocalVar())
+              ? inst.dest.name
+              : std::string();
+
+      // 先改名（renameMap 只读，不擦除），再释放被消费的单次使用临时
+      resolveOperand(inst.src1);
+      resolveOperand(inst.src2);
+      if (inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
+        resolveOperand(inst.dest);
+      }
+
+      const auto releaseIfSingleUse = [&](const std::string& oldName) {
+        if (oldName.empty()) {
+          return;
+        }
+        auto cit = useCount.find(oldName);
+        if (cit == useCount.end() || cit->second != 1) {
+          return;
+        }
+        auto rit = renameMap.find(oldName);
+        if (rit != renameMap.end()) {
+          const std::string newName = rit->second;
+          renameMap.erase(rit);
+          // 只有块内定义的名字才可回收：跨块（如循环前提升）的名字即使线性扫描
+          // 中已无引用，跨迭代仍可能被回边重新读取，复用其名字会破坏语义
+          if (--activeCount[newName] == 0 && blockDefined.count(newName) > 0) {
+            freePool.push_back(newName);
+          }
+        }
+      };
+      releaseIfSingleUse(oldSrc1);
+      releaseIfSingleUse(oldSrc2);
+      releaseIfSingleUse(oldDest);
+
+      // 为新定义的临时分配名字：优先复用池中已释放且不活跃的名字
+      // 允许 dest 与 src 同名：RISC-V 指令原子读操作数再写 dest（read-before-write），
+      // 且池中名字都来自已消费的临时（值已无引用），覆盖安全。
+      // 注意：短路求值的 result 临时会被写两次（true/false 两路径），第二次定义
+      // 必须沿用第一次的映射，否则 false 路径会写回未定义的名字。
+      if (inst.dest.isLocalVar() && isCompilerTemp(inst.dest.name)) {
+        auto existing = renameMap.find(inst.dest.name);
+        if (existing != renameMap.end()) {
+          if (inst.dest.name != existing->second) {
+            inst.dest = Operand::localVar(existing->second);
+          }
+        } else {
+          std::string newName;
+          if (!freePool.empty()) {
+            newName = freePool.back();
+            freePool.pop_back();
+          } else {
+            newName = inst.dest.name;
+          }
+          renameMap[inst.dest.name] = newName;
+          ++activeCount[newName];
+          blockDefined.insert(newName);
+          if (newName != inst.dest.name) {
+            inst.dest = Operand::localVar(newName);
+          }
+        }
       }
     }
   }

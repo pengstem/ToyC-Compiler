@@ -686,6 +686,21 @@ void CodeGenerator::applyPeephole(const std::string& asmText, std::ostream& out)
     const auto& op = tok.opcode;
     const auto& args = tok.args;
 
+    // 模式0: 通用空操作消除
+    //   mv rd, rd / addi rd, rd, 0 / sub rd, rd, 0 / xori rd, rd, 0
+    if (op == "mv" && args.size() >= 2 && args[0] == args[1]) {
+      continue;
+    }
+    if (op == "sub" && args.size() == 3 && args[0] == args[1] && args[2] == "0") {
+      continue;
+    }
+    if (args.size() == 3 && args[0] == args[1] && op == "addi" && args[2] == "0") {
+      continue;
+    }
+    if (args.size() == 3 && args[0] == args[1] && op == "xori" && args[2] == "0") {
+      continue;
+    }
+
     // 模式1: slt rd, rs1, rs2  +  beqz rd, L  ->  bge rs1, rs2, L
     // 模式2: slt rd, rs1, rs2  +  bnez rd, L  ->  blt rs1, rs2, L
     if (op == "slt" && args.size() == 3 && i + 1 < n) {
@@ -773,11 +788,17 @@ void CodeGenerator::applyPeephole(const std::string& asmText, std::ostream& out)
         if (t1.opcode == "sub" && t1.args.size() == 3 && t1.args[2] == "t1" &&
             ((t2.opcode == "seqz" && t3.opcode == "beqz") ||
              (t2.opcode == "snez" && t3.opcode == "bnez"))) {
-          const bool jumpWhenNe = (t2.opcode == "seqz"); // seqz+beqz 与 snez+bnez 都是跳转当不等
+          // seqz+beqz 与 snez+bnez 都是跳转当不等（rs != imm）-> addi + bnez
           if (t2.args.size() == 2 && t2.args[0] == t1.args[0] && t2.args[1] == t1.args[0] &&
               t3.args.size() == 2 && t3.args[0] == t1.args[0]) {
-            emit(out, "addi", t1.args[0] + ", " + t1.args[1] + ", " + std::to_string(-immVal));
-            emit(out, (jumpWhenNe ? "bnez" : "beqz"), t1.args[0] + ", " + t3.args[1]);
+            if (-immVal != 0) {
+              emit(out, "addi", t1.args[0] + ", " + t1.args[1] + ", " + std::to_string(-immVal));
+              emit(out, "bnez", t1.args[0] + ", " + t3.args[1]);
+            } else {
+              // imm==0：addi rd, rs, 0 会把 rd 从布尔值重算为 rs，不能省略；
+              // 直接对源寄存器分支（rs != 0）
+              emit(out, "bnez", t1.args[1] + ", " + t3.args[1]);
+            }
             i += 3;
             continue;
           }
@@ -788,8 +809,13 @@ void CodeGenerator::applyPeephole(const std::string& asmText, std::ostream& out)
           // seqz+bnez 与 snez+beqz 都是跳转当相等 -> addi + beqz
           if (t2.args.size() == 2 && t2.args[0] == t1.args[0] && t2.args[1] == t1.args[0] &&
               t3.args.size() == 2 && t3.args[0] == t1.args[0]) {
-            emit(out, "addi", t1.args[0] + ", " + t1.args[1] + ", " + std::to_string(-immVal));
-            emit(out, "beqz", t1.args[0] + ", " + t3.args[1]);
+            if (-immVal != 0) {
+              emit(out, "addi", t1.args[0] + ", " + t1.args[1] + ", " + std::to_string(-immVal));
+              emit(out, "beqz", t1.args[0] + ", " + t3.args[1]);
+            } else {
+              // imm==0：直接对源寄存器分支（rs == 0）
+              emit(out, "beqz", t1.args[1] + ", " + t3.args[1]);
+            }
             i += 3;
             continue;
           }
