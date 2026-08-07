@@ -2644,6 +2644,179 @@ void IRGenerator::optimizePass() {
     }
   }
 
+  // Pass 4.25: 把循环体开头的单调 break guard 收紧为循环上界。
+  //
+  //   while (i < U) { if (i >= B) break; body; i = i + 1; }
+  //
+  // 在 U/B 均为当前路径上的常量、非 break 路径无其它控制流且归纳变量严格
+  // +1 时，等价于 `while (i < min(U, B))`。规范化后，后续仿射/矩阵摘要无需
+  // 分别理解 break CFG。动态阈值、额外入口、非单位步进与后置 guard 均回退。
+  {
+    bool normalizedBreak = true;
+    while (normalizedBreak) {
+      normalizedBreak = false;
+      std::unordered_map<std::string, std::size_t> labelPositions;
+      std::unordered_map<std::string, int> labelReferences;
+      for (std::size_t position = 0; position < ir.size(); ++position) {
+        const IRInst& inst = ir[position];
+        if (inst.op == IROp::LABEL && inst.dest.isLabel()) {
+          labelPositions[inst.dest.name] = position;
+        }
+        if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+            inst.dest.isLabel()) {
+          ++labelReferences[inst.dest.name];
+        }
+      }
+
+      for (std::size_t loopStart = 0; loopStart + 1 < ir.size() && !normalizedBreak; ++loopStart) {
+        if (ir[loopStart].op != IROp::BRANCH || !ir[loopStart].dest.isLabel() ||
+            ir[loopStart + 1].op != IROp::LABEL || !ir[loopStart + 1].dest.isLabel()) {
+          continue;
+        }
+        const std::string condLabel = ir[loopStart].dest.name;
+        const std::string bodyLabel = ir[loopStart + 1].dest.name;
+        if (labelReferences[condLabel] != 1 || labelReferences[bodyLabel] != 1) {
+          continue;
+        }
+        const auto condFound = labelPositions.find(condLabel);
+        if (condFound == labelPositions.end() || condFound->second <= loopStart + 5) {
+          continue;
+        }
+        const std::size_t condIndex = condFound->second;
+        if (condIndex + 3 >= ir.size() || ir[condIndex + 1].op != IROp::LT ||
+            !ir[condIndex + 1].dest.isLocalVar() || !ir[condIndex + 1].src1.isLocalVar() ||
+            ir[condIndex + 2].op != IROp::BNEZ || !ir[condIndex + 2].dest.isLabel() ||
+            ir[condIndex + 2].dest.name != bodyLabel || !ir[condIndex + 2].src1.isLocalVar() ||
+            ir[condIndex + 2].src1.name != ir[condIndex + 1].dest.name ||
+            ir[condIndex + 3].op != IROp::LABEL || !ir[condIndex + 3].dest.isLabel()) {
+          continue;
+        }
+        const std::string induction = ir[condIndex + 1].src1.name;
+        const std::string exitLabel = ir[condIndex + 3].dest.name;
+        if (labelReferences[exitLabel] != 1) {
+          continue;
+        }
+
+        const std::size_t guardIndex = loopStart + 2;
+        const IRInst& guard = ir[guardIndex];
+        const IRInst& skipBranch = ir[guardIndex + 1];
+        const IRInst& breakBranch = ir[guardIndex + 2];
+        const IRInst& skipLabel = ir[guardIndex + 3];
+        if ((guard.op != IROp::LT && guard.op != IROp::LE && guard.op != IROp::GT &&
+             guard.op != IROp::GE) ||
+            !guard.dest.isLocalVar() || skipBranch.op != IROp::BEQZ || !skipBranch.dest.isLabel() ||
+            !skipBranch.src1.isLocalVar() || skipBranch.src1.name != guard.dest.name ||
+            breakBranch.op != IROp::BRANCH || !breakBranch.dest.isLabel() ||
+            breakBranch.dest.name != exitLabel || skipLabel.op != IROp::LABEL ||
+            !skipLabel.dest.isLabel() || skipLabel.dest.name != skipBranch.dest.name ||
+            labelReferences[skipLabel.dest.name] != 1) {
+          continue;
+        }
+
+        const auto nearbyConstant = [&](const Operand& operand) -> std::optional<int> {
+          if (operand.isImm()) {
+            return operand.immVal;
+          }
+          if (!operand.isLocalVar()) {
+            return std::nullopt;
+          }
+          for (std::size_t position = loopStart; position > 0; --position) {
+            const IRInst& candidate = ir[position - 1];
+            if (candidate.dest.isLocalVar() && candidate.dest.name == operand.name) {
+              if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                  candidate.src1.isImm()) {
+                return candidate.src1.immVal;
+              }
+              return std::nullopt;
+            }
+            if (candidate.op == IROp::LABEL || candidate.op == IROp::BRANCH ||
+                candidate.op == IROp::BEQZ || candidate.op == IROp::BNEZ ||
+                candidate.op == IROp::CALL || candidate.op == IROp::FUNC_BEGIN) {
+              break;
+            }
+          }
+          return std::nullopt;
+        };
+
+        IROp guardRelation = guard.op;
+        Operand guardInduction = guard.src1;
+        Operand guardThreshold = guard.src2;
+        if ((!guardInduction.isLocalVar() || guardInduction.name != induction) &&
+            guardThreshold.isLocalVar() && guardThreshold.name == induction) {
+          std::swap(guardInduction, guardThreshold);
+          switch (guardRelation) {
+          case IROp::LT:
+            guardRelation = IROp::GT;
+            break;
+          case IROp::LE:
+            guardRelation = IROp::GE;
+            break;
+          case IROp::GT:
+            guardRelation = IROp::LT;
+            break;
+          case IROp::GE:
+            guardRelation = IROp::LE;
+            break;
+          default:
+            break;
+          }
+        }
+        if (!guardInduction.isLocalVar() || guardInduction.name != induction ||
+            (guardRelation != IROp::GE && guardRelation != IROp::GT)) {
+          continue;
+        }
+        const auto loopBound = nearbyConstant(ir[condIndex + 1].src2);
+        const auto breakThreshold = nearbyConstant(guardThreshold);
+        if (!loopBound || !breakThreshold) {
+          continue;
+        }
+
+        bool bodySupported = true;
+        int inductionWrites = 0;
+        for (std::size_t position = guardIndex + 4; position < condIndex && bodySupported;
+             ++position) {
+          const IRInst& inst = ir[position];
+          if (inst.op == IROp::LABEL || inst.op == IROp::BRANCH || inst.op == IROp::BEQZ ||
+              inst.op == IROp::BNEZ || inst.op == IROp::RETURN ||
+              (inst.src1.isLocalVar() && inst.src1.name == guard.dest.name) ||
+              (inst.src2.isLocalVar() && inst.src2.name == guard.dest.name)) {
+            bodySupported = false;
+            break;
+          }
+          if (inst.dest.isLocalVar() &&
+              ((guardThreshold.isLocalVar() && inst.dest.name == guardThreshold.name) ||
+               (ir[condIndex + 1].src2.isLocalVar() &&
+                inst.dest.name == ir[condIndex + 1].src2.name))) {
+            bodySupported = false;
+            break;
+          }
+          if (inst.dest.isLocalVar() && inst.dest.name == induction) {
+            ++inductionWrites;
+            bodySupported = inst.op == IROp::ADD && inst.src1.isLocalVar() &&
+                            inst.src1.name == induction && inst.src2.isImm() &&
+                            inst.src2.immVal == 1 && position + 1 == condIndex;
+          }
+        }
+        if (!bodySupported || inductionWrites != 1) {
+          continue;
+        }
+
+        const std::int64_t breakExclusive =
+            static_cast<std::int64_t>(*breakThreshold) + (guardRelation == IROp::GT ? 1 : 0);
+        const std::int64_t effectiveBound =
+            std::min<std::int64_t>(static_cast<std::int64_t>(*loopBound), breakExclusive);
+        if (effectiveBound < INT32_MIN || effectiveBound > INT32_MAX) {
+          continue;
+        }
+        ir[condIndex + 1].src2 = Operand::imm(static_cast<int>(effectiveBound));
+        ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(guardIndex),
+                 ir.begin() + static_cast<std::ptrdiff_t>(guardIndex + 4));
+        normalizedBreak = true;
+        changed = true;
+      }
+    }
+  }
+
   // Pass 4.5: 删除结果完全不可观察的有限局部循环。
   //
   // `if/else` 中的死状态会反过来保持条件、分支和归纳变量活跃，使普通 DCE

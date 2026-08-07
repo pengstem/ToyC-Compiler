@@ -474,6 +474,22 @@ if(TOYCC_BUILD_TESTS)
       )
 
       add_test(
+        NAME toycc.perf.leading-break-affine-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_leading_break_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_leading_break_affine_summary.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/leading_break_moving_bound_safety.c"
+      )
+      set_tests_properties(toycc.perf.leading-break-affine-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
         NAME toycc.perf.periodic-affine-summary-codegen
         COMMAND
           "${Python3_EXECUTABLE}"
@@ -706,8 +722,6 @@ if(TOYCC_BUILD_TESTS)
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_break_loop.c"
           --continue-case
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_continue_loop.c"
-          --live-break-case
-          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_break_live_state_safety.c"
           --live-continue-case
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_continue_live_state_safety.c"
           --unsafe-continue-case

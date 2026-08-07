@@ -288,6 +288,29 @@ def make_case(rng: random.Random, case_index: int) -> str:
             "  result = result + reset_a + reset_b + reset_total + reset_j;",
         ]
     )
+    # A monotone leading break only tightens a canonical loop's upper bound.
+    # Exercise the normalized guard together with a coupled affine recurrence.
+    break_upper = rng.randint(4, 10)
+    break_threshold = rng.randint(1, break_upper - 1)
+    break_a_initial = rng.randint(-4, 5)
+    break_b_initial = rng.randint(-4, 5)
+    lines.extend(
+        [
+            "  int break_i = 0;",
+            f"  int break_a = result % 13 + {break_a_initial};",
+            f"  int break_b = seed % 11 + {break_b_initial};",
+            "  int break_total = 3;",
+            f"  while (break_i < {break_upper}) {{",
+            f"    if (break_i >= {break_threshold}) break;",
+            "    int break_next = break_a + break_b + break_i;",
+            "    break_a = break_b;",
+            "    break_b = break_next;",
+            "    break_total = break_total + break_a - break_b;",
+            "    break_i = break_i + 1;",
+            "  }",
+            "  result = result + break_a + break_b + break_total + break_i;",
+        ]
+    )
     # A modulo-controlled affine branch has a finite phase period. The optimizer
     # may summarize a whole period, but must preserve sequential assignments and
     # the phase implied by a non-zero induction start.
