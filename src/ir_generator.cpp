@@ -1841,6 +1841,112 @@ void IRGenerator::optimizePass() {
     // 而非单次定义分析会保守保留同名变量的所有赋值，但不会误删非 SSA IR
     // 中某条可达定义。
     {
+      struct StructuredIf {
+        std::size_t branchIndex;
+        std::size_t joinIndex;
+        std::unordered_set<std::string> conditionVars;
+        std::unordered_set<std::string> controlledDefs;
+      };
+
+      std::unordered_map<std::string, std::size_t> labelPositions;
+      std::unordered_map<std::string, std::vector<std::size_t>> labelReferences;
+      for (std::size_t index = 0; index < ir.size(); ++index) {
+        const IRInst& inst = ir[index];
+        if (inst.op == IROp::LABEL && inst.dest.isLabel()) {
+          labelPositions[inst.dest.name] = index;
+        }
+        if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+            inst.dest.isLabel()) {
+          labelReferences[inst.dest.name].push_back(index);
+        }
+      }
+
+      // 识别生成器产生的前向 if/if-else 区域。只有区域内全部为局部纯计算和
+      // 前向内部边、且不存在外部入口时，分支条件才不必先验地视为可观察根。
+      std::vector<StructuredIf> structuredIfs;
+      std::unordered_set<std::size_t> suppressBranchRoots;
+      for (std::size_t branchIndex = 0; branchIndex < ir.size(); ++branchIndex) {
+        const IRInst& branch = ir[branchIndex];
+        if (branch.op != IROp::BEQZ || !branch.dest.isLabel()) {
+          continue;
+        }
+        const auto elseFound = labelPositions.find(branch.dest.name);
+        if (elseFound == labelPositions.end() || elseFound->second <= branchIndex) {
+          continue;
+        }
+
+        const std::size_t elseIndex = elseFound->second;
+        std::size_t joinIndex = elseIndex;
+        if (elseIndex > branchIndex + 1 && ir[elseIndex - 1].op == IROp::BRANCH &&
+            ir[elseIndex - 1].dest.isLabel()) {
+          const auto endFound = labelPositions.find(ir[elseIndex - 1].dest.name);
+          if (endFound != labelPositions.end() && endFound->second > elseIndex) {
+            joinIndex = endFound->second;
+          }
+        }
+
+        bool removableControl = true;
+        std::unordered_set<std::string> controlledLabels;
+        std::unordered_set<std::string> controlledDefs;
+        for (std::size_t index = branchIndex + 1; index < joinIndex && removableControl; ++index) {
+          const IRInst& inst = ir[index];
+          const bool pureLocalDefinition =
+              inst.dest.isLocalVar() && (isCombinableOp(inst.op) || inst.op == IROp::ASSIGN ||
+                                         inst.op == IROp::LOCAL_VAR_DECL);
+          if (pureLocalDefinition) {
+            controlledDefs.insert(inst.dest.name);
+            continue;
+          }
+          if (inst.op == IROp::LABEL && inst.dest.isLabel()) {
+            controlledLabels.insert(inst.dest.name);
+            continue;
+          }
+          if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+              inst.dest.isLabel()) {
+            const auto target = labelPositions.find(inst.dest.name);
+            // 内部控制流也必须严格向前；嵌套循环或 continue/break 会改变终止性。
+            removableControl = target != labelPositions.end() && target->second > index &&
+                               target->second <= joinIndex;
+            continue;
+          }
+          removableControl = false;
+        }
+        if (!removableControl || ir[joinIndex].op != IROp::LABEL || !ir[joinIndex].dest.isLabel()) {
+          continue;
+        }
+        controlledLabels.insert(ir[joinIndex].dest.name);
+
+        // 所有受控标签只能从待删除区域内进入；否则删除会留下悬空外部跳转。
+        for (const auto& label : controlledLabels) {
+          const auto references = labelReferences.find(label);
+          if (references == labelReferences.end()) {
+            continue;
+          }
+          for (const std::size_t reference : references->second) {
+            if (reference < branchIndex || reference >= joinIndex) {
+              removableControl = false;
+              break;
+            }
+          }
+          if (!removableControl) {
+            break;
+          }
+        }
+        if (!removableControl) {
+          continue;
+        }
+
+        StructuredIf candidate{branchIndex, joinIndex, {}, std::move(controlledDefs)};
+        if (branch.src1.isLocalVar()) {
+          candidate.conditionVars.insert(branch.src1.name);
+        }
+        if (branch.src2.isLocalVar()) {
+          candidate.conditionVars.insert(branch.src2.name);
+        }
+        structuredIfs.push_back(std::move(candidate));
+        suppressBranchRoots.insert(branchIndex);
+      }
+
       std::unordered_map<std::string, std::unordered_set<std::string>> dependencies;
       std::unordered_set<std::string> useful;
 
@@ -1850,7 +1956,8 @@ void IRGenerator::optimizePass() {
         }
       };
 
-      for (const auto& inst : ir) {
+      for (std::size_t index = 0; index < ir.size(); ++index) {
+        const IRInst& inst = ir[index];
         const bool pureLocalDefinition =
             inst.dest.isLocalVar() &&
             (isCombinableOp(inst.op) || inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL);
@@ -1860,12 +1967,26 @@ void IRGenerator::optimizePass() {
           continue;
         }
 
+        if (suppressBranchRoots.count(index) != 0) {
+          continue;
+        }
+
         // 对不可删除指令，只把真正读取的局部操作数作为根；普通 dest 是定义，
         // RETURN/PARAM 的 dest 则按 IR 约定是被读取的值。
         addLocalUse(inst.src1, useful);
         addLocalUse(inst.src2, useful);
         if (inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
           addLocalUse(inst.dest, useful);
+        }
+      }
+
+      // 若受控区域定义的变量最终有用，则分支条件也有用。把控制依赖编码成
+      // `defined variable -> condition` 的依赖边；无出口的数据/控制互相递推 SCC
+      // 不会凭空成为根，因此整棵死 if 可以一起消失。
+      for (const auto& candidate : structuredIfs) {
+        for (const auto& definition : candidate.controlledDefs) {
+          auto& deps = dependencies[definition];
+          deps.insert(candidate.conditionVars.begin(), candidate.conditionVars.end());
         }
       }
 
@@ -1884,10 +2005,53 @@ void IRGenerator::optimizePass() {
         }
       }
 
+      std::vector<std::pair<std::size_t, std::size_t>> deadIntervals;
+      for (const auto& candidate : structuredIfs) {
+        bool controlsUsefulDefinition = false;
+        for (const auto& definition : candidate.controlledDefs) {
+          if (useful.count(definition) != 0) {
+            controlsUsefulDefinition = true;
+            break;
+          }
+        }
+        bool usefulCondition = false;
+        for (const auto& condition : candidate.conditionVars) {
+          if (useful.count(condition) != 0) {
+            usefulCondition = true;
+            break;
+          }
+        }
+        if (!controlsUsefulDefinition && !usefulCondition) {
+          deadIntervals.emplace_back(candidate.branchIndex, candidate.joinIndex + 1);
+        }
+      }
+      std::sort(deadIntervals.begin(), deadIntervals.end());
+      std::vector<std::pair<std::size_t, std::size_t>> mergedIntervals;
+      for (const auto& interval : deadIntervals) {
+        if (mergedIntervals.empty() || interval.first > mergedIntervals.back().second) {
+          mergedIntervals.push_back(interval);
+        } else {
+          mergedIntervals.back().second = std::max(mergedIntervals.back().second, interval.second);
+        }
+      }
+
       std::vector<IRInst> optimized;
       optimized.reserve(ir.size());
       bool rootedDceChanged = false;
-      for (const auto& inst : ir) {
+      std::size_t intervalIndex = 0;
+      for (std::size_t index = 0; index < ir.size(); ++index) {
+        while (intervalIndex < mergedIntervals.size() &&
+               index >= mergedIntervals[intervalIndex].second) {
+          ++intervalIndex;
+        }
+        if (intervalIndex < mergedIntervals.size() &&
+            index >= mergedIntervals[intervalIndex].first &&
+            index < mergedIntervals[intervalIndex].second) {
+          rootedDceChanged = true;
+          continue;
+        }
+
+        const IRInst& inst = ir[index];
         const bool deadLocalDefinition = inst.dest.isLocalVar() &&
                                          useful.count(inst.dest.name) == 0 &&
                                          (isCombinableOp(inst.op) || inst.op == IROp::ASSIGN);

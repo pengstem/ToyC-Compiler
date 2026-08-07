@@ -546,6 +546,8 @@ if(TOYCC_BUILD_TESTS)
           --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_recurrence_loop.c"
           --must-keep-case
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/live_recurrence_safety.c"
+          --side-effect-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/conditional_side_effect_safety.c"
       )
       set_tests_properties(toycc.perf.dead-recurrence-codegen PROPERTIES
         LABELS "toycc;codegen;performance"
