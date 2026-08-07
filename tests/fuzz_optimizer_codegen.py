@@ -94,6 +94,33 @@ def make_case(rng: random.Random, case_index: int) -> str:
     lines.append(f"  int seed = opaque({case_index % 31 + 1});")
     arguments = [f"(seed + {index * 3 + 1}) % 997" for index in range(parameter_count)]
     lines.append(f"  int result = work({', '.join(arguments)});")
+    # Constant-trip nested affine loops exercise the runtime-initial-value
+    # summary. Include zero-trip and negative-induction starts across cases.
+    outer_bound = rng.randint(1, 6)
+    inner_start = rng.randint(-3, 4)
+    inner_end = rng.randint(-2, 6)
+    coeff_i = rng.randint(-4, 5)
+    coeff_j = rng.randint(-4, 5)
+    constant = rng.randint(-9, 11)
+    second_coeff = rng.randint(-3, 4)
+    lines.extend(
+        [
+            "  int ni = 0;",
+            "  int nj = 0;",
+            "  int affine0 = result;",
+            "  int affine1 = seed;",
+            f"  while (ni < {outer_bound}) {{",
+            f"    nj = {inner_start};",
+            f"    while (nj <= {inner_end}) {{",
+            f"      affine0 = affine0 + ni * {coeff_i} + nj * {coeff_j} + {constant};",
+            f"      affine1 = affine1 - ni + nj * {second_coeff};",
+            "      nj = nj + 1;",
+            "    }",
+            "    ni = ni + 1;",
+            "  }",
+            "  result = result + affine0 + affine1 + nj;",
+        ]
+    )
     lines.append("  result = result % 251;")
     lines.append("  if (result < 0) { result = result + 251; }")
     lines.extend(["  return result;", "}"])
