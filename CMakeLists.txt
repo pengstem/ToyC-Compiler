@@ -710,10 +710,14 @@ if(TOYCC_BUILD_TESTS)
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_dead_pure_call_codegen.py"
           --compiler "$<TARGET_FILE:toycc>"
           --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_pure_call_loop.c"
+          --loop-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_pure_loop_call.c"
           --side-effect-case
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_call_side_effect_safety.c"
           --termination-case
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_call_termination_safety.c"
+          --moving-loop-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_call_moving_loop_safety.c"
       )
       set_tests_properties(toycc.perf.dead-pure-call-codegen PROPERTIES
         LABELS "toycc;codegen;performance"

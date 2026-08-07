@@ -2086,14 +2086,15 @@ void IRGenerator::optimizePass() {
     // Pass 2.75: 删除返回值无用的、已证明纯且必然终止的函数调用。
     //
     // 内联预算会保留较大的函数调用，而普通 DCE 必须把任意 CALL 当成副作用根。
-    // 这里仅接受无全局写/STORE/未知调用、无回边且调用图无环的已定义函数；
-    // 无回边 CFG 与已证明终止的被调函数共同保证删除调用不会改变程序终止性。
+    // 这里仅接受无全局写/STORE/未知调用、调用图无环的已定义函数。CFG 可以
+    // 包含规范的单位步进单调循环，但每条回边都必须独立证明终止；这让返回值
+    // 无用的有限纯 helper 不再因为含有一个 while 就永久成为副作用根。
     {
       struct FunctionEffects {
         std::size_t begin = 0;
         std::size_t end = 0;
         std::size_t paramCount = 0;
-        bool locallyPureAndAcyclic = true;
+        bool locallyPureAndTerminatingShape = true;
         std::unordered_set<std::string> callees;
       };
 
@@ -2119,16 +2120,91 @@ void IRGenerator::optimizePass() {
             labels[inst.dest.name] = index;
           }
         }
+
+        const auto provenTerminatingBackedge = [&](std::size_t backedgeIndex,
+                                                   std::size_t bodyLabelIndex) {
+          if (backedgeIndex < 2 || bodyLabelIndex >= backedgeIndex ||
+              ir[backedgeIndex].op != IROp::BNEZ) {
+            return false;
+          }
+          const IRInst& condition = ir[backedgeIndex - 1];
+          if ((condition.op != IROp::LT && condition.op != IROp::LE && condition.op != IROp::GT &&
+               condition.op != IROp::GE) ||
+              !condition.dest.isLocalVar() || !condition.src1.isLocalVar() ||
+              !ir[backedgeIndex].src1.isLocalVar() ||
+              ir[backedgeIndex].src1.name != condition.dest.name) {
+            return false;
+          }
+
+          std::size_t conditionLabelIndex = backedgeIndex - 1;
+          while (conditionLabelIndex > bodyLabelIndex &&
+                 ir[conditionLabelIndex].op != IROp::LABEL) {
+            --conditionLabelIndex;
+          }
+          if (conditionLabelIndex <= bodyLabelIndex || ir[conditionLabelIndex].op != IROp::LABEL) {
+            return false;
+          }
+
+          const bool increasing = condition.op == IROp::LT || condition.op == IROp::LE;
+          if ((condition.op == IROp::LE &&
+               (!condition.src2.isImm() || condition.src2.immVal == INT32_MAX)) ||
+              (condition.op == IROp::GE &&
+               (!condition.src2.isImm() || condition.src2.immVal == INT32_MIN))) {
+            return false;
+          }
+
+          const std::string induction = condition.src1.name;
+          const std::optional<std::string> bound =
+              condition.src2.isLocalVar() ? std::optional<std::string>{condition.src2.name}
+                                          : std::nullopt;
+          int inductionWrites = 0;
+          std::size_t inductionWriteIndex = 0;
+          std::size_t lastInternalControl = bodyLabelIndex;
+          for (std::size_t position = bodyLabelIndex + 1; position < conditionLabelIndex;
+               ++position) {
+            const IRInst& bodyInst = ir[position];
+            if (bound && bodyInst.dest.isLocalVar() && bodyInst.dest.name == *bound) {
+              return false;
+            }
+            if (bodyInst.dest.isLocalVar() && bodyInst.dest.name == induction &&
+                bodyInst.op != IROp::RETURN && bodyInst.op != IROp::PARAM) {
+              ++inductionWrites;
+              inductionWriteIndex = position;
+              const bool unitStep = ((increasing && bodyInst.op == IROp::ADD) ||
+                                     (!increasing && bodyInst.op == IROp::SUB)) &&
+                                    bodyInst.src1.isLocalVar() && bodyInst.src1.name == induction &&
+                                    bodyInst.src2.isImm() && bodyInst.src2.immVal == 1;
+              if (!unitStep) {
+                return false;
+              }
+            }
+            if ((bodyInst.op == IROp::BRANCH || bodyInst.op == IROp::BEQZ ||
+                 bodyInst.op == IROp::BNEZ) &&
+                bodyInst.dest.isLabel()) {
+              const auto target = labels.find(bodyInst.dest.name);
+              if (target == labels.end() || target->second <= position) {
+                return false;
+              }
+              // 向循环退出标签的 break 只会提早终止；循环体内部的前向边
+              // 则必须位于归纳更新之前，确保继续迭代的每条路径都执行更新。
+              if (target->second <= conditionLabelIndex) {
+                lastInternalControl = position;
+              }
+            }
+          }
+          return inductionWrites == 1 && inductionWriteIndex > lastInternalControl;
+        };
+
         for (std::size_t index = effects.begin + 1; index < effects.end; ++index) {
           const IRInst& inst = ir[index];
           const bool globalWrite =
               inst.dest.isGlobalVar() && inst.op != IROp::PARAM && inst.op != IROp::RETURN;
           if (globalWrite || inst.op == IROp::STORE) {
-            effects.locallyPureAndAcyclic = false;
+            effects.locallyPureAndTerminatingShape = false;
           }
           if (inst.op == IROp::CALL) {
             if (!inst.src1.isFunc()) {
-              effects.locallyPureAndAcyclic = false;
+              effects.locallyPureAndTerminatingShape = false;
             } else {
               effects.callees.insert(inst.src1.name);
             }
@@ -2136,8 +2212,9 @@ void IRGenerator::optimizePass() {
           if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
               inst.dest.isLabel()) {
             const auto target = labels.find(inst.dest.name);
-            if (target == labels.end() || target->second <= index) {
-              effects.locallyPureAndAcyclic = false;
+            if (target == labels.end() ||
+                (target->second <= index && !provenTerminatingBackedge(index, target->second))) {
+              effects.locallyPureAndTerminatingShape = false;
             }
           }
         }
@@ -2154,7 +2231,7 @@ void IRGenerator::optimizePass() {
         for (const auto& entry : functions) {
           const std::string& name = entry.first;
           const FunctionEffects& effects = entry.second;
-          if (!effects.locallyPureAndAcyclic || pureTerminating.count(name) != 0) {
+          if (!effects.locallyPureAndTerminatingShape || pureTerminating.count(name) != 0) {
             continue;
           }
           const bool calleesProven = std::all_of(

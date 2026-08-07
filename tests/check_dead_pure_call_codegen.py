@@ -34,8 +34,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--case", required=True)
+    parser.add_argument("--loop-case", required=True)
     parser.add_argument("--side-effect-case", required=True)
     parser.add_argument("--termination-case", required=True)
+    parser.add_argument("--moving-loop-case", required=True)
     args = parser.parse_args()
 
     body = main_body(compile_source(args.compiler, args.case))
@@ -44,6 +46,10 @@ def main() -> int:
     if re.search(r"(?m)^\s*(?:b\w+|j)\s+L\w+", body):
         raise RuntimeError(f"newly summarizable loop remains:\n{body}")
 
+    body = main_body(compile_source(args.compiler, args.loop_case))
+    if re.search(r"(?m)^\s*call\s+heavy_loop\b", body):
+        raise RuntimeError(f"dead finite-loop call remains:\n{body}")
+
     body = main_body(compile_source(args.compiler, args.side_effect_case))
     if not re.search(r"(?m)^\s*call\s+impure\b", body):
         raise RuntimeError("dead-result impure call was deleted")
@@ -51,6 +57,10 @@ def main() -> int:
     body = main_body(compile_source(args.compiler, args.termination_case))
     if not re.search(r"(?m)^\s*call\s+spin\b", body):
         raise RuntimeError("possibly nonterminating pure call was deleted")
+
+    body = main_body(compile_source(args.compiler, args.moving_loop_case))
+    if not re.search(r"(?m)^\s*(?:call\s+drift\b|(?:b\w+|j)\s+L\w+)", body):
+        raise RuntimeError("moving-bound pure loop was unsafely deleted")
     return 0
 
 
