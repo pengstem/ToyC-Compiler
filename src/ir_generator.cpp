@@ -59,7 +59,7 @@ void IRGenerator::emit(IROp op, Operand dest, Operand src1, Operand src2) {
 // 主入口
 // ============================================================
 
-std::vector<IRInst> IRGenerator::generate(CompUnit& compUnit) {
+std::vector<IRInst> IRGenerator::generate(CompUnit& compUnit, IRStage stage) {
   ir.clear();
   tempCounter = 0;
   labelCounter = 0;
@@ -68,8 +68,12 @@ std::vector<IRInst> IRGenerator::generate(CompUnit& compUnit) {
     genGlobalDecl(node.get());
   }
 
-  inlinePass();
-  optimizePass();
+  if (stage != IRStage::RAW) {
+    inlinePass();
+  }
+  if (stage == IRStage::OPTIMIZED) {
+    optimizePass();
+  }
 
   return ir;
 }
@@ -834,8 +838,7 @@ void IRGenerator::inlinePass() {
         const std::string& pv = f.paramVars[i];
         if (wp.count(pv)) {
           // 形参被写：实参物化到新鲜临时变量。
-          // 用 p 前缀而非 t%d：mapTmp 会重命名函数体复制的 t 名，
-          // 若物化临时也是 t 名会被误重命名，造成悬垂引用
+          // 使用独立 p 前缀，避免与被调函数 t%d 临时命名空间混淆。
           Operand fresh = Operand::localVar("p" + std::to_string(tempCounter++));
           paramMap[pv] = fresh;
           body.emplace_back(IROp::ASSIGN, fresh, argVals[i], Operand::none());
@@ -888,7 +891,7 @@ void IRGenerator::inlinePass() {
           if (isLast && hasReturnBranch)
             continue; // 不可达（前有 return 跳转）
           if (!retTemp.isNone()) {
-            Operand rv = inst.dest.isNone() ? Operand::imm(0) : mapTmp(mapOp(inst.dest));
+            Operand rv = inst.dest.isNone() ? Operand::imm(0) : mapOp(mapTmp(inst.dest));
             body.emplace_back(IROp::ASSIGN, retTemp, std::move(rv), Operand::none());
           }
           if (!isLast) {
@@ -898,9 +901,10 @@ void IRGenerator::inlinePass() {
           }
           continue;
         }
-        // 一般指令：重命名参数引用、临时变量与标签（用户变量名全局唯一）
-        IRInst copy(inst.op, mapTmp(mapOp(inst.dest)), mapTmp(mapOp(inst.src1)),
-                    mapTmp(mapOp(inst.src2)));
+        // 必须先重命名被调函数自身的 t%d，再替换形参。若顺序相反，调用者
+        // 作为实参传入的 t%d 会被误当成被调函数临时并改成没有定义的新名字。
+        IRInst copy(inst.op, mapOp(mapTmp(inst.dest)), mapOp(mapTmp(inst.src1)),
+                    mapOp(mapTmp(inst.src2)));
         if (copy.op == IROp::LABEL && copy.dest.isLabel()) {
           copy.dest = Operand::label(mapLabel(copy.dest.name));
         }

@@ -77,4 +77,5 @@ perf/t_copy_loop.c
 perf/t_cse_loop.c
 perf/t_loop_weighted_regalloc.c
 regression/f19_many_arguments.c
+regression/f19_forwarding.c
 regression/pair_unroll_bounds.c

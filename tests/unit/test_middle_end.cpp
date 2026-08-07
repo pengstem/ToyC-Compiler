@@ -387,7 +387,7 @@ void testIR_functionCall() {
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*comp);
+  auto ir = irGen.generate(*comp, IRStage::RAW);
   if (irContains(ir, "FUNC_BEGIN add") && irContains(ir, "FUNC_END add") &&
       irContains(ir, "PARAM") && irContains(ir, "CALL") && irContains(ir, "FUNC_BEGIN main")) {
     testPass();
@@ -405,7 +405,7 @@ void testIR_voidFunction() {
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*comp);
+  auto ir = irGen.generate(*comp, IRStage::RAW);
   if (irContains(ir, "FUNC_BEGIN f") && irContains(ir, "RETURN") && irContains(ir, "CALL")) {
     testPass();
   } else {
@@ -908,7 +908,7 @@ void testIR_whileIf() {
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*comp);
+  auto ir = irGen.generate(*comp, IRStage::RAW);
   if (irContains(ir, "LT") && irContains(ir, "BEQZ")) {
     testPass();
   } else {
@@ -983,7 +983,7 @@ void testIR_multiParams() {
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*comp);
+  auto ir = irGen.generate(*comp, IRStage::RAW);
   auto irStr = irToString(ir);
   size_t first = irStr.find("PARAM");
   if (first != std::string::npos && irStr.find("PARAM", first + 1) != std::string::npos &&
@@ -1297,7 +1297,7 @@ void testIntegration_functionCall() {
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*comp);
+  auto ir = irGen.generate(*comp, IRStage::RAW);
 
   CodeGenerator cg;
   std::ostringstream out;

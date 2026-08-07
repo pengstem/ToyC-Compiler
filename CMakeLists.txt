@@ -466,6 +466,22 @@ if(TOYCC_BUILD_TESTS)
         LABELS "toycc;differential;regression"
         TIMEOUT 30
       )
+
+      add_test(
+        NAME toycc.many-arguments-differential
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz_many_arguments.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --host-cc "${TOYCC_HOST_CC}"
+          --riscv-cc "${TOYCC_RISCV_CC}"
+          --qemu "${TOYCC_QEMU_RISCV32}"
+          --cases 60
+      )
+      set_tests_properties(toycc.many-arguments-differential PROPERTIES
+        LABELS "toycc;differential;regression"
+        TIMEOUT 30
+      )
     endif()
   endif()
 endif()
