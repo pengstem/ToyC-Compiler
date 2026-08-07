@@ -2516,8 +2516,9 @@ void IRGenerator::optimizePass() {
   //
   // `if/else` 中的死状态会反过来保持条件、分支和归纳变量活跃，使普通 DCE
   // 无法拆掉整个控制流环。这里接受直线循环体或只有前向边的局部 CFG，但同时
-  // 要求常量迭代次数、末尾严格 +1 的归纳变量、无调用/全局状态，并证明循环
-  // 写入的所有局部量在退出后均不再使用。
+  // 要求可证明终止的单调归纳变量、无调用/全局状态，并证明循环写入的所有
+  // 局部量在退出后均不再使用。严格 `<`/`>` 循环即使边界是运行期不变量也会
+  // 在恰好到达边界时退出；非严格比较还要排除 INT32 边界处的步进溢出。
   {
     bool removedLoop = true;
     while (removedLoop) {
@@ -2557,7 +2558,8 @@ void IRGenerator::optimizePass() {
         }
         const IRInst& condition = ir[condIndex + 1];
         const IRInst& backedge = ir[condIndex + 2];
-        if ((condition.op != IROp::LT && condition.op != IROp::LE) ||
+        if ((condition.op != IROp::LT && condition.op != IROp::LE && condition.op != IROp::GT &&
+             condition.op != IROp::GE) ||
             !condition.dest.isLocalVar() || !condition.src1.isLocalVar() ||
             backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
             backedge.dest.name != bodyLabel || !backedge.src1.isLocalVar() ||
@@ -2587,24 +2589,25 @@ void IRGenerator::optimizePass() {
           }
           return std::nullopt;
         };
-        const auto initial = findNearbyConstant(induction);
-        std::optional<int> upper;
+        std::optional<int> bound;
         if (condition.src2.isImm()) {
-          upper = condition.src2.immVal;
+          bound = condition.src2.immVal;
         } else if (condition.src2.isLocalVar()) {
-          upper = findNearbyConstant(condition.src2.name);
+          bound = findNearbyConstant(condition.src2.name);
         }
-        if (!initial || !upper ||
-            (condition.op == IROp::LE && *upper == INT32_MAX && *initial <= *upper)) {
+        const bool increasing = condition.op == IROp::LT || condition.op == IROp::LE;
+        const int inductionStep = increasing ? 1 : -1;
+
+        // 严格比较配合单位步进对任意不变 int32 边界都必然终止：若进入循环，
+        // 归纳变量会在溢出前恰好等于边界。<= INT32_MAX 与 >= INT32_MIN 则会在
+        // 边界仍执行一次并溢出，只有已知安全边界时才能删除。
+        if ((condition.op == IROp::LE || condition.op == IROp::GE) && !bound) {
           continue;
         }
-        std::int64_t trips = static_cast<std::int64_t>(*upper) - *initial;
-        if (condition.op == IROp::LE) {
-          ++trips;
+        if (condition.op == IROp::LE && *bound == INT32_MAX) {
+          continue;
         }
-        trips = std::max<std::int64_t>(0, trips);
-        const std::int64_t finalInduction = static_cast<std::int64_t>(*initial) + trips;
-        if (trips > INT32_MAX || finalInduction > INT32_MAX) {
+        if (condition.op == IROp::GE && *bound == INT32_MIN) {
           continue;
         }
 
@@ -2649,10 +2652,11 @@ void IRGenerator::optimizePass() {
             if (inst.dest.name == induction) {
               ++inductionWrites;
               inductionWriteIndex = position;
-              const bool incrementsByOne = inst.op == IROp::ADD && inst.src1.isLocalVar() &&
-                                           inst.src1.name == induction && inst.src2.isImm() &&
-                                           inst.src2.immVal == 1;
-              if (!incrementsByOne) {
+              const bool unitStep = ((inst.op == IROp::ADD && inductionStep == 1) ||
+                                     (inst.op == IROp::SUB && inductionStep == -1)) &&
+                                    inst.src1.isLocalVar() && inst.src1.name == induction &&
+                                    inst.src2.isImm() && inst.src2.immVal == 1;
+              if (!unitStep) {
                 bodySupported = false;
               }
             }

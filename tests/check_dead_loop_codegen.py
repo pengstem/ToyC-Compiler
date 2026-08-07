@@ -13,7 +13,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--case", required=True)
+    parser.add_argument("--descending-case", required=True)
     parser.add_argument("--must-keep-case", required=True)
+    parser.add_argument("--overflow-case", required=True)
     args = parser.parse_args()
     process = subprocess.run(
         [args.compiler, "-opt"],
@@ -37,6 +39,26 @@ def main() -> int:
 
     process = subprocess.run(
         [args.compiler, "-opt"],
+        input=Path(args.descending_case).read_bytes(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(process.stderr.decode(errors="replace"))
+    assembly = process.stdout.decode(errors="replace")
+    match = re.search(r"(?ms)^main:\n(.*?)^\s*\.size\s+main,", assembly)
+    if match is None:
+        raise RuntimeError("generated assembly has no main")
+    body = match.group(1)
+    if re.search(r"(?m)^\s*(?:b\w+|j)\s+L\w+", body):
+        raise RuntimeError(f"descending dead loop remains:\n{body}")
+    if "li a0, 91" not in body:
+        raise RuntimeError(f"unexpected descending-loop result:\n{body}")
+
+    process = subprocess.run(
+        [args.compiler, "-opt"],
         input=Path(args.must_keep_case).read_bytes(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -52,6 +74,26 @@ def main() -> int:
     body = match.group(1)
     if not re.search(r"(?m)^\s*(?:b\w+|j)\s+L\w+", body):
         raise RuntimeError(f"moving-bound loop was unsafely deleted:\n{body}")
+
+    process = subprocess.run(
+        [args.compiler, "-opt"],
+        input=Path(args.overflow_case).read_bytes(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(process.stderr.decode(errors="replace"))
+    assembly = process.stdout.decode(errors="replace")
+    match = re.search(
+        r"(?ms)^unsafe_inclusive_loop:\n(.*?)^\s*\.size\s+unsafe_inclusive_loop,",
+        assembly,
+    )
+    if match is None:
+        raise RuntimeError("generated assembly has no unsafe_inclusive_loop")
+    if not re.search(r"(?m)^\s*(?:b\w+|j)\s+L\w+", match.group(1)):
+        raise RuntimeError("overflowing inclusive loop was unsafely deleted")
     return 0
 
 
