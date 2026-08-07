@@ -21,7 +21,7 @@ struct Symbol {
   bool isFunction = false;
   bool isGlobal = false;
   bool isParam = false;
-  int constValue = 0;           // 若 isConst 且已折叠，存储编译期求值结果
+  int constValue = 0; // 若 isConst 且已折叠，存储编译期求值结果
   std::vector<Type> paramTypes; // 仅函数有效
 
   // 辅助判断

@@ -35,6 +35,7 @@ Cpp11BracedListStyle: true
 
 AlignAfterOpenBracket: Align
 AlignOperands: Align
+AlignTrailingComments: false
 
 BreakConstructorInitializers: BeforeComma
 

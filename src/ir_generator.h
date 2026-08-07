@@ -17,7 +17,7 @@ namespace toycc {
 // ============================================================
 
 struct LoopContext {
-  std::string breakLabel;    // 跳出循环的目标标签
+  std::string breakLabel; // 跳出循环的目标标签
   std::string continueLabel; // 跳回条件判断的标签
 };
 

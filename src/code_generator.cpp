@@ -163,7 +163,7 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
 
   int localIndex = 0;
   int maxOverflowArgs = 0;
-  int nextReg = 2;                    // 2-11: s2-s11；12-19: a0-a7（见下方分配策略）
+  int nextReg = 2; // 2-11: s2-s11；12-19: a0-a7（见下方分配策略）
   std::vector<std::string> paramVars; // 按声明顺序的形参 IR 名
 
   // 第一遍：收集所有局部变量
@@ -948,7 +948,7 @@ void CodeGenerator::applyPeephole(const std::string& asmText, std::ostream& out)
       if (next.opcode == "lw" && next.args.size() == 2 && next.args[0] == args[0] &&
           next.args[1] == args[1]) {
         out << lines[i] << "\n"; // 保留 sw
-        ++i;                     // 跳过冗余 lw
+        ++i; // 跳过冗余 lw
         continue;
       }
     }

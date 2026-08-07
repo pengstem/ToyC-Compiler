@@ -149,7 +149,7 @@ public:
   std::string name;
   std::shared_ptr<Expr> initExpr; // 可为空
   // 语义分析阶段填充（供 IR 生成器使用）
-  int constValue = 0;        // 若 isConst，存储编译期折叠结果
+  int constValue = 0; // 若 isConst，存储编译期折叠结果
   bool isGlobalDecl = false; // 是否为全局声明
 };
 

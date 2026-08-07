@@ -745,8 +745,8 @@ void IRGenerator::inlinePass() {
     };
 
     struct Candidate {
-      std::size_t callIndex;    // CALL 指令下标
-      std::size_t paramStart;   // 该调用点第一个 PARAM 的下标
+      std::size_t callIndex; // CALL 指令下标
+      std::size_t paramStart; // 该调用点第一个 PARAM 的下标
       std::vector<IRInst> body; // 变换后的内联体
     };
     std::vector<Candidate> cands;
@@ -1719,7 +1719,7 @@ void IRGenerator::optimizePass() {
     // 在无控制流的直线代码段内，若 (op, src1, src2) 已计算过且操作数未在块内被重新定义，
     // 则复用之前的结果。用户变量可被重新赋值，须跟踪重定义并使相关条目失效。
     {
-      std::unordered_map<std::string, std::string> rename;   // 原名 → 复用名（仅临时变量）
+      std::unordered_map<std::string, std::string> rename; // 原名 → 复用名（仅临时变量）
       std::unordered_map<std::string, std::string> valueMap; // (op,src1,src2) → 结果变量
       std::unordered_map<std::string, std::vector<std::string>> varKeys; // 变量 → 引用它的 key
       std::vector<IRInst> optimized;
@@ -2266,8 +2266,8 @@ void IRGenerator::optimizePass() {
     };
 
     std::unordered_map<std::string, std::string> renameMap; // old -> new
-    std::unordered_map<std::string, int> activeCount;       // new 名字的活跃引用数
-    std::vector<std::string> freePool;                      // activeCount==0 的可复用名字
+    std::unordered_map<std::string, int> activeCount; // new 名字的活跃引用数
+    std::vector<std::string> freePool; // activeCount==0 的可复用名字
     // 当前基本块内被定义的名字。只有块内定义的名字才能进入 freePool 复用：
     // 循环不变提升（LICM 外提）的临时定义在循环前的基本块，却在循环体内被消费；
     // 若将其名字复用给循环体内新临时，会在循环内重新定义该名字，覆盖外提值，
@@ -2432,8 +2432,8 @@ void IRGenerator::optimizePass() {
               // 临时变量必须是循环变量的线性函数：t = i*c, t = i+c, t = i, t = c 等。
               struct AccVar {
                 std::string name;
-                int step;          // 每次迭代的常量增量（可正可负）
-                int indCoeff;      // 循环变量系数（0=不加循环变量, +1/-1=加/减循环变量）
+                int step; // 每次迭代的常量增量（可正可负）
+                int indCoeff; // 循环变量系数（0=不加循环变量, +1/-1=加/减循环变量）
                 int quadCoeff = 0; // i² 系数（b += i*i 类平方累加）
               };
               // 临时变量的多项式表示：value = quadCoeff*i*i + indCoeff*i + constOffset
