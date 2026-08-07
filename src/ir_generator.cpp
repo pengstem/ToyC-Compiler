@@ -2067,7 +2067,6 @@ void IRGenerator::optimizePass() {
       }
       return identity;
     };
-    const auto newAffineTemp = [&]() { return "m" + std::to_string(tempCounter++); };
 
     bool summarizedAny = true;
     while (summarizedAny) {
@@ -2468,7 +2467,7 @@ void IRGenerator::optimizePass() {
             continue;
           }
 
-          const std::string finalName = newAffineTemp();
+          const std::string finalName = newTemp();
           bool haveValue = false;
           const std::uint32_t constant = summary[rowIndex][constantColumn];
           if (constant != 0) {
@@ -2484,7 +2483,7 @@ void IRGenerator::optimizePass() {
             }
             Operand term = Operand::localVar(variables[column]);
             if (coefficient != 1) {
-              const std::string productName = newAffineTemp();
+              const std::string productName = newTemp();
               replacement.emplace_back(IROp::MUL, Operand::localVar(productName), term,
                                        Operand::imm(static_cast<std::int32_t>(coefficient)));
               term = Operand::localVar(productName);
