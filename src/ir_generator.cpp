@@ -3708,6 +3708,541 @@ void IRGenerator::optimizePass() {
       }
     }
 
+    // Pass 5.56: 汇总由归纳变量余数驱动的直线累加循环。
+    //
+    // `i % k`（以及由它组合出的算术表达式）在非负、无回绕的 `i += 1`
+    // 循环中至多每 |k| 轮重复。这里只枚举不同的余数相位，再把一个周期的
+    // 增量乘以完整周期数；不会按源程序的迭代次数执行循环。累加器之外的可观察
+    // 状态、运行时除数、过大的组合周期、非规范归纳或控制流都会保守回退。
+    {
+      constexpr std::uint64_t kMaxPeriodicPhases = 1024;
+
+      struct PeriodicValue {
+        enum class Kind { UNKNOWN, CONSTANT, INDUCTION, QUOTIENT, QUOTIENT_PRODUCT, PERIODIC };
+        Kind kind = Kind::UNKNOWN;
+        int value = 0;
+        int offset = 0;
+        int divisor = 0;
+        std::uint64_t period = 0;
+      };
+      struct PeriodicAccumulator {
+        std::string name;
+        Operand delta;
+        int sign = 1;
+        std::uint64_t period = 0;
+      };
+
+      const auto gcd = [](std::uint64_t lhs, std::uint64_t rhs) {
+        while (rhs != 0) {
+          const std::uint64_t remainder = lhs % rhs;
+          lhs = rhs;
+          rhs = remainder;
+        }
+        return lhs;
+      };
+      const auto combinePeriod = [&](std::uint64_t lhs, std::uint64_t rhs) {
+        if (lhs == 0 || rhs == 0) {
+          return std::uint64_t{0};
+        }
+        const std::uint64_t divisor = gcd(lhs, rhs);
+        const std::uint64_t factor = rhs / divisor;
+        if (lhs > kMaxPeriodicPhases / factor) {
+          return std::uint64_t{0};
+        }
+        const std::uint64_t result = lhs * factor;
+        return result <= kMaxPeriodicPhases ? result : std::uint64_t{0};
+      };
+      const auto wrappedBinary = [](IROp op, int lhs, int rhs) -> std::optional<int> {
+        switch (op) {
+        case IROp::ADD:
+          return static_cast<std::int32_t>(static_cast<std::uint32_t>(lhs) +
+                                           static_cast<std::uint32_t>(rhs));
+        case IROp::SUB:
+          return static_cast<std::int32_t>(static_cast<std::uint32_t>(lhs) -
+                                           static_cast<std::uint32_t>(rhs));
+        case IROp::MUL:
+          return static_cast<std::int32_t>(static_cast<std::uint32_t>(
+              static_cast<std::uint64_t>(static_cast<std::uint32_t>(lhs)) *
+              static_cast<std::uint32_t>(rhs)));
+        case IROp::DIV:
+          if (rhs == 0 || (lhs == INT32_MIN && rhs == -1)) {
+            return std::nullopt;
+          }
+          return lhs / rhs;
+        case IROp::MOD:
+          if (rhs == 0 || (lhs == INT32_MIN && rhs == -1)) {
+            return std::nullopt;
+          }
+          return lhs % rhs;
+        case IROp::LT:
+          return lhs < rhs ? 1 : 0;
+        case IROp::GT:
+          return lhs > rhs ? 1 : 0;
+        case IROp::LE:
+          return lhs <= rhs ? 1 : 0;
+        case IROp::GE:
+          return lhs >= rhs ? 1 : 0;
+        case IROp::EQ:
+          return lhs == rhs ? 1 : 0;
+        case IROp::NE:
+          return lhs != rhs ? 1 : 0;
+        default:
+          return std::nullopt;
+        }
+      };
+
+      for (int summaryRound = 0; summaryRound < 8; ++summaryRound) {
+        std::unordered_map<std::string, int> labelReferences;
+        std::unordered_map<std::string, std::size_t> labelPositions;
+        for (std::size_t index = 0; index < ir.size(); ++index) {
+          const IRInst& inst = ir[index];
+          if (inst.op == IROp::LABEL && inst.dest.isLabel()) {
+            labelPositions[inst.dest.name] = index;
+          }
+          if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+              inst.dest.isLabel()) {
+            ++labelReferences[inst.dest.name];
+          }
+        }
+
+        bool summarized = false;
+        for (std::size_t loopStart = ir.size(); loopStart-- > 0 && !summarized;) {
+          if (ir[loopStart].op != IROp::BRANCH || !ir[loopStart].dest.isLabel() ||
+              loopStart + 1 >= ir.size() || ir[loopStart + 1].op != IROp::LABEL ||
+              !ir[loopStart + 1].dest.isLabel()) {
+            continue;
+          }
+          const std::string condLabel = ir[loopStart].dest.name;
+          const std::string bodyLabel = ir[loopStart + 1].dest.name;
+          if (labelReferences[condLabel] != 1 || labelReferences[bodyLabel] != 1) {
+            continue;
+          }
+          const auto condPosition = labelPositions.find(condLabel);
+          if (condPosition == labelPositions.end() || condPosition->second <= loopStart + 2) {
+            continue;
+          }
+          const std::size_t condIndex = condPosition->second;
+          if (condIndex + 2 >= ir.size()) {
+            continue;
+          }
+          const IRInst& condition = ir[condIndex + 1];
+          const IRInst& backedge = ir[condIndex + 2];
+          if ((condition.op != IROp::LT && condition.op != IROp::LE) ||
+              !condition.dest.isLocalVar() || !condition.src1.isLocalVar() ||
+              backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
+              backedge.dest.name != bodyLabel || !backedge.src1.isLocalVar() ||
+              backedge.src1.name != condition.dest.name) {
+            continue;
+          }
+          const std::string induction = condition.src1.name;
+
+          const auto findNearbyConstant = [&](const std::string& name) -> std::optional<int> {
+            for (std::size_t position = loopStart; position > 0; --position) {
+              const IRInst& candidate = ir[position - 1];
+              if (candidate.dest.isLocalVar() && candidate.dest.name == name) {
+                if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                    candidate.src1.isImm()) {
+                  return candidate.src1.immVal;
+                }
+                return std::nullopt;
+              }
+              if (candidate.op == IROp::LABEL || candidate.op == IROp::BRANCH ||
+                  candidate.op == IROp::BEQZ || candidate.op == IROp::BNEZ ||
+                  candidate.op == IROp::CALL || candidate.op == IROp::FUNC_BEGIN) {
+                break;
+              }
+            }
+            return std::nullopt;
+          };
+          const auto findUniqueConstant = [&](const std::string& name) -> std::optional<int> {
+            std::size_t functionBegin = loopStart;
+            while (functionBegin > 0 && ir[functionBegin - 1].op != IROp::FUNC_BEGIN) {
+              --functionBegin;
+            }
+            int definitions = 0;
+            std::optional<int> value;
+            for (std::size_t position = functionBegin; position < ir.size(); ++position) {
+              const IRInst& candidate = ir[position];
+              if (candidate.op == IROp::FUNC_END) {
+                break;
+              }
+              if (!candidate.dest.isLocalVar() || candidate.dest.name != name ||
+                  candidate.op == IROp::RETURN || candidate.op == IROp::PARAM ||
+                  (candidate.op == IROp::LOCAL_VAR_DECL && candidate.src1.isNone())) {
+                continue;
+              }
+              ++definitions;
+              if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                  candidate.src1.isImm()) {
+                value = candidate.src1.immVal;
+              } else {
+                value.reset();
+              }
+            }
+            return definitions == 1 ? value : std::nullopt;
+          };
+
+          const auto initial = findNearbyConstant(induction);
+          std::optional<int> upper;
+          if (condition.src2.isImm()) {
+            upper = condition.src2.immVal;
+          } else if (condition.src2.isLocalVar()) {
+            upper = findNearbyConstant(condition.src2.name);
+            if (!upper) {
+              upper = findUniqueConstant(condition.src2.name);
+            }
+          }
+          if (!initial || !upper || *initial < 0 ||
+              (condition.op == IROp::LE && *upper == INT32_MAX && *initial <= *upper)) {
+            continue;
+          }
+          std::int64_t trips = static_cast<std::int64_t>(*upper) - *initial;
+          if (condition.op == IROp::LE) {
+            ++trips;
+          }
+          trips = std::max<std::int64_t>(0, trips);
+          const std::int64_t finalInduction = static_cast<std::int64_t>(*initial) + trips;
+          if (trips < 2 || trips > INT32_MAX || finalInduction > INT32_MAX) {
+            continue;
+          }
+
+          std::unordered_map<std::string, PeriodicValue> values;
+          values[induction] = {PeriodicValue::Kind::INDUCTION, 0, 0, 0, 0};
+          const auto valueOf = [&](const Operand& operand) {
+            if (operand.isImm()) {
+              return PeriodicValue{PeriodicValue::Kind::CONSTANT, operand.immVal, 0, 0, 1};
+            }
+            if (operand.isLocalVar()) {
+              const auto found = values.find(operand.name);
+              if (found != values.end()) {
+                return found->second;
+              }
+              const auto constant = findUniqueConstant(operand.name);
+              if (constant) {
+                return PeriodicValue{PeriodicValue::Kind::CONSTANT, *constant, 0, 0, 1};
+              }
+            }
+            return PeriodicValue{};
+          };
+          const auto isInduction = [](const PeriodicValue& value) {
+            return value.kind == PeriodicValue::Kind::INDUCTION;
+          };
+          const auto absoluteDivisor = [](int divisor) {
+            return static_cast<std::uint64_t>(divisor < 0 ? -static_cast<std::int64_t>(divisor)
+                                                          : divisor);
+          };
+          const auto inductionRangeSafe = [&](int offset) {
+            const std::int64_t lowest = static_cast<std::int64_t>(*initial) + offset;
+            const std::int64_t highest = finalInduction - 1 + offset;
+            return lowest >= 0 && highest <= INT32_MAX;
+          };
+
+          bool bodySupported = true;
+          bool inductionIncremented = false;
+          int inductionWrites = 0;
+          std::unordered_set<std::string> written;
+          std::unordered_set<std::string> periodicDefinitions;
+          std::vector<PeriodicAccumulator> accumulators;
+          for (std::size_t position = loopStart + 2; position < condIndex && bodySupported;
+               ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+              continue;
+            }
+            if (!inst.dest.isLocalVar() || inductionIncremented) {
+              bodySupported = false;
+              break;
+            }
+            written.insert(inst.dest.name);
+
+            if (inst.dest.name == induction) {
+              ++inductionWrites;
+              inductionIncremented = inductionWrites == 1 && inst.op == IROp::ADD &&
+                                     inst.src1.isLocalVar() && inst.src1.name == induction &&
+                                     inst.src2.isImm() && inst.src2.immVal == 1;
+              if (!inductionIncremented) {
+                bodySupported = false;
+              }
+              continue;
+            }
+
+            const PeriodicValue lhs = valueOf(inst.src1);
+            const PeriodicValue rhs = valueOf(inst.src2);
+            const bool lhsSelf = inst.src1.isLocalVar() && inst.src1.name == inst.dest.name;
+            const bool rhsSelf = inst.src2.isLocalVar() && inst.src2.name == inst.dest.name;
+            const PeriodicValue& selfValue = lhsSelf ? lhs : rhs;
+            const PeriodicValue& deltaValue = lhsSelf ? rhs : lhs;
+            if ((inst.op == IROp::ADD || inst.op == IROp::SUB) && (lhsSelf || rhsSelf) &&
+                !(inst.op == IROp::SUB && rhsSelf) &&
+                selfValue.kind == PeriodicValue::Kind::UNKNOWN &&
+                deltaValue.kind == PeriodicValue::Kind::PERIODIC) {
+              const auto duplicate = std::find_if(accumulators.begin(), accumulators.end(),
+                                                  [&](const PeriodicAccumulator& accumulator) {
+                                                    return accumulator.name == inst.dest.name;
+                                                  });
+              if (duplicate != accumulators.end()) {
+                bodySupported = false;
+                break;
+              }
+              accumulators.push_back({inst.dest.name, lhsSelf ? inst.src2 : inst.src1,
+                                      inst.op == IROp::SUB ? -1 : 1, deltaValue.period});
+              values.erase(inst.dest.name);
+              continue;
+            }
+
+            PeriodicValue result;
+            if (inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) {
+              result = lhs;
+            } else if (inst.op == IROp::NOT) {
+              if (lhs.kind == PeriodicValue::Kind::CONSTANT) {
+                result = {PeriodicValue::Kind::CONSTANT, lhs.value == 0 ? 1 : 0, 0, 0, 1};
+              } else if (lhs.kind == PeriodicValue::Kind::PERIODIC) {
+                result = {PeriodicValue::Kind::PERIODIC, 0, 0, 0, lhs.period};
+              }
+            } else if (inst.op == IROp::ADD || inst.op == IROp::SUB) {
+              if (isInduction(lhs) && rhs.kind == PeriodicValue::Kind::CONSTANT) {
+                result = lhs;
+                result.offset =
+                    inst.op == IROp::ADD ? lhs.offset + rhs.value : lhs.offset - rhs.value;
+              } else if (inst.op == IROp::ADD && lhs.kind == PeriodicValue::Kind::CONSTANT &&
+                         isInduction(rhs)) {
+                result = rhs;
+                result.offset += lhs.value;
+              }
+            } else if (inst.op == IROp::DIV && isInduction(lhs) &&
+                       rhs.kind == PeriodicValue::Kind::CONSTANT && rhs.value != 0 &&
+                       rhs.value != 1 && rhs.value != -1 && rhs.value != INT32_MIN) {
+              if (inductionRangeSafe(lhs.offset)) {
+                result = {PeriodicValue::Kind::QUOTIENT, 0, lhs.offset, rhs.value, 0};
+              }
+            } else if (inst.op == IROp::MOD && isInduction(lhs) &&
+                       rhs.kind == PeriodicValue::Kind::CONSTANT && rhs.value != 0 &&
+                       rhs.value != 1 && rhs.value != -1 && rhs.value != INT32_MIN) {
+              const std::uint64_t period = absoluteDivisor(rhs.value);
+              if (period <= kMaxPeriodicPhases && inductionRangeSafe(lhs.offset)) {
+                result = {PeriodicValue::Kind::PERIODIC, 0, 0, 0, period};
+              }
+            } else if (inst.op == IROp::MUL) {
+              const PeriodicValue* quotient = nullptr;
+              const PeriodicValue* constant = nullptr;
+              if (lhs.kind == PeriodicValue::Kind::QUOTIENT &&
+                  rhs.kind == PeriodicValue::Kind::CONSTANT) {
+                quotient = &lhs;
+                constant = &rhs;
+              } else if (rhs.kind == PeriodicValue::Kind::QUOTIENT &&
+                         lhs.kind == PeriodicValue::Kind::CONSTANT) {
+                quotient = &rhs;
+                constant = &lhs;
+              }
+              if (quotient != nullptr && constant->value == quotient->divisor) {
+                result = {PeriodicValue::Kind::QUOTIENT_PRODUCT, 0, quotient->offset,
+                          quotient->divisor, 0};
+              }
+            }
+            if (inst.op == IROp::SUB && isInduction(lhs) &&
+                rhs.kind == PeriodicValue::Kind::QUOTIENT_PRODUCT && lhs.offset == rhs.offset) {
+              const std::uint64_t period = absoluteDivisor(rhs.divisor);
+              if (period <= kMaxPeriodicPhases) {
+                result = {PeriodicValue::Kind::PERIODIC, 0, 0, 0, period};
+              }
+            }
+
+            if (result.kind == PeriodicValue::Kind::UNKNOWN &&
+                (inst.op == IROp::ADD || inst.op == IROp::SUB || inst.op == IROp::MUL ||
+                 inst.op == IROp::DIV || inst.op == IROp::MOD || inst.op == IROp::LT ||
+                 inst.op == IROp::GT || inst.op == IROp::LE || inst.op == IROp::GE ||
+                 inst.op == IROp::EQ || inst.op == IROp::NE)) {
+              const bool lhsPeriodic = lhs.kind == PeriodicValue::Kind::CONSTANT ||
+                                       lhs.kind == PeriodicValue::Kind::PERIODIC;
+              const bool rhsPeriodic = rhs.kind == PeriodicValue::Kind::CONSTANT ||
+                                       rhs.kind == PeriodicValue::Kind::PERIODIC;
+              if (lhsPeriodic && rhsPeriodic) {
+                if (lhs.kind == PeriodicValue::Kind::CONSTANT &&
+                    rhs.kind == PeriodicValue::Kind::CONSTANT) {
+                  const auto folded = wrappedBinary(inst.op, lhs.value, rhs.value);
+                  if (folded) {
+                    result = {PeriodicValue::Kind::CONSTANT, *folded, 0, 0, 1};
+                  }
+                } else {
+                  const std::uint64_t period = combinePeriod(lhs.period, rhs.period);
+                  if (period != 0) {
+                    result = {PeriodicValue::Kind::PERIODIC, 0, 0, 0, period};
+                  }
+                }
+              }
+            }
+            if (result.kind == PeriodicValue::Kind::UNKNOWN) {
+              bodySupported = false;
+              break;
+            }
+            values[inst.dest.name] = result;
+            periodicDefinitions.insert(inst.dest.name);
+          }
+          if (!bodySupported || inductionWrites != 1 || !inductionIncremented ||
+              accumulators.empty() ||
+              (condition.src2.isLocalVar() && written.count(condition.src2.name) != 0)) {
+            continue;
+          }
+
+          std::uint64_t period = 1;
+          for (const PeriodicAccumulator& accumulator : accumulators) {
+            period = combinePeriod(period, accumulator.period);
+            if (period == 0) {
+              break;
+            }
+          }
+          if (period <= 1 || period > kMaxPeriodicPhases ||
+              static_cast<std::int64_t>(*initial) + static_cast<std::int64_t>(period) - 1 >
+                  INT32_MAX) {
+            continue;
+          }
+
+          const std::size_t loopEnd = condIndex + 3;
+          const auto usedAfterLoop = [&](const std::string& name) {
+            for (std::size_t position = loopEnd; position < ir.size(); ++position) {
+              const IRInst& inst = ir[position];
+              if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
+                break;
+              }
+              if ((inst.src1.isLocalVar() && inst.src1.name == name) ||
+                  (inst.src2.isLocalVar() && inst.src2.name == name) ||
+                  ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) && inst.dest.isLocalVar() &&
+                   inst.dest.name == name)) {
+                return true;
+              }
+            }
+            return false;
+          };
+          bool leaksPeriodicTemporary = false;
+          for (const std::string& name : periodicDefinitions) {
+            if (!isCompilerTemp(name) && usedAfterLoop(name)) {
+              leaksPeriodicTemporary = true;
+              break;
+            }
+          }
+          if (leaksPeriodicTemporary) {
+            continue;
+          }
+
+          std::vector<std::uint32_t> cycleDeltas(accumulators.size(), 0);
+          std::vector<std::vector<std::uint32_t>> phaseDeltas(
+              accumulators.size(), std::vector<std::uint32_t>(period, 0));
+          bool evaluated = true;
+          for (std::uint64_t phase = 0; phase < period && evaluated; ++phase) {
+            std::unordered_map<std::string, int> concrete;
+            concrete[induction] = *initial + static_cast<int>(phase);
+            const auto concreteValue = [&](const Operand& operand) -> std::optional<int> {
+              if (operand.isImm()) {
+                return operand.immVal;
+              }
+              if (operand.isLocalVar()) {
+                const auto found = concrete.find(operand.name);
+                if (found != concrete.end()) {
+                  return found->second;
+                }
+                return findUniqueConstant(operand.name);
+              }
+              return std::nullopt;
+            };
+            for (std::size_t position = loopStart + 2; position < condIndex && evaluated;
+                 ++position) {
+              const IRInst& inst = ir[position];
+              if ((inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) ||
+                  inst.dest.name == induction) {
+                continue;
+              }
+              const auto accumulator = std::find_if(accumulators.begin(), accumulators.end(),
+                                                    [&](const PeriodicAccumulator& candidate) {
+                                                      return candidate.name == inst.dest.name;
+                                                    });
+              if (accumulator != accumulators.end()) {
+                const auto delta = concreteValue(accumulator->delta);
+                if (!delta) {
+                  evaluated = false;
+                  break;
+                }
+                const std::size_t index =
+                    static_cast<std::size_t>(accumulator - accumulators.begin());
+                const std::uint32_t signedDelta = accumulator->sign > 0
+                                                      ? static_cast<std::uint32_t>(*delta)
+                                                      : 0u - static_cast<std::uint32_t>(*delta);
+                phaseDeltas[index][phase] = signedDelta;
+                cycleDeltas[index] += signedDelta;
+                continue;
+              }
+              if (!inst.dest.isLocalVar()) {
+                evaluated = false;
+                break;
+              }
+              const auto lhs = concreteValue(inst.src1);
+              if (!lhs) {
+                evaluated = false;
+                break;
+              }
+              std::optional<int> value;
+              if (inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) {
+                value = *lhs;
+              } else if (inst.op == IROp::NOT) {
+                value = *lhs == 0 ? 1 : 0;
+              } else {
+                const auto rhs = concreteValue(inst.src2);
+                if (rhs) {
+                  value = wrappedBinary(inst.op, *lhs, *rhs);
+                }
+              }
+              if (!value) {
+                evaluated = false;
+                break;
+              }
+              concrete[inst.dest.name] = *value;
+            }
+          }
+          if (!evaluated) {
+            continue;
+          }
+
+          std::vector<IRInst> replacement;
+          const std::uint64_t completePeriods = static_cast<std::uint64_t>(trips) / period;
+          const std::uint64_t remainder = static_cast<std::uint64_t>(trips) % period;
+          for (std::size_t index = 0; index < accumulators.size(); ++index) {
+            if (!usedAfterLoop(accumulators[index].name)) {
+              continue;
+            }
+            std::uint32_t delta = static_cast<std::uint32_t>(
+                static_cast<std::uint64_t>(cycleDeltas[index]) * completePeriods);
+            for (std::uint64_t phase = 0; phase < remainder; ++phase) {
+              delta += phaseDeltas[index][phase];
+            }
+            if (delta != 0) {
+              replacement.emplace_back(IROp::ADD, Operand::localVar(accumulators[index].name),
+                                       Operand::localVar(accumulators[index].name),
+                                       Operand::imm(static_cast<std::int32_t>(delta)));
+            }
+          }
+          if (usedAfterLoop(induction)) {
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(induction),
+                                     Operand::imm(static_cast<int>(finalInduction)),
+                                     Operand::none());
+          }
+
+          std::size_t eraseEnd = loopEnd;
+          if (eraseEnd < ir.size() && ir[eraseEnd].op == IROp::LABEL &&
+              ir[eraseEnd].dest.isLabel() && labelReferences[ir[eraseEnd].dest.name] == 0) {
+            ++eraseEnd;
+          }
+          ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(loopStart),
+                   ir.begin() + static_cast<std::ptrdiff_t>(eraseEnd));
+          ir.insert(ir.begin() + static_cast<std::ptrdiff_t>(loopStart), replacement.begin(),
+                    replacement.end());
+          summarized = true;
+          changed = true;
+        }
+        if (!summarized) {
+          break;
+        }
+      }
+    }
+
     // Pass 5.6: 汇总耦合仿射状态循环。
     //
     // Pass 5.5 只接受 `x' = x + affine(invariants, induction)`，因此会保守拒绝
@@ -4154,6 +4689,7 @@ void IRGenerator::optimizePass() {
     {
       using AffineRow = std::vector<std::uint32_t>;
       using AffineMatrix = std::vector<AffineRow>;
+      constexpr std::uint64_t kMaxPeriodicBranchPhases = 256;
 
       const auto identityMatrix = [](std::size_t dimension) {
         AffineMatrix identity(dimension, AffineRow(dimension, 0));
@@ -4361,6 +4897,10 @@ void IRGenerator::optimizePass() {
               if (found != symbolic.end()) {
                 return found->second;
               }
+              const auto constant = findUniqueConstant(operand.name);
+              if (constant) {
+                return PeriodicValue{PeriodicValue::Kind::CONSTANT, *constant, 0, 1};
+              }
             }
             return PeriodicValue{};
           };
@@ -4369,11 +4909,11 @@ void IRGenerator::optimizePass() {
               return 0;
             }
             const std::uint64_t divisor = gcd(lhs, rhs);
-            if (lhs > 64 / (rhs / divisor)) {
+            if (lhs > kMaxPeriodicBranchPhases / (rhs / divisor)) {
               return 0;
             }
             const std::uint64_t result = lhs * (rhs / divisor);
-            return result <= 64 ? result : 0;
+            return result <= kMaxPeriodicBranchPhases ? result : 0;
           };
 
           bool periodicProof = true;
@@ -4407,7 +4947,7 @@ void IRGenerator::optimizePass() {
                        rhs.value != 1 && rhs.value != -1 && rhs.value != INT32_MIN) {
               const std::uint64_t period = static_cast<std::uint64_t>(
                   rhs.value < 0 ? -static_cast<std::int64_t>(rhs.value) : rhs.value);
-              if (period <= 64) {
+              if (period <= kMaxPeriodicBranchPhases) {
                 result = {PeriodicValue::Kind::PERIODIC, 0, 0, period};
               }
             } else if (inst.op == IROp::MUL) {
@@ -4429,7 +4969,7 @@ void IRGenerator::optimizePass() {
                        rhs.kind == PeriodicValue::Kind::QUOTIENT_PRODUCT) {
               const std::uint64_t period = static_cast<std::uint64_t>(
                   rhs.divisor < 0 ? -static_cast<std::int64_t>(rhs.divisor) : rhs.divisor);
-              if (period <= 64) {
+              if (period <= kMaxPeriodicBranchPhases) {
                 result = {PeriodicValue::Kind::PERIODIC, 0, 0, period};
               }
             }
@@ -4470,7 +5010,7 @@ void IRGenerator::optimizePass() {
           const std::uint64_t period = guardSymbol->second.kind == PeriodicValue::Kind::CONSTANT
                                            ? 1
                                            : guardSymbol->second.period;
-          if (period == 0 || period > 64 ||
+          if (period == 0 || period > kMaxPeriodicBranchPhases ||
               static_cast<std::int64_t>(*initial) + static_cast<std::int64_t>(period) - 1 >
                   INT32_MAX) {
             continue;
@@ -4488,6 +5028,7 @@ void IRGenerator::optimizePass() {
                 if (found != values.end()) {
                   return found->second;
                 }
+                return findUniqueConstant(operand.name);
               }
               return std::nullopt;
             };

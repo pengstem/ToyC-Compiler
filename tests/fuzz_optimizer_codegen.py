@@ -228,6 +228,28 @@ def make_case(rng: random.Random, case_index: int) -> str:
             "  result = result + polynomial_sum + polynomial_i;",
         ]
     )
+    # A remainder-derived expression repeats after a finite number of phases.
+    # Exercise direct and helper-inlined shapes without overflowing signed int.
+    periodic_acc_start = rng.randint(0, 9)
+    periodic_acc_trips = rng.randint(2, 30)
+    periodic_acc_modulus = rng.randint(2, 19)
+    periodic_acc_output_modulus = rng.randint(2, 17)
+    periodic_acc_linear = rng.randint(-3, 4)
+    periodic_acc_bias = rng.randint(-7, 9)
+    lines.extend(
+        [
+            f"  int periodic_acc_i = {periodic_acc_start};",
+            "  int periodic_acc_sum = result;",
+            f"  while (periodic_acc_i < {periodic_acc_start + periodic_acc_trips}) {{",
+            f"    int periodic_acc_r = periodic_acc_i % {periodic_acc_modulus};",
+            "    periodic_acc_sum = periodic_acc_sum + "
+            f"(periodic_acc_r * periodic_acc_r + periodic_acc_r * {periodic_acc_linear} + "
+            f"{periodic_acc_bias}) % {periodic_acc_output_modulus};",
+            "    periodic_acc_i = periodic_acc_i + 1;",
+            "  }",
+            "  result = result + periodic_acc_sum + periodic_acc_i;",
+        ]
+    )
     lines.append("  result = result % 251;")
     lines.append("  if (result < 0) { result = result + 251; }")
     lines.extend(["  return result;", "}"])
