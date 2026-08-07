@@ -2,7 +2,7 @@ int main() {
     int i = 0;
     int live = 0;
     while (i < 12) {
-        if (i < 6) {
+        if (i < 6 && live < 1000) {
             live = live + i * 3;
         } else {
             live = live - i;

@@ -1846,6 +1846,7 @@ void IRGenerator::optimizePass() {
         std::size_t joinIndex;
         std::unordered_set<std::string> conditionVars;
         std::unordered_set<std::string> controlledDefs;
+        std::unordered_set<std::size_t> controlledBranches;
       };
 
       std::unordered_map<std::string, std::size_t> labelPositions;
@@ -1888,6 +1889,8 @@ void IRGenerator::optimizePass() {
         bool removableControl = true;
         std::unordered_set<std::string> controlledLabels;
         std::unordered_set<std::string> controlledDefs;
+        std::unordered_set<std::string> conditionVars;
+        std::unordered_set<std::size_t> controlledBranches;
         for (std::size_t index = branchIndex + 1; index < joinIndex && removableControl; ++index) {
           const IRInst& inst = ir[index];
           const bool pureLocalDefinition =
@@ -1907,6 +1910,15 @@ void IRGenerator::optimizePass() {
             // 内部控制流也必须严格向前；嵌套循环或 continue/break 会改变终止性。
             removableControl = target != labelPositions.end() && target->second > index &&
                                target->second <= joinIndex;
+            if (removableControl && (inst.op == IROp::BEQZ || inst.op == IROp::BNEZ)) {
+              controlledBranches.insert(index);
+              if (inst.src1.isLocalVar()) {
+                conditionVars.insert(inst.src1.name);
+              }
+              if (inst.src2.isLocalVar()) {
+                conditionVars.insert(inst.src2.name);
+              }
+            }
             continue;
           }
           removableControl = false;
@@ -1936,15 +1948,18 @@ void IRGenerator::optimizePass() {
           continue;
         }
 
-        StructuredIf candidate{branchIndex, joinIndex, {}, std::move(controlledDefs)};
+        StructuredIf candidate{branchIndex, joinIndex, std::move(conditionVars),
+                               std::move(controlledDefs), std::move(controlledBranches)};
         if (branch.src1.isLocalVar()) {
           candidate.conditionVars.insert(branch.src1.name);
         }
         if (branch.src2.isLocalVar()) {
           candidate.conditionVars.insert(branch.src2.name);
         }
+        candidate.controlledBranches.insert(branchIndex);
+        suppressBranchRoots.insert(candidate.controlledBranches.begin(),
+                                   candidate.controlledBranches.end());
         structuredIfs.push_back(std::move(candidate));
-        suppressBranchRoots.insert(branchIndex);
       }
 
       std::unordered_map<std::string, std::unordered_set<std::string>> dependencies;

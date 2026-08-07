@@ -96,7 +96,7 @@ def make_case(rng: random.Random, case_index: int) -> str:
     lines.append("    int c = b;")
     lines.append("    sum = (sum + c + v1 * v2) % 10007;")
     lines.append("    v1 = (v1 + 3) % 997;")
-    lines.append("    if (dead0 < dead1) {")
+    lines.append("    if (dead0 < dead1 && dead0 > -997) {")
     lines.append("      dead0 = (dead0 * 3 + dead1 + i) % 997;")
     lines.append("    } else {")
     lines.append("      dead0 = (dead0 * 7 - dead1 + i) % 991;")
