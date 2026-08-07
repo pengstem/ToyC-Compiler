@@ -2274,29 +2274,6 @@ void IRGenerator::optimizePass() {
           continue;
         }
 
-        // 上界可以保持不变，也可以自身按常量步长移动；后者必须用 i-bound
-        // 的相对闭合速度计算迭代次数。任何依赖其他循环状态的上界都不摘要。
-        std::int32_t boundStep = 0;
-        if (condition.src2.isLocalVar()) {
-          const auto boundPosition = variableIndex.find(condition.src2.name);
-          if (boundPosition == variableIndex.end()) {
-            continue;
-          }
-          const auto& boundRow = transform[boundPosition->second];
-          bool canonicalBound = true;
-          for (std::size_t column = 0; column < constantColumn; ++column) {
-            const std::uint32_t expected = column == boundPosition->second ? 1u : 0u;
-            if (boundRow[column] != expected) {
-              canonicalBound = false;
-              break;
-            }
-          }
-          if (!canonicalBound) {
-            continue;
-          }
-          boundStep = static_cast<std::int32_t>(boundRow[constantColumn]);
-        }
-
         const auto findConstantBefore = [&](const std::string& name) -> std::optional<int> {
           for (std::size_t position = scan; position > 0; --position) {
             const auto& previous = ir[position - 1];
@@ -2383,40 +2360,21 @@ void IRGenerator::optimizePass() {
         const std::int64_t initial = *inductionInitial;
         const std::int64_t limit = *bound;
         const std::int64_t signedStep = step;
-        const std::int64_t signedBoundStep = boundStep;
         std::uint64_t tripCount = 0;
         if (condition.op == IROp::LT && initial < limit) {
-          const std::int64_t closingStep = signedStep - signedBoundStep;
-          if (closingStep <= 0) {
-            continue;
-          }
-          tripCount = static_cast<std::uint64_t>((limit - initial + closingStep - 1) / closingStep);
+          tripCount = static_cast<std::uint64_t>((limit - initial + signedStep - 1) / signedStep);
         } else if (condition.op == IROp::LE && initial <= limit) {
-          const std::int64_t closingStep = signedStep - signedBoundStep;
-          if (closingStep <= 0) {
-            continue;
-          }
-          tripCount = static_cast<std::uint64_t>((limit - initial) / closingStep + 1);
+          tripCount = static_cast<std::uint64_t>((limit - initial) / signedStep + 1);
         } else if (condition.op == IROp::GT && initial > limit) {
-          const std::int64_t closingStep = signedBoundStep - signedStep;
-          if (closingStep <= 0) {
-            continue;
-          }
-          tripCount = static_cast<std::uint64_t>((initial - limit + closingStep - 1) / closingStep);
+          const std::int64_t magnitude = -signedStep;
+          tripCount = static_cast<std::uint64_t>((initial - limit + magnitude - 1) / magnitude);
         } else if (condition.op == IROp::GE && initial >= limit) {
-          const std::int64_t closingStep = signedBoundStep - signedStep;
-          if (closingStep <= 0) {
-            continue;
-          }
-          tripCount = static_cast<std::uint64_t>((initial - limit) / closingStep + 1);
+          tripCount = static_cast<std::uint64_t>((initial - limit) / (-signedStep) + 1);
         }
         const std::int64_t finalInduction =
             initial + signedStep * static_cast<std::int64_t>(tripCount);
-        const std::int64_t finalBound =
-            limit + signedBoundStep * static_cast<std::int64_t>(tripCount);
-        if (finalInduction < INT32_MIN || finalInduction > INT32_MAX || finalBound < INT32_MIN ||
-            finalBound > INT32_MAX) {
-          continue; // 归纳变量或上界环绕会改变有符号比较的终止行为
+        if (finalInduction < INT32_MIN || finalInduction > INT32_MAX) {
+          continue; // 归纳变量环绕会改变有符号比较的终止行为
         }
 
         AffineMatrix power = transform;

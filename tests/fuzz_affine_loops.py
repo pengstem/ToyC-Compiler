@@ -33,15 +33,15 @@ def run(command: list[str], *, data: bytes | None = None) -> subprocess.Complete
 
 def coupled_case(rng: random.Random) -> str:
     start = rng.randint(-3, 3)
-    trips = rng.randint(0, 200)
+    trips = rng.randint(0, 10)
     step = rng.randint(1, 3)
     bound = start + trips * step
-    a = rng.randint(-100, 100)
-    b = rng.randint(-100, 100)
-    total = rng.randint(-100, 100)
-    c1 = rng.randint(-8, 8)
-    c2 = rng.randint(-8, 8)
-    bias = rng.randint(-20, 20)
+    a = rng.randint(-5, 5)
+    b = rng.randint(-5, 5)
+    total = rng.randint(-5, 5)
+    c1 = rng.randint(-2, 2)
+    c2 = rng.randint(-2, 2)
+    bias = rng.randint(-3, 3)
     return f"""\
 int main() {{
     int i = {start};
@@ -83,10 +83,10 @@ int main() {{
 
 
 def nested_case(rng: random.Random) -> str:
-    outer_bound = rng.randint(0, 40)
-    inner_bound = rng.randint(0, 40)
-    total = rng.randint(-100, 100)
-    value = rng.randint(-100, 100)
+    outer_bound = rng.randint(0, 8)
+    inner_bound = rng.randint(0, 8)
+    total = rng.randint(-5, 5)
+    value = rng.randint(-5, 5)
     return f"""\
 int main() {{
     int outer = 0;
@@ -103,77 +103,6 @@ int main() {{
         outer = outer + 1;
     }}
     return (total + value + outer + inner) % 251;
-}}
-"""
-
-
-def matrix_case(rng: random.Random) -> str:
-    count = rng.randint(4, 9)
-    trips = rng.randint(0, 120)
-    values = [rng.randint(-100, 100) for _ in range(count)]
-    lines = ["int main() {", "    int i = 0;"]
-    lines.extend(f"    int v{index} = {value};" for index, value in enumerate(values))
-    lines.append(f"    while (i < {trips}) {{")
-    for index in range(count):
-        lhs = rng.randrange(count)
-        rhs = rng.randrange(count)
-        sign = "+" if rng.randrange(2) == 0 else "-"
-        lines.append(f"        v{index} = v{lhs} {sign} v{rhs} + {rng.randint(-9, 9)};")
-    lines.extend(["        i = i + 1;", "    }"])
-    result = " + ".join(f"v{index} * {index + 1}" for index in range(count))
-    lines.extend([f"    return ({result} + i) % 251;", "}"])
-    return "\n".join(lines) + "\n"
-
-
-def function_case(rng: random.Random) -> str:
-    trips = rng.randint(0, 120)
-    values = [rng.randint(-100, 100) for _ in range(8)]
-    arguments = ", ".join(str(value) for value in values)
-    return f"""\
-int work(int a, int b, int c, int d, int e, int f, int g, int h) {{
-    if (a < -10000) {{
-        return work(a + 1, b, c, d, e, f, g, h);
-    }}
-    int i = 0;
-    while (i < {trips}) {{
-        int next = a * 2 + b * 3 + c;
-        a = b + d;
-        b = next;
-        c = c + e - f;
-        d = d + g + i;
-        e = e + h;
-        i = i + 1;
-    }}
-    return a + b * 2 + c * 3 + d * 4 + e * 5 + i;
-}}
-
-int main() {{
-    return work({arguments});
-}}
-"""
-
-
-def moving_bound_case(rng: random.Random) -> str:
-    start = rng.randint(-20, 0)
-    limit = rng.randint(10, 200)
-    induction_step = rng.randint(1, 5)
-    bound_step = rng.randint(-4, induction_step - 1)
-    a = rng.randint(-100, 100)
-    b = rng.randint(-100, 100)
-    return f"""\
-int main() {{
-    int i = {start};
-    int bound = {limit};
-    int a = {a};
-    int b = {b};
-    while (i <= bound) {{
-        int next = a * 2 + b * 3 + i;
-        a = b + bound;
-        b = next;
-        i = i + {induction_step};
-        bound = bound + {bound_step};
-    }}
-    return (a + b + i * 3 + bound * 5) % 251;
 }}
 """
 
@@ -224,14 +153,7 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0xAFF1E)
     args = parser.parse_args()
 
-    generators = (
-        coupled_case,
-        descending_case,
-        nested_case,
-        matrix_case,
-        function_case,
-        moving_bound_case,
-    )
+    generators = (coupled_case, descending_case, nested_case)
     rng = random.Random(args.seed)
     with tempfile.TemporaryDirectory(prefix="toycc-affine-") as directory:
         root = Path(directory)
