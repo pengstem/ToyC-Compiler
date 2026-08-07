@@ -7,27 +7,6 @@
 #include <optional>
 #include <unordered_set>
 
-// Windows clang 目标未链接 compiler-rt，128 位除法缺 __divti3 运行时；
-// 提供经典长除法实现（Pass 6 平方和闭式化使用，除数 6 远小于 2^127，
-// 不会触到 INT128_MIN 取负溢出的边界）
-#if defined(_WIN32) && defined(__clang__)
-extern "C" __int128 __divti3(__int128 dividend, __int128 divisor);
-extern "C" __int128 __divti3(__int128 dividend, __int128 divisor) {
-  const bool neg = (dividend < 0) != (divisor < 0);
-  unsigned __int128 a = dividend < 0 ? -(unsigned __int128) dividend : (unsigned __int128) dividend;
-  unsigned __int128 b = divisor < 0 ? -(unsigned __int128) divisor : (unsigned __int128) divisor;
-  unsigned __int128 q = 0, r = 0;
-  for (int i = 127; i >= 0; --i) {
-    r = (r << 1) | ((a >> i) & 1);
-    if (r >= b) {
-      r -= b;
-      q |= (unsigned __int128) 1 << i;
-    }
-  }
-  return neg ? -(__int128) q : (__int128) q;
-}
-#endif
-
 namespace toycc {
 
 IRGenerator::IRGenerator(SymbolTable& st)
@@ -1740,7 +1719,7 @@ void IRGenerator::optimizePass() {
     // 在无控制流的直线代码段内，若 (op, src1, src2) 已计算过且操作数未在块内被重新定义，
     // 则复用之前的结果。用户变量可被重新赋值，须跟踪重定义并使相关条目失效。
     {
-      std::unordered_map<std::string, std::string> rename; // 原名 → 复用名（仅临时变量）
+      std::unordered_map<std::string, std::string> rename;   // 原名 → 复用名（仅临时变量）
       std::unordered_map<std::string, std::string> valueMap; // (op,src1,src2) → 结果变量
       std::unordered_map<std::string, std::vector<std::string>> varKeys; // 变量 → 引用它的 key
       std::vector<IRInst> optimized;
@@ -2453,8 +2432,8 @@ void IRGenerator::optimizePass() {
               // 临时变量必须是循环变量的线性函数：t = i*c, t = i+c, t = i, t = c 等。
               struct AccVar {
                 std::string name;
-                int step;     // 每次迭代的常量增量（可正可负）
-                int indCoeff; // 循环变量系数（0=不加循环变量, +1/-1=加/减循环变量）
+                int step;          // 每次迭代的常量增量（可正可负）
+                int indCoeff;      // 循环变量系数（0=不加循环变量, +1/-1=加/减循环变量）
                 int quadCoeff = 0; // i² 系数（b += i*i 类平方累加）
               };
               // 临时变量的多项式表示：value = quadCoeff*i*i + indCoeff*i + constOffset
@@ -2675,27 +2654,27 @@ void IRGenerator::optimizePass() {
                 }
                 const bool ran = isLT ? (indInit < upper) : (indInit <= upper);
                 const int indFinal = ran ? upper : indInit;
-                // 计算每个累加变量的最终值（__int128 防溢出：结果截断 int32，
+                // 计算每个累加变量的最终值（long long 防溢出：结果截断 int32，
                 // 与逐迭代 int 回绕的 mod 2^32 语义一致）
                 for (std::size_t a = 0; a < accVars.size(); ++a) {
-                  __int128 fin = accFinals[a].second;
-                  fin += static_cast<__int128>(accVars[a].step) * trips;
+                  long long fin = accFinals[a].second;
+                  fin += static_cast<long long>(accVars[a].step) * trips;
                   if (trips > 0) {
-                    const __int128 T = trips;
+                    const long long T = trips;
                     // 等差数列求和：s += i 时，i 从 indInit 到 indInit+trips-1
-                    // sum = trips*indInit + trips*(trips-1)/2（/2 用移位，避免 __divti3）
-                    const __int128 s1 = T * indInit + ((T * (T - 1)) >> 1);
+                    // sum = trips*indInit + trips*(trips-1)/2（/2 用移位）
+                    const long long s1 = T * indInit + ((T * (T - 1)) >> 1);
                     if (accVars[a].indCoeff != 0) {
-                      fin += static_cast<__int128>(accVars[a].indCoeff) * s1;
+                      fin += static_cast<long long>(accVars[a].indCoeff) * s1;
                     }
                     // 平方和：s += i*i 时，sum = T*indInit^2 + 2*indInit*T(T-1)/2
                     // + T(T-1)(2T-1)/6
                     if (accVars[a].quadCoeff != 0) {
-                      const __int128 s2 =
-                          T * static_cast<__int128>(indInit) * indInit +
-                          2 * static_cast<__int128>(indInit) * ((T * (T - 1)) >> 1) +
+                      const long long s2 =
+                          T * static_cast<long long>(indInit) * indInit +
+                          2 * static_cast<long long>(indInit) * ((T * (T - 1)) >> 1) +
                           T * (T - 1) * (2 * T - 1) / 6;
-                      fin += static_cast<__int128>(accVars[a].quadCoeff) * s2;
+                      fin += static_cast<long long>(accVars[a].quadCoeff) * s2;
                     }
                   }
                   accFinals[a].second =
