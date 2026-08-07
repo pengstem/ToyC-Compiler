@@ -86,6 +86,7 @@ perf/t_overwritten_dead_store.c
 perf/t_hot_constants.c
 perf/t_nested_affine_summary.c
 perf/t_coupled_affine_summary.c
+perf/t_nested_reset_affine_summary.c
 perf/t_periodic_affine_branch.c
 perf/t_polynomial_accumulator_summary.c
 perf/t_quotient_accumulator_summary.c
@@ -101,6 +102,7 @@ regression/f19_many_arguments.c
 regression/f19_forwarding.c
 regression/pair_unroll_bounds.c
 regression/loop_summary_moving_bound.c
+regression/coupled_reset_dependency_safety.c
 regression/dead_inclusive_overflow_loop.c
 regression/dead_call_moving_loop_safety.c
 regression/dead_branched_loop_safety.c

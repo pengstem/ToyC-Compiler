@@ -463,6 +463,10 @@ if(TOYCC_BUILD_TESTS)
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_coupled_affine_summary.py"
           --compiler "$<TARGET_FILE:toycc>"
           --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_coupled_affine_summary.c"
+          --reset-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_nested_reset_affine_summary.c"
+          --must-keep-reset-dependency-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/coupled_reset_dependency_safety.c"
       )
       set_tests_properties(toycc.perf.coupled-affine-summary-codegen PROPERTIES
         LABELS "toycc;performance;codegen"

@@ -255,6 +255,39 @@ def make_case(rng: random.Random, case_index: int) -> str:
             "  result = result + coupled_a + coupled_b + coupled_total + ci;",
         ]
     )
+    # Nested coupled recurrences reset the inner state on every outer
+    # iteration. The outer affine summary may compose with the inner one only
+    # when those reset variables' entry values are fully killed.
+    reset_outer_trips = rng.randint(2, 7)
+    reset_inner_trips = rng.randint(2, 5)
+    reset_a_initial = rng.randint(-3, 5)
+    reset_b_initial = rng.randint(-3, 5)
+    reset_i_coeff = rng.randint(-2, 2)
+    reset_total_coeff = rng.choice((-2, -1, 1, 2))
+    lines.extend(
+        [
+            "  int reset_i = 0;",
+            "  int reset_j = 0;",
+            "  int reset_a = 0;",
+            "  int reset_b = 0;",
+            "  int reset_total = result;",
+            f"  while (reset_i < {reset_outer_trips}) {{",
+            f"    reset_a = {reset_a_initial};",
+            f"    reset_b = {reset_b_initial};",
+            "    reset_j = 0;",
+            f"    while (reset_j < {reset_inner_trips}) {{",
+            "      int reset_next = reset_a + reset_b + "
+            f"reset_i * {reset_i_coeff};",
+            "      reset_a = reset_b;",
+            "      reset_b = reset_next;",
+            "      reset_j = reset_j + 1;",
+            "    }",
+            f"    reset_total = reset_total + reset_a * {reset_total_coeff} - reset_b;",
+            "    reset_i = reset_i + 1;",
+            "  }",
+            "  result = result + reset_a + reset_b + reset_total + reset_j;",
+        ]
+    )
     # A modulo-controlled affine branch has a finite phase period. The optimizer
     # may summarize a whole period, but must preserve sequential assignments and
     # the phase implied by a non-zero induction start.

@@ -6210,26 +6210,6 @@ void IRGenerator::optimizePass() {
             continue;
           }
 
-          // 不跨越“每轮把用户状态重置为常量”的循环做二次摘要。这种形态通常
-          // 来自 Pass 5.5 已删除的内层循环；保留外层回边可避免把两个独立证明
-          // 组合成一个更强但尚未验证的嵌套状态证明。编译器临时的常量定义不算
-          // 循环状态，直接的耦合递推仍由本 Pass 处理。
-          bool resetsUserState = false;
-          for (const std::string& name : written) {
-            if (name == induction || isCompilerTemp(name)) {
-              continue;
-            }
-            const auto position = variableIndex.find(name);
-            if (position != variableIndex.end() &&
-                rowIsConstant(transform[position->second], constantColumn)) {
-              resetsUserState = true;
-              break;
-            }
-          }
-          if (resetsUserState) {
-            continue;
-          }
-
           const std::size_t inductionIndex = variableIndex.at(induction);
           const AffineRow& inductionRow = transform[inductionIndex];
           bool canonicalInduction = inductionRow[constantColumn] == 1;
@@ -6256,6 +6236,34 @@ void IRGenerator::optimizePass() {
             }
             return false;
           };
+
+          // 内层摘要常把自己的归纳状态改写为常量，例如外层每轮执行 `j = 0`
+          // 后，已闭式化的内层最终写回 `j = 5`。只有当该 reset 状态的入口旧值
+          // 对所有循环后可观察行的矩阵系数都为 0 时，才跨层继续摘要；这证明旧
+          // 状态已在本轮被完全杀死。若旧值仍流入任一结果，则保留外层回边。
+          bool resetStateIsKilled = true;
+          for (const std::string& name : written) {
+            if (name == induction || isCompilerTemp(name)) {
+              continue;
+            }
+            const std::size_t resetIndex = variableIndex.at(name);
+            if (!rowIsConstant(transform[resetIndex], constantColumn)) {
+              continue;
+            }
+            for (std::size_t rowIndex = 0; rowIndex < variables.size(); ++rowIndex) {
+              if (written.count(variables[rowIndex]) != 0 && usedAfterLoop(variables[rowIndex]) &&
+                  transform[rowIndex][resetIndex] != 0) {
+                resetStateIsKilled = false;
+                break;
+              }
+            }
+            if (!resetStateIsKilled) {
+              break;
+            }
+          }
+          if (!resetStateIsKilled) {
+            continue;
+          }
 
           bool hasCoupledObservableState = false;
           for (const std::string& name : written) {
