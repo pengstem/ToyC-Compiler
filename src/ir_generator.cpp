@@ -7,6 +7,27 @@
 #include <optional>
 #include <unordered_set>
 
+// Windows clang 目标未链接 compiler-rt，128 位除法缺 __divti3 运行时；
+// 提供经典长除法实现（Pass 6 平方和闭式化使用，除数 6 远小于 2^127，
+// 不会触到 INT128_MIN 取负溢出的边界）
+#if defined(_WIN32) && defined(__clang__)
+extern "C" __int128 __divti3(__int128 dividend, __int128 divisor);
+extern "C" __int128 __divti3(__int128 dividend, __int128 divisor) {
+  const bool neg = (dividend < 0) != (divisor < 0);
+  unsigned __int128 a = dividend < 0 ? -(unsigned __int128) dividend : (unsigned __int128) dividend;
+  unsigned __int128 b = divisor < 0 ? -(unsigned __int128) divisor : (unsigned __int128) divisor;
+  unsigned __int128 q = 0, r = 0;
+  for (int i = 127; i >= 0; --i) {
+    r = (r << 1) | ((a >> i) & 1);
+    if (r >= b) {
+      r -= b;
+      q |= (unsigned __int128) 1 << i;
+    }
+  }
+  return neg ? -(__int128) q : (__int128) q;
+}
+#endif
+
 namespace toycc {
 
 IRGenerator::IRGenerator(SymbolTable& st)
@@ -665,7 +686,8 @@ bool isPureCondInst(const IRInst& inst) {
 // ============================================================
 
 void IRGenerator::inlinePass() {
-  constexpr std::size_t kInlineLimit = 24;
+  // 注意：此处在 optimizePass 之前运行，函数体大小基于未优化 IR
+  constexpr std::size_t kInlineLimit = 64;
 
   // 多轮迭代：内联可能引入新的可内联调用（如 f(g(x))）。
   // 每轮重新收集函数区间，因为前一轮的内联替换会使旧下标失效。
@@ -1291,7 +1313,10 @@ void IRGenerator::optimizePass() {
         };
         for (std::size_t idx = blocks[k].first; idx <= blocks[k].second; ++idx) {
           IRInst& inst = ir[idx];
-          if (inst.op != IROp::BEQZ && inst.op != IROp::BNEZ) {
+          if (inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) {
+            // 分支条件也参与传播：常量条件由 Pass 0a 折叠
+            resolveOperand(inst.src1, false);
+          } else {
             resolveOperand(inst.src1, false);
             resolveOperand(inst.src2, isCompareOp(inst.op));
           }
@@ -1315,6 +1340,81 @@ void IRGenerator::optimizePass() {
             copyMap[inst.dest.name] = inst.src1.name;
           }
         }
+      }
+    }
+
+    // Pass 0a: 立即数条件分支折叠（while(1)/if(1) 等生成的条件是字面量时，
+    // 恒真 → 无条件 BRANCH，恒假 → 删除，避免每轮循环多发射 li+bnez 两条指令）
+    {
+      for (std::size_t i = 0; i < ir.size();) {
+        IRInst& inst = ir[i];
+        if ((inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) && inst.src1.isImm()) {
+          const bool cond = inst.src1.immVal != 0;
+          const bool taken = (inst.op == IROp::BEQZ) ? !cond : cond;
+          if (taken) {
+            inst.op = IROp::BRANCH;
+            inst.src1 = Operand::none();
+            inst.src2 = Operand::none();
+          } else {
+            ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(i));
+            continue; // 删除后不递增：下一条指令移到 i
+          }
+          changed = true;
+        }
+        ++i;
+      }
+    }
+
+    // Pass 0a2: 跳板折叠——"LABEL Lx: BRANCH Ly" 是纯跳板，把所有跳入 Lx 的
+    // 跳转改指 Ly，再删除跳板。消除循环反转/break 结构留下的多余一跳
+    // （如 exp10 的 "BEQZ L3; ...; LABEL L3: BRANCH L0"）。
+    {
+      // 收集跳板链（Lx → Ly，迭代至稳定以处理连续跳板）
+      std::unordered_map<std::string, std::string> jumpThru;
+      for (std::size_t i = 0; i + 1 < ir.size(); ++i) {
+        if (ir[i].op == IROp::LABEL && ir[i + 1].op == IROp::BRANCH && ir[i + 1].dest.isLabel()) {
+          jumpThru[ir[i].dest.name] = ir[i + 1].dest.name;
+        }
+      }
+      bool thChanged = true;
+      while (thChanged) {
+        thChanged = false;
+        for (auto& inst : ir) {
+          if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+              inst.dest.isLabel()) {
+            auto it = jumpThru.find(inst.dest.name);
+            if (it != jumpThru.end() && it->second != inst.dest.name) {
+              inst.dest = Operand::label(it->second);
+              thChanged = true;
+              changed = true;
+            }
+          }
+        }
+      }
+      // 删除纯跳板（仅当无 fall-through 前驱：从 Lx 往前跳过 LABEL 是终结指令）
+      const auto hasFallThroughPred = [&](std::size_t i) {
+        std::size_t p = i;
+        while (p > 0) {
+          --p;
+          if (ir[p].op == IROp::LABEL) {
+            continue;
+          }
+          const bool term = ir[p].op == IROp::BRANCH || ir[p].op == IROp::BEQZ ||
+                            ir[p].op == IROp::BNEZ || ir[p].op == IROp::RETURN ||
+                            ir[p].op == IROp::FUNC_END;
+          return !term;
+        }
+        return false; // 函数开头：无前驱
+      };
+      for (std::size_t i = 0; i < ir.size();) {
+        if (ir[i].op == IROp::LABEL && i + 1 < ir.size() && ir[i + 1].op == IROp::BRANCH &&
+            ir[i + 1].dest.isLabel() && !hasFallThroughPred(i)) {
+          ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(i),
+                   ir.begin() + static_cast<std::ptrdiff_t>(i) + 2);
+          changed = true;
+          continue;
+        }
+        ++i;
       }
     }
 
@@ -1825,6 +1925,198 @@ void IRGenerator::optimizePass() {
       }
     }
 
+    // Pass 5.5: do-while 循环规范化（while(1)+break 的产物）
+    // 形态：LABEL Lb; <body>; CMP t, x, #N; BEQZ/BNEZ Lb（尾部回跳循环头，
+    // 检查点落在 body 之后，Pass 3 反转不识别）。当首次检查恒真（归纳变量
+    // 初值与上限均为编译期常量且必然继续）、循环头无外部跳入且为 fall-through
+    // 唯一入口时，等价转换为标准反转循环：
+    //   BRANCH Lc; LABEL Lb; <body>; LABEL Lc; CMP'(取反) t,x,N; BNEZ Lb
+    // 使 Pass 6（闭式消除）/LICM/Pass 7 能识别。首次检查恒真是等价的充分条件：
+    // 原语义"先执行 body 再检查"与转换后"先检查再执行 body"在首次必然通过时一致。
+    {
+      // 与 Pass 6 相同的初值查找：从位置向前扫描同一基本块内最近的定义
+      const auto findConstInit = [&](std::size_t li, const std::string& name, int& value) {
+        for (std::size_t k = li; k > 0; --k) {
+          const IRInst& prev = ir[k - 1];
+          if (prev.dest.isLocalVar() && prev.dest.name == name) {
+            const bool constInit =
+                (prev.op == IROp::ASSIGN || prev.op == IROp::LOCAL_VAR_DECL) && prev.src1.isImm();
+            if (constInit) {
+              value = prev.src1.immVal;
+              return true;
+            }
+            return false; // 定义不是常量初始化，无法确认初值
+          }
+          if (prev.op == IROp::LABEL || prev.op == IROp::BRANCH || prev.op == IROp::BEQZ ||
+              prev.op == IROp::BNEZ || prev.op == IROp::CALL) {
+            return false;
+          }
+        }
+        return false;
+      };
+      std::vector<IRInst> optimized;
+      std::size_t li = 0;
+      bool normChanged = false;
+      while (li < ir.size()) {
+        bool handled = false;
+        if (ir[li].op == IROp::LABEL) {
+          const std::string bodyLabel = ir[li].dest.name;
+          // 循环头之前（跳过 LABEL）必须是 fall-through（非终结指令）
+          std::size_t p = li;
+          bool fallThru = true;
+          while (p > 0 && ir[p - 1].op == IROp::LABEL) {
+            --p;
+          }
+          if (p > 0) {
+            const auto& prev = ir[p - 1];
+            const bool term = prev.op == IROp::BRANCH || prev.op == IROp::BEQZ ||
+                              prev.op == IROp::BNEZ || prev.op == IROp::RETURN ||
+                              prev.op == IROp::FUNC_END;
+            fallThru = !term;
+          }
+          // 向后找回跳 BEQZ/BNEZ 循环头；回跳前一条必须是 CMP
+          std::size_t j = li + 1;
+          std::size_t backIdx = 0;
+          for (; j < ir.size(); ++j) {
+            const auto& inst = ir[j];
+            if ((inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) && inst.dest.isLabel() &&
+                inst.dest.name == bodyLabel) {
+              backIdx = j;
+              break;
+            }
+            if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
+              break; // 跨函数停止（body 内的嵌套循环标签由 bodyOk 检查拒绝）
+            }
+          }
+          // 无外部跳入（转换会把循环语义改为先检查后执行，跳入方会跳过检查；
+          // 回跳 backIdx 本身除外）
+          bool noJumpIn = backIdx > 0;
+          for (std::size_t k = 0; k < ir.size() && noJumpIn; ++k) {
+            if (k == li || k == backIdx) {
+              continue;
+            }
+            const auto& inst = ir[k];
+            if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+                inst.dest.isLabel() && inst.dest.name == bodyLabel) {
+              noJumpIn = false;
+            }
+          }
+          if (fallThru && noJumpIn) {
+            if (backIdx > li + 1) {
+              const IRInst& cmp = ir[backIdx - 1];
+              const bool isCmpOp = cmp.op == IROp::LT || cmp.op == IROp::LE || cmp.op == IROp::GT ||
+                                   cmp.op == IROp::GE || cmp.op == IROp::EQ || cmp.op == IROp::NE;
+              if (isCmpOp && cmp.src1.isLocalVar()) {
+                // 继续条件归一到 LT/LE 语义：
+                // BEQZ 回跳 → 继续 = !CMP；BNEZ 回跳 → 继续 = CMP
+                // 继续 = "i < N"：BNEZ+LT 或 BEQZ+GE；继续 = "i <= N"：BNEZ+LE 或 BEQZ+GT
+                bool isLT = false;
+                bool isLE = false;
+                if (ir[backIdx].op == IROp::BNEZ && (cmp.op == IROp::LT || cmp.op == IROp::LE)) {
+                  isLT = (cmp.op == IROp::LT);
+                  isLE = (cmp.op == IROp::LE);
+                } else if (ir[backIdx].op == IROp::BEQZ &&
+                           (cmp.op == IROp::GE || cmp.op == IROp::GT)) {
+                  isLT = (cmp.op == IROp::GE); // !GE = LT
+                  isLE = (cmp.op == IROp::GT); // !GT = LE
+                }
+                if (isLT || isLE) {
+                  int indInit = 0;
+                  const bool initKnown = findConstInit(li, cmp.src1.name, indInit);
+                  int upper = 0;
+                  bool upperKnown = false;
+                  if (cmp.src2.isImm()) {
+                    upper = cmp.src2.immVal;
+                    upperKnown = true;
+                  } else if (cmp.src2.isLocalVar()) {
+                    upperKnown = findConstInit(li, cmp.src2.name, upper);
+                  }
+                  const bool firstPasses =
+                      initKnown && upperKnown && (isLT ? indInit < upper : indInit <= upper);
+                  if (firstPasses) {
+                    // body 必须为直线代码，且 body 内 LABEL 不得被循环外引用
+                    bool bodyOk = true;
+                    std::unordered_set<std::string> innerLabels;
+                    for (std::size_t k = li + 1; k + 1 < backIdx; ++k) {
+                      const auto& inst = ir[k];
+                      if (inst.op == IROp::LABEL) {
+                        innerLabels.insert(inst.dest.name);
+                      } else if (inst.op == IROp::BRANCH || inst.op == IROp::BEQZ ||
+                                 inst.op == IROp::BNEZ || inst.op == IROp::CALL ||
+                                 inst.op == IROp::LOAD || inst.op == IROp::STORE ||
+                                 inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
+                        bodyOk = false;
+                        break;
+                      }
+                    }
+                    for (std::size_t k = 0; k < ir.size() && bodyOk; ++k) {
+                      const auto& inst = ir[k];
+                      if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ ||
+                           inst.op == IROp::BNEZ) &&
+                          inst.dest.isLabel() && innerLabels.count(inst.dest.name) > 0) {
+                        bodyOk = false; // 跳转引用 body 内标签（LABEL 自身是定义，不算）
+                      }
+                    }
+                    if (bodyOk) {
+                      // 转换：BRANCH Lc + 循环头 + body（去 LABEL）+ LABEL Lc + 取反 CMP + BNEZ Lb
+                      const std::string condLabel = newLabel();
+                      optimized.push_back(IRInst(IROp::BRANCH, Operand::label(condLabel),
+                                                 Operand::none(), Operand::none()));
+                      for (std::size_t k = li; k + 1 < backIdx; ++k) {
+                        if (k != li && ir[k].op == IROp::LABEL) {
+                          continue; // 删除 body 内无引用标签（循环头标签保留）
+                        }
+                        optimized.push_back(ir[k]);
+                      }
+                      optimized.push_back(IRInst(IROp::LABEL, Operand::label(condLabel),
+                                                 Operand::none(), Operand::none()));
+                      IRInst cmpCopy = cmp;
+                      switch (cmpCopy.op) {
+                      case IROp::GE:
+                        cmpCopy.op = IROp::LT;
+                        break;
+                      case IROp::GT:
+                        cmpCopy.op = IROp::LE;
+                        break;
+                      case IROp::LE:
+                        cmpCopy.op = IROp::GT;
+                        break;
+                      case IROp::LT:
+                        cmpCopy.op = IROp::GE;
+                        break;
+                      case IROp::EQ:
+                        cmpCopy.op = IROp::NE;
+                        break;
+                      default:
+                        cmpCopy.op = IROp::EQ;
+                        break;
+                      }
+                      optimized.push_back(cmpCopy);
+                      // BNEZ 的条件是取反后比较的结果（cmp.dest）
+                      optimized.push_back(IRInst(IROp::BNEZ, Operand::label(bodyLabel),
+                                                 Operand::localVar(cmp.dest.name),
+                                                 Operand::none()));
+                      li = backIdx + 1;
+                      normChanged = true;
+                      handled = true;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (!handled) {
+          optimized.push_back(ir[li]);
+          ++li;
+        }
+      }
+      if (normChanged) {
+        ir = std::move(optimized);
+        changed = true;
+      }
+    }
+
     // Pass 4: 循环不变代码外提（LICM）
     // 针对反转后的循环结构：
     //   BRANCH Lc; LABEL Lb; <body>; LABEL Lc; <cond>; BNEZ Lb
@@ -2163,11 +2455,14 @@ void IRGenerator::optimizePass() {
                 std::string name;
                 int step;     // 每次迭代的常量增量（可正可负）
                 int indCoeff; // 循环变量系数（0=不加循环变量, +1/-1=加/减循环变量）
+                int quadCoeff = 0; // i² 系数（b += i*i 类平方累加）
               };
-              // 临时变量的线性表示：value = indCoeff * i + constOffset
+              // 临时变量的多项式表示：value = quadCoeff*i*i + indCoeff*i + constOffset
+              // （quadCoeff 放末尾：现有 {indCoeff, constOffset} 初始化列表不受影响）
               struct TempLin {
                 int indCoeff = 0;
                 int constOffset = 0;
+                int quadCoeff = 0;
               };
               std::unordered_map<std::string, TempLin> tempLinMap;
               std::vector<AccVar> accVars;
@@ -2216,10 +2511,18 @@ void IRGenerator::optimizePass() {
                     if (l1 && l2) {
                       TempLin tl;
                       if (ir[k].op == IROp::MUL) {
-                        // t = L1 * L2：两边都含归纳变量则非线性
-                        if (l1->indCoeff != 0 && l2->indCoeff != 0) {
-                          // 不作为线性临时变量，交给后续检查
+                        // t = L1 * L2 多项式乘法（至多二次：线性×线性、二次×常量；
+                        // 三次/四次组合不支持，交由后续检查）
+                        const bool high1 = l1->quadCoeff != 0;
+                        const bool high2 = l2->quadCoeff != 0;
+                        const bool nonConst1 = l1->indCoeff != 0;
+                        const bool nonConst2 = l2->indCoeff != 0;
+                        if ((high1 && (high2 || nonConst2)) || (high2 && nonConst1)) {
+                          // 三次/四次：不作为临时变量，交给后续检查
                         } else {
+                          tl.quadCoeff = l1->quadCoeff * l2->constOffset +
+                                         l2->quadCoeff * l1->constOffset +
+                                         l1->indCoeff * l2->indCoeff; // 线性×线性 → i² 项
                           tl.indCoeff =
                               l1->indCoeff * l2->constOffset + l2->indCoeff * l1->constOffset;
                           tl.constOffset = l1->constOffset * l2->constOffset;
@@ -2229,11 +2532,13 @@ void IRGenerator::optimizePass() {
                       } else if (ir[k].op == IROp::ADD) {
                         tl.indCoeff = l1->indCoeff + l2->indCoeff;
                         tl.constOffset = l1->constOffset + l2->constOffset;
+                        tl.quadCoeff = l1->quadCoeff + l2->quadCoeff;
                         tempLinMap[d.name] = tl;
                         continue;
                       } else if (ir[k].op == IROp::SUB) {
                         tl.indCoeff = l1->indCoeff - l2->indCoeff;
                         tl.constOffset = l1->constOffset - l2->constOffset;
+                        tl.quadCoeff = l1->quadCoeff - l2->quadCoeff;
                         tempLinMap[d.name] = tl;
                         continue;
                       } else { // ASSIGN：t = L1
@@ -2283,6 +2588,7 @@ void IRGenerator::optimizePass() {
                       int sign = (ir[k].op == IROp::ADD) ? 1 : -1;
                       acc.indCoeff += sign * tit->second.indCoeff;
                       acc.step += sign * tit->second.constOffset;
+                      acc.quadCoeff += sign * tit->second.quadCoeff;
                       matched = true;
                       break;
                     }
@@ -2329,6 +2635,7 @@ void IRGenerator::optimizePass() {
                     int sign = (ir[k].op == IROp::ADD) ? 1 : -1;
                     acc.indCoeff = sign * tit->second.indCoeff;
                     acc.step = sign * tit->second.constOffset;
+                    acc.quadCoeff = sign * tit->second.quadCoeff;
                     accVars.push_back(acc);
                     continue;
                   }
@@ -2368,16 +2675,31 @@ void IRGenerator::optimizePass() {
                 }
                 const bool ran = isLT ? (indInit < upper) : (indInit <= upper);
                 const int indFinal = ran ? upper : indInit;
-                // 计算每个累加变量的最终值
+                // 计算每个累加变量的最终值（__int128 防溢出：结果截断 int32，
+                // 与逐迭代 int 回绕的 mod 2^32 语义一致）
                 for (std::size_t a = 0; a < accVars.size(); ++a) {
-                  accFinals[a].second += accVars[a].step * trips;
-                  // 等差数列求和：s += i 时，i 从 indInit 到 indInit+trips-1
-                  // sum = trips*indInit + trips*(trips-1)/2
-                  if (accVars[a].indCoeff != 0 && trips > 0) {
-                    long long sum = static_cast<long long>(trips) * indInit +
-                                    static_cast<long long>(trips) * (trips - 1) / 2;
-                    accFinals[a].second += accVars[a].indCoeff * static_cast<int>(sum);
+                  __int128 fin = accFinals[a].second;
+                  fin += static_cast<__int128>(accVars[a].step) * trips;
+                  if (trips > 0) {
+                    const __int128 T = trips;
+                    // 等差数列求和：s += i 时，i 从 indInit 到 indInit+trips-1
+                    // sum = trips*indInit + trips*(trips-1)/2（/2 用移位，避免 __divti3）
+                    const __int128 s1 = T * indInit + ((T * (T - 1)) >> 1);
+                    if (accVars[a].indCoeff != 0) {
+                      fin += static_cast<__int128>(accVars[a].indCoeff) * s1;
+                    }
+                    // 平方和：s += i*i 时，sum = T*indInit^2 + 2*indInit*T(T-1)/2
+                    // + T(T-1)(2T-1)/6
+                    if (accVars[a].quadCoeff != 0) {
+                      const __int128 s2 =
+                          T * static_cast<__int128>(indInit) * indInit +
+                          2 * static_cast<__int128>(indInit) * ((T * (T - 1)) >> 1) +
+                          T * (T - 1) * (2 * T - 1) / 6;
+                      fin += static_cast<__int128>(accVars[a].quadCoeff) * s2;
+                    }
                   }
+                  accFinals[a].second =
+                      static_cast<int>(static_cast<unsigned long long>(fin) & 0xFFFFFFFFULL);
                 }
                 // 循环后变量是否被使用（决定是否保留赋值）
                 const auto usedAfter = [&](const std::string& name) {

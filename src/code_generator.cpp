@@ -22,6 +22,18 @@ int alignTo(int value, int alignment) {
   return value + alignment - remainder;
 }
 
+// 寄存器槽位 → 寄存器名：2-11 → s2-s11（callee-saved），12-19 → a0-a7
+// （caller-saved，仅无调用函数可作长寿命变量池，见 analyzeStackFrame）
+std::string slotToReg(int slot) {
+  if (slot >= 2 && slot <= 11) {
+    return "s" + std::to_string(slot);
+  }
+  if (slot >= 12 && slot <= 19) {
+    return "a" + std::to_string(slot - 12);
+  }
+  return std::string();
+}
+
 // Hacker's Delight magc：计算正数除数 d（2 <= d <= 2^31-1，非 2 的幂）的
 // magic number M 与 shift s，使 q = (mulh(x,M) [+ x]) >> s - (x>>31) 等于 x/d。
 bool computeSignedDivMagic(int32_t d, uint32_t& magic, int32_t& shift) {
@@ -151,7 +163,8 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
 
   int localIndex = 0;
   int maxOverflowArgs = 0;
-  int nextReg = 2; // s2-s11 可用于局部变量分配
+  int nextReg = 2;                    // 2-11: s2-s11；12-19: a0-a7（见下方分配策略）
+  std::vector<std::string> paramVars; // 按声明顺序的形参 IR 名
 
   // 第一遍：收集所有局部变量
   std::vector<std::string> varOrder; // 保持插入顺序
@@ -209,10 +222,17 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
   // 全局变量使用频率（仅当函数无函数调用时启用寄存器分配，避免跨调用同步）
   std::unordered_map<std::string, int> globalUseFreq;
   bool hasCall = false;
+  bool hasParams = false;
   for (std::size_t i = function.begin; i < function.end; ++i) {
     const auto& inst = ir_[i];
     if (inst.op == IROp::CALL) {
       hasCall = true;
+    }
+    if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isParam()) {
+      hasParams = true;
+    }
+    if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isParam()) {
+      paramVars.push_back(inst.dest.name);
     }
     if (inst.src1.isLocalVar()) {
       useFreq[inst.src1.name]++;
@@ -232,6 +252,42 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
     if (inst.dest.isGlobalVar()) {
       globalUseFreq[inst.dest.name]++;
     }
+  }
+
+  // 自尾调用检测：存在 CALL 且所有 CALL 目标都是本函数、且每个自调用点
+  // 都是真正的尾调用（CALL 后紧跟 RETURN，如 return f(n-1)；而非
+  // f(n-1) + f(n-2) 这种调用后仍有计算的递归）。尾递归被转成自跳转循环后，
+  // 每迭代重复"参数→变量寄存器→参数"的搬运；参数变量直接驻留 a0-a7 时
+  // 搬运自动省略（同寄存器 mv 被剔除），循环直接在参数寄存器上运算，
+  // 消除 4 条/迭代的 mv 往返
+  bool selfTailCall = false;
+  {
+    bool hasCallAny = false;
+    bool allSelfTail = true;
+    for (std::size_t i = function.begin; i < function.end; ++i) {
+      const auto& callInst = ir_[i];
+      if (callInst.op == IROp::CALL) {
+        hasCallAny = true;
+        if (!callInst.src1.isFunc() || callInst.src1.name != function.name) {
+          allSelfTail = false;
+          continue;
+        }
+        // 自调用点必须是尾调用（与 detectTailCalls 的判定一致）：
+        // CALL 后立即是 RETURN，且 RETURN 返回 CALL 的结果（或无返回值）
+        const auto& next = ir_[i + 1];
+        bool tailReturn = false;
+        if (callInst.dest.isLocalVar()) {
+          tailReturn = next.op == IROp::RETURN && next.dest.isLocalVar() &&
+                       next.dest.name == callInst.dest.name;
+        } else if (callInst.dest.isNone()) {
+          tailReturn = next.op == IROp::RETURN && next.dest.isNone();
+        }
+        if (!tailReturn) {
+          allSelfTail = false;
+        }
+      }
+    }
+    selfTailCall = hasCallAny && allSelfTail;
   }
 
   // 按使用频率降序排列，优先为高频变量分配寄存器（循环计数器等）
@@ -353,19 +409,50 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
     }
   }
 
-  // 为前 10 个高频局部变量分配 s2-s11 寄存器
+  // 自尾调用：形参变量优先进 a 池对应槽位（12+i ↔ a0+i），其余变量随后分配
+  if (selfTailCall) {
+    for (std::size_t p = 0; p < paramVars.size() && p < 8; ++p) {
+      const int slot = 12 + static_cast<int>(p);
+      if (frame.tempRegs.find(paramVars[p]) == frame.tempRegs.end()) {
+        frame.regAlloc[paramVars[p]] = slot;
+      }
+    }
+  }
+
+  // 为高频局部变量分配长寿命寄存器：
+  //  - 所有函数：s2-s11（callee-saved，有调用也安全）
+  //  - 无调用且无参数函数：额外使用 a0-a7。函数内没有 CALL 指令，caller-saved
+  //    寄存器不会被嵌套破坏；入口无参数（a0-a7 未被参数占用），返回时 a0 只在
+  //    RETURN 语句发射前一刻被写入（之后函数退出），故 a0-a7 可安全作变量池。
+  //    注意 t0-t2 是发射逻辑的 scratch 寄存器（loadOperand/emitCompareInto 等），
+  //    不能入池
+  const auto slotTaken = [&](int slot) {
+    for (const auto& kv : frame.regAlloc) {
+      if (kv.second == slot) {
+        return true;
+      }
+    }
+    return false;
+  };
   for (const auto& varName : varOrder) {
     if (frame.tempRegs.find(varName) != frame.tempRegs.end()) {
-      continue; // 已分配到 t 寄存器，不再占用 s 寄存器
+      continue; // 已分配到 t 寄存器，不再占用长寿命寄存器
     }
-    if (nextReg <= 11) {
+    if (frame.regAlloc.find(varName) != frame.regAlloc.end()) {
+      continue; // 已分配（自尾调用的形参变量）
+    }
+    const bool canUseA = (!hasCall && !hasParams) || selfTailCall;
+    while (nextReg <= 19 && slotTaken(nextReg)) {
+      ++nextReg;
+    }
+    if (nextReg <= 11 || (canUseA && nextReg <= 19)) {
       frame.regAlloc[varName] = nextReg++;
     }
   }
 
   // 全局变量寄存器分配：仅当函数无函数调用时（调用者可能修改全局变量，寄存器中的
-  // 副本会失效），把高频全局变量放入剩余的 s 寄存器，函数入口加载、出口存回，
-  // 循环内对全局的访问从 la+lw/sw（6 条指令）降为寄存器直用
+  // 副本会失效），把高频全局变量放入未被局部变量占用的 s 寄存器，函数入口加载、
+  // 出口存回，循环内对全局的访问从 la+lw/sw（6 条指令）降为寄存器直用
   if (!hasCall) {
     std::vector<std::string> globalOrder;
     for (const auto& entry : globalUseFreq) {
@@ -375,10 +462,17 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
                      [&](const std::string& a, const std::string& b) {
                        return globalUseFreq[a] > globalUseFreq[b];
                      });
+    int globalReg = 2;
     for (const auto& name : globalOrder) {
-      if (nextReg <= 11) {
-        frame.globalRegAlloc[name] = nextReg++;
+      while (globalReg <= 11 &&
+             std::any_of(frame.regAlloc.begin(), frame.regAlloc.end(),
+                         [globalReg](const auto& kv) { return kv.second == globalReg; })) {
+        ++globalReg;
       }
+      if (globalReg > 11) {
+        break;
+      }
+      frame.globalRegAlloc[name] = globalReg++;
     }
   }
 
@@ -1831,7 +1925,7 @@ bool CodeGenerator::isDestInReg(const Operand& dest) const {
 std::string CodeGenerator::regForVar(const std::string& name) const {
   auto it = frame_.regAlloc.find(name);
   if (it != frame_.regAlloc.end()) {
-    return "s" + std::to_string(it->second);
+    return slotToReg(it->second);
   }
   auto tit = frame_.tempRegs.find(name);
   if (tit != frame_.tempRegs.end()) {
