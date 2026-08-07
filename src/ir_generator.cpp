@@ -7,6 +7,32 @@
 #include <optional>
 #include <unordered_set>
 
+// 128 位整数：__extension__ 修饰抑制 GCC -Wpedantic/-Werror 对 __int128
+// 扩展类型的告警（CI 门禁）。Pass 6 平方和闭式化使用：trips 为 int32，
+// 平方和 T(T-1)(2T-1)/6 在 trips=2^31 时约 2^92，long long（2^63）必溢出。
+__extension__ typedef __int128 i128;
+__extension__ typedef unsigned __int128 u128;
+// Windows clang 目标未链接 compiler-rt，128 位除法缺 __divti3 运行时；
+// 提供经典长除法实现（除数 6 远小于 2^127，不会触到 INT128_MIN 取负溢出
+// 的边界）。
+#if defined(_WIN32) && defined(__clang__)
+extern "C" i128 __divti3(i128 dividend, i128 divisor);
+extern "C" i128 __divti3(i128 dividend, i128 divisor) {
+  const bool neg = (dividend < 0) != (divisor < 0);
+  u128 a = dividend < 0 ? -(u128) dividend : (u128) dividend;
+  u128 b = divisor < 0 ? -(u128) divisor : (u128) divisor;
+  u128 q = 0, r = 0;
+  for (int i = 127; i >= 0; --i) {
+    r = (r << 1) | ((a >> i) & 1);
+    if (r >= b) {
+      r -= b;
+      q |= (u128) 1 << i;
+    }
+  }
+  return neg ? -(i128) q : (i128) q;
+}
+#endif
+
 namespace toycc {
 
 IRGenerator::IRGenerator(SymbolTable& st)
@@ -1388,10 +1414,33 @@ void IRGenerator::optimizePass() {
       for (std::size_t i = 0; i < ir.size();) {
         if (ir[i].op == IROp::LABEL && i + 1 < ir.size() && ir[i + 1].op == IROp::BRANCH &&
             ir[i + 1].dest.isLabel() && !hasFallThroughPred(i)) {
-          ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(i),
-                   ir.begin() + static_cast<std::ptrdiff_t>(i) + 2);
-          changed = true;
-          continue;
+          // 跳板 Lx 前的连续 LABEL（恒假分支删除后残留的孤立标签）只对
+          // Lx 做过重定向；若这些标签仍被其他跳转引用，删除跳板会让跳入
+          // 方从"跳 Ly"变成"落入后续代码"，语义改变——此时保守保留跳板
+          bool labelJumpedIn = false;
+          std::size_t p = i;
+          while (p > 0 && ir[p - 1].op == IROp::LABEL) {
+            --p;
+          }
+          if (p != i) {
+            std::unordered_set<std::string> labels;
+            for (std::size_t q = p; q <= i; ++q) {
+              labels.insert(ir[q].dest.name);
+            }
+            for (const auto& inst : ir) {
+              if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+                  inst.dest.isLabel() && labels.count(inst.dest.name) > 0) {
+                labelJumpedIn = true;
+                break;
+              }
+            }
+          }
+          if (!labelJumpedIn) {
+            ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(i),
+                     ir.begin() + static_cast<std::ptrdiff_t>(i) + 2);
+            changed = true;
+            continue;
+          }
         }
         ++i;
       }
@@ -1927,8 +1976,9 @@ void IRGenerator::optimizePass() {
             return false; // 定义不是常量初始化，无法确认初值
           }
           if (prev.op == IROp::LABEL || prev.op == IROp::BRANCH || prev.op == IROp::BEQZ ||
-              prev.op == IROp::BNEZ || prev.op == IROp::CALL) {
-            return false;
+              prev.op == IROp::BNEZ || prev.op == IROp::CALL || prev.op == IROp::RETURN ||
+              prev.op == IROp::FUNC_BEGIN || prev.op == IROp::FUNC_END) {
+            return false; // 基本块/函数边界：初值不在同一直线路径上
           }
         }
         return false;
@@ -2050,26 +2100,31 @@ void IRGenerator::optimizePass() {
                       optimized.push_back(IRInst(IROp::LABEL, Operand::label(condLabel),
                                                  Operand::none(), Operand::none()));
                       IRInst cmpCopy = cmp;
-                      switch (cmpCopy.op) {
-                      case IROp::GE:
-                        cmpCopy.op = IROp::LT;
-                        break;
-                      case IROp::GT:
-                        cmpCopy.op = IROp::LE;
-                        break;
-                      case IROp::LE:
-                        cmpCopy.op = IROp::GT;
-                        break;
-                      case IROp::LT:
-                        cmpCopy.op = IROp::GE;
-                        break;
-                      case IROp::EQ:
-                        cmpCopy.op = IROp::NE;
-                        break;
-                      default:
-                        cmpCopy.op = IROp::EQ;
-                        break;
+                      if (ir[backIdx].op == IROp::BEQZ) {
+                        // BEQZ 回跳：继续 = !CMP，反转形态用取反后的 CMP
+                        // 作 BNEZ 条件（继续 = CMP' = !CMP）
+                        switch (cmpCopy.op) {
+                        case IROp::GE:
+                          cmpCopy.op = IROp::LT;
+                          break;
+                        case IROp::GT:
+                          cmpCopy.op = IROp::LE;
+                          break;
+                        case IROp::LE:
+                          cmpCopy.op = IROp::GT;
+                          break;
+                        case IROp::LT:
+                          cmpCopy.op = IROp::GE;
+                          break;
+                        case IROp::EQ:
+                          cmpCopy.op = IROp::NE;
+                          break;
+                        default:
+                          cmpCopy.op = IROp::EQ;
+                          break;
+                        }
                       }
+                      // BNEZ 回跳：继续 = CMP，反转形态保持 CMP 不变
                       optimized.push_back(cmpCopy);
                       // BNEZ 的条件是取反后比较的结果（cmp.dest）
                       optimized.push_back(IRInst(IROp::BNEZ, Operand::label(bodyLabel),
@@ -2393,8 +2448,9 @@ void IRGenerator::optimizePass() {
             return false; // 定义不是常量初始化，无法确认初值
           }
           if (prev.op == IROp::LABEL || prev.op == IROp::BRANCH || prev.op == IROp::BEQZ ||
-              prev.op == IROp::BNEZ || prev.op == IROp::CALL) {
-            return false;
+              prev.op == IROp::BNEZ || prev.op == IROp::CALL || prev.op == IROp::RETURN ||
+              prev.op == IROp::FUNC_BEGIN || prev.op == IROp::FUNC_END) {
+            return false; // 基本块/函数边界：初值不在同一直线路径上
           }
         }
         return false;
@@ -2657,24 +2713,26 @@ void IRGenerator::optimizePass() {
                 // 计算每个累加变量的最终值（long long 防溢出：结果截断 int32，
                 // 与逐迭代 int 回绕的 mod 2^32 语义一致）
                 for (std::size_t a = 0; a < accVars.size(); ++a) {
-                  long long fin = accFinals[a].second;
-                  fin += static_cast<long long>(accVars[a].step) * trips;
+                  // 128 位精度：trips 为 int32，平方和 T(T-1)(2T-1)/6 在
+                  // trips=2^31 时约 2^92，long long（2^63）必溢出且回绕后
+                  // 再除 6 不再与逐迭代 mod 2^32 语义一致
+                  i128 fin = accFinals[a].second;
+                  fin += static_cast<i128>(accVars[a].step) * trips;
                   if (trips > 0) {
-                    const long long T = trips;
+                    const i128 T = trips;
                     // 等差数列求和：s += i 时，i 从 indInit 到 indInit+trips-1
                     // sum = trips*indInit + trips*(trips-1)/2（/2 用移位）
-                    const long long s1 = T * indInit + ((T * (T - 1)) >> 1);
+                    const i128 s1 = T * indInit + ((T * (T - 1)) >> 1);
                     if (accVars[a].indCoeff != 0) {
-                      fin += static_cast<long long>(accVars[a].indCoeff) * s1;
+                      fin += static_cast<i128>(accVars[a].indCoeff) * s1;
                     }
                     // 平方和：s += i*i 时，sum = T*indInit^2 + 2*indInit*T(T-1)/2
                     // + T(T-1)(2T-1)/6
                     if (accVars[a].quadCoeff != 0) {
-                      const long long s2 =
-                          T * static_cast<long long>(indInit) * indInit +
-                          2 * static_cast<long long>(indInit) * ((T * (T - 1)) >> 1) +
-                          T * (T - 1) * (2 * T - 1) / 6;
-                      fin += static_cast<long long>(accVars[a].quadCoeff) * s2;
+                      const i128 s2 = T * static_cast<i128>(indInit) * indInit +
+                                      2 * static_cast<i128>(indInit) * ((T * (T - 1)) >> 1) +
+                                      T * (T - 1) * (2 * T - 1) / 6;
+                      fin += static_cast<i128>(accVars[a].quadCoeff) * s2;
                     }
                   }
                   accFinals[a].second =

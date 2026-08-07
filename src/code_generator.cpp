@@ -106,6 +106,10 @@ void CodeGenerator::generate(const std::vector<IRInst>& ir, std::ostream& out) {
   currentFunction_.clear();
   currentParamIndex_ = 0;
 
+  // 禁用链接器 relax：RISC-V 默认 -mrelax 会把全局符号的 la 折叠成
+  // gp 相对寻址（addi rd, gp, off），要求 _start 先初始化 gp；OJ/外部
+  // 链接脚本无此约定，折叠后访问越界。.option norelax 使该文件不参与 relax。
+  emitRaw(out, "    .option norelax\n");
   emitGlobalData(out);
   emitRaw(out, "    .text\n");
 
