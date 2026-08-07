@@ -2033,6 +2033,448 @@ void IRGenerator::optimizePass() {
     }
   }
 
+  // Pass 4.5: 常数次数仿射循环摘要。
+  //
+  // 对直线循环体构造一次迭代的增广线性变换 state' = M * state（所有
+  // 系数按 RV32 的 2^32 模运算），再以矩阵快速幂求 M^N。生成的仍是普通
+  // 三地址算术，而不是在编译期执行源程序或预计算 main 的返回值。内层循环
+  // 会先变成直线变换，下一轮扫描即可继续摘要外层矩形循环。
+  {
+    using AffineRow = std::vector<std::uint32_t>;
+    using AffineMatrix = std::vector<AffineRow>;
+
+    const auto multiplyMatrices = [](const AffineMatrix& lhs, const AffineMatrix& rhs) {
+      const std::size_t dimension = lhs.size();
+      AffineMatrix product(dimension, AffineRow(dimension, 0));
+      for (std::size_t row = 0; row < dimension; ++row) {
+        for (std::size_t pivot = 0; pivot < dimension; ++pivot) {
+          if (lhs[row][pivot] == 0) {
+            continue;
+          }
+          for (std::size_t column = 0; column < dimension; ++column) {
+            product[row][column] += static_cast<std::uint32_t>(
+                static_cast<std::uint64_t>(lhs[row][pivot]) * rhs[pivot][column]);
+          }
+        }
+      }
+      return product;
+    };
+
+    const auto identityMatrix = [](std::size_t dimension) {
+      AffineMatrix identity(dimension, AffineRow(dimension, 0));
+      for (std::size_t i = 0; i < dimension; ++i) {
+        identity[i][i] = 1;
+      }
+      return identity;
+    };
+
+    bool summarizedAny = true;
+    while (summarizedAny) {
+      summarizedAny = false;
+
+      // 单一定义的立即数可跨反转循环的标签安全使用（LICM 提升的上限通常
+      // 位于外层循环之前）；有其他定义的变量仍要求在当前基本块找到最近初值。
+      std::unordered_map<std::string, int> uniqueConstants;
+      std::unordered_set<std::string> nonUniqueConstants;
+      for (const auto& inst : ir) {
+        if (!inst.dest.isLocalVar() || inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
+          continue;
+        }
+        const bool constantDefinition =
+            (inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) && inst.src1.isImm();
+        auto [found, inserted] =
+            uniqueConstants.emplace(inst.dest.name, constantDefinition ? inst.src1.immVal : 0);
+        if (!inserted || !constantDefinition) {
+          nonUniqueConstants.insert(inst.dest.name);
+        }
+      }
+      for (const auto& name : nonUniqueConstants) {
+        uniqueConstants.erase(name);
+      }
+
+      std::unordered_map<std::string, int> labelReferenceCount;
+      for (const auto& inst : ir) {
+        if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+            inst.dest.isLabel()) {
+          ++labelReferenceCount[inst.dest.name];
+        }
+      }
+
+      // 从后向前寻找，保证嵌套结构先处理最内层。
+      for (std::size_t scan = ir.size(); scan-- > 0 && !summarizedAny;) {
+        if (ir[scan].op != IROp::BRANCH || !ir[scan].dest.isLabel() || scan + 1 >= ir.size() ||
+            ir[scan + 1].op != IROp::LABEL || !ir[scan + 1].dest.isLabel()) {
+          continue;
+        }
+
+        const std::string condLabel = ir[scan].dest.name;
+        const std::string bodyLabel = ir[scan + 1].dest.name;
+        if (labelReferenceCount[condLabel] != 1 || labelReferenceCount[bodyLabel] != 1) {
+          continue; // continue、额外入口或非规范控制流
+        }
+
+        std::size_t condIndex = scan + 2;
+        while (condIndex < ir.size() &&
+               !(ir[condIndex].op == IROp::LABEL && ir[condIndex].dest.isLabel() &&
+                 ir[condIndex].dest.name == condLabel)) {
+          ++condIndex;
+        }
+        if (condIndex + 2 >= ir.size()) {
+          continue;
+        }
+        const IRInst& condition = ir[condIndex + 1];
+        const IRInst& backedge = ir[condIndex + 2];
+        if (backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
+            backedge.dest.name != bodyLabel || !backedge.src1.isLocalVar() ||
+            !condition.dest.isLocalVar() || condition.dest.name != backedge.src1.name) {
+          continue;
+        }
+        if (condition.op != IROp::LT && condition.op != IROp::LE && condition.op != IROp::GT &&
+            condition.op != IROp::GE) {
+          continue;
+        }
+        if (!condition.src1.isLocalVar()) {
+          continue;
+        }
+
+        // 循环体必须是无副作用直线算术。声明本身可保留为状态维的一部分，
+        // 但数组/全局/调用/除模/控制流均使证明失败。
+        std::vector<std::string> variables;
+        std::unordered_map<std::string, std::size_t> variableIndex;
+        const auto addVariable = [&](const Operand& operand) {
+          if (operand.isLocalVar() && variableIndex.find(operand.name) == variableIndex.end()) {
+            variableIndex[operand.name] = variables.size();
+            variables.push_back(operand.name);
+          }
+        };
+
+        bool bodySupported = condIndex > scan + 2;
+        for (std::size_t index = scan + 2; index < condIndex && bodySupported; ++index) {
+          const auto& inst = ir[index];
+          switch (inst.op) {
+          case IROp::LOCAL_VAR_DECL:
+          case IROp::ASSIGN:
+          case IROp::ADD:
+          case IROp::SUB:
+          case IROp::MUL:
+            break;
+          default:
+            bodySupported = false;
+            continue;
+          }
+          if (!inst.dest.isLocalVar()) {
+            bodySupported = false;
+            continue;
+          }
+          const Operand* operands[3] = {&inst.dest, &inst.src1, &inst.src2};
+          for (const Operand* operand : operands) {
+            if (!operand->isNone() && !operand->isImm() && !operand->isLocalVar()) {
+              bodySupported = false;
+              break;
+            }
+            addVariable(*operand);
+          }
+        }
+        addVariable(condition.src1);
+        addVariable(condition.src2);
+        if (!bodySupported || variables.empty() || variables.size() > 24) {
+          continue;
+        }
+
+        const std::size_t constantColumn = variables.size();
+        const std::size_t dimension = variables.size() + 1;
+        AffineMatrix transform = identityMatrix(dimension);
+        const auto rowForOperand = [&](const Operand& operand) -> std::optional<AffineRow> {
+          AffineRow row(dimension, 0);
+          if (operand.isImm()) {
+            row[constantColumn] = static_cast<std::uint32_t>(operand.immVal);
+            return row;
+          }
+          if (operand.isLocalVar()) {
+            const auto found = variableIndex.find(operand.name);
+            if (found != variableIndex.end()) {
+              return transform[found->second];
+            }
+          }
+          return std::nullopt;
+        };
+        const auto constantRow = [&](const AffineRow& row) -> std::optional<std::uint32_t> {
+          for (std::size_t column = 0; column < constantColumn; ++column) {
+            if (row[column] != 0) {
+              return std::nullopt;
+            }
+          }
+          return row[constantColumn];
+        };
+
+        for (std::size_t index = scan + 2; index < condIndex && bodySupported; ++index) {
+          const auto& inst = ir[index];
+          if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+            continue;
+          }
+          const auto destination = variableIndex.find(inst.dest.name);
+          const auto lhs = rowForOperand(inst.src1);
+          if (destination == variableIndex.end() || !lhs) {
+            bodySupported = false;
+            break;
+          }
+          if (inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) {
+            transform[destination->second] = *lhs;
+            continue;
+          }
+          const auto rhs = rowForOperand(inst.src2);
+          if (!rhs) {
+            bodySupported = false;
+            break;
+          }
+          AffineRow result(dimension, 0);
+          if (inst.op == IROp::ADD || inst.op == IROp::SUB) {
+            for (std::size_t column = 0; column < dimension; ++column) {
+              result[column] = inst.op == IROp::ADD ? (*lhs)[column] + (*rhs)[column]
+                                                    : (*lhs)[column] - (*rhs)[column];
+            }
+          } else if (inst.op == IROp::MUL) {
+            const auto lhsConstant = constantRow(*lhs);
+            const auto rhsConstant = constantRow(*rhs);
+            if (!lhsConstant && !rhsConstant) {
+              bodySupported = false;
+              break;
+            }
+            const std::uint32_t factor = lhsConstant ? *lhsConstant : *rhsConstant;
+            const auto& value = lhsConstant ? *rhs : *lhs;
+            for (std::size_t column = 0; column < dimension; ++column) {
+              result[column] =
+                  static_cast<std::uint32_t>(static_cast<std::uint64_t>(value[column]) * factor);
+            }
+          } else {
+            bodySupported = false;
+            break;
+          }
+          transform[destination->second] = std::move(result);
+        }
+        if (!bodySupported) {
+          continue;
+        }
+
+        const std::string inductionName = condition.src1.name;
+        const std::size_t inductionIndex = variableIndex[inductionName];
+        const auto& inductionRow = transform[inductionIndex];
+        bool canonicalInduction = true;
+        for (std::size_t column = 0; column < constantColumn; ++column) {
+          const std::uint32_t expected = column == inductionIndex ? 1u : 0u;
+          if (inductionRow[column] != expected) {
+            canonicalInduction = false;
+            break;
+          }
+        }
+        const std::int32_t step = static_cast<std::int32_t>(inductionRow[constantColumn]);
+        if (!canonicalInduction || step == 0 ||
+            ((condition.op == IROp::LT || condition.op == IROp::LE) && step <= 0) ||
+            ((condition.op == IROp::GT || condition.op == IROp::GE) && step >= 0)) {
+          continue;
+        }
+
+        const auto findConstantBefore = [&](const std::string& name) -> std::optional<int> {
+          for (std::size_t position = scan; position > 0; --position) {
+            const auto& previous = ir[position - 1];
+            if (previous.dest.isLocalVar() && previous.dest.name == name) {
+              if ((previous.op == IROp::ASSIGN || previous.op == IROp::LOCAL_VAR_DECL) &&
+                  previous.src1.isImm()) {
+                return previous.src1.immVal;
+              }
+              return std::nullopt;
+            }
+            if (previous.op == IROp::LABEL || previous.op == IROp::BRANCH ||
+                previous.op == IROp::BEQZ || previous.op == IROp::BNEZ ||
+                previous.op == IROp::CALL || previous.op == IROp::FUNC_BEGIN) {
+              break;
+            }
+          }
+          const auto found = uniqueConstants.find(name);
+          if (found != uniqueConstants.end()) {
+            return found->second;
+          }
+          return std::nullopt;
+        };
+
+        // Pass 6 below already turns the common `acc += a*i+b` shape with
+        // constant accumulator initial values into the optimal constant result.
+        // Leave that subset untouched so the more general matrix summary does
+        // not replace a one-instruction result with unnecessary runtime algebra.
+        const auto usedAfterForScalarPass = [&](const std::string& name) {
+          for (std::size_t index = condIndex + 3; index < ir.size(); ++index) {
+            const auto& inst = ir[index];
+            if (inst.op == IROp::FUNC_END || inst.op == IROp::FUNC_BEGIN) {
+              break;
+            }
+            if ((inst.src1.isLocalVar() && inst.src1.name == name) ||
+                (inst.src2.isLocalVar() && inst.src2.name == name) ||
+                ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) && inst.dest.isLocalVar() &&
+                 inst.dest.name == name)) {
+              return true;
+            }
+          }
+          return false;
+        };
+        bool scalarClosedFormWillApply = true;
+        bool hasScalarAccumulator = false;
+        for (std::size_t row = 0; row < variables.size() && scalarClosedFormWillApply; ++row) {
+          bool changedRow = false;
+          for (std::size_t column = 0; column < dimension; ++column) {
+            const std::uint32_t expected = column == row ? 1u : 0u;
+            if (transform[row][column] != expected) {
+              changedRow = true;
+              break;
+            }
+          }
+          if (!changedRow || !usedAfterForScalarPass(variables[row]) || row == inductionIndex) {
+            continue;
+          }
+          hasScalarAccumulator = true;
+          if (transform[row][row] != 1 || !findConstantBefore(variables[row])) {
+            scalarClosedFormWillApply = false;
+            break;
+          }
+          for (std::size_t column = 0; column < variables.size(); ++column) {
+            if (column != row && column != inductionIndex && transform[row][column] != 0) {
+              scalarClosedFormWillApply = false;
+              break;
+            }
+          }
+        }
+        if (scalarClosedFormWillApply && hasScalarAccumulator) {
+          continue;
+        }
+
+        const auto inductionInitial = findConstantBefore(inductionName);
+        std::optional<int> bound;
+        if (condition.src2.isImm()) {
+          bound = condition.src2.immVal;
+        } else if (condition.src2.isLocalVar()) {
+          bound = findConstantBefore(condition.src2.name);
+        }
+        if (!inductionInitial || !bound) {
+          continue;
+        }
+
+        const std::int64_t initial = *inductionInitial;
+        const std::int64_t limit = *bound;
+        const std::int64_t signedStep = step;
+        std::uint64_t tripCount = 0;
+        if (condition.op == IROp::LT && initial < limit) {
+          tripCount = static_cast<std::uint64_t>((limit - initial + signedStep - 1) / signedStep);
+        } else if (condition.op == IROp::LE && initial <= limit) {
+          tripCount = static_cast<std::uint64_t>((limit - initial) / signedStep + 1);
+        } else if (condition.op == IROp::GT && initial > limit) {
+          const std::int64_t magnitude = -signedStep;
+          tripCount = static_cast<std::uint64_t>((initial - limit + magnitude - 1) / magnitude);
+        } else if (condition.op == IROp::GE && initial >= limit) {
+          tripCount = static_cast<std::uint64_t>((initial - limit) / (-signedStep) + 1);
+        }
+        const std::int64_t finalInduction =
+            initial + signedStep * static_cast<std::int64_t>(tripCount);
+        if (finalInduction < INT32_MIN || finalInduction > INT32_MAX) {
+          continue; // 归纳变量环绕会改变有符号比较的终止行为
+        }
+
+        AffineMatrix power = transform;
+        AffineMatrix summary = identityMatrix(dimension);
+        for (std::uint64_t remaining = tripCount; remaining != 0; remaining >>= 1) {
+          if ((remaining & 1u) != 0) {
+            summary = multiplyMatrices(power, summary);
+          }
+          if (remaining > 1) {
+            power = multiplyMatrices(power, power);
+          }
+        }
+
+        std::size_t loopEnd = condIndex + 3;
+        if (loopEnd < ir.size() && ir[loopEnd].op == IROp::LABEL && ir[loopEnd].dest.isLabel() &&
+            labelReferenceCount[ir[loopEnd].dest.name] == 0) {
+          ++loopEnd; // 标准 while 的未引用退出标签随循环一起删除
+        }
+
+        const auto usedAfterLoop = [&](const std::string& name) {
+          for (std::size_t index = loopEnd; index < ir.size(); ++index) {
+            const auto& inst = ir[index];
+            if (inst.op == IROp::FUNC_END || inst.op == IROp::FUNC_BEGIN) {
+              break;
+            }
+            if ((inst.src1.isLocalVar() && inst.src1.name == name) ||
+                (inst.src2.isLocalVar() && inst.src2.name == name) ||
+                ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) && inst.dest.isLocalVar() &&
+                 inst.dest.name == name)) {
+              return true;
+            }
+          }
+          return false;
+        };
+
+        std::vector<IRInst> replacement;
+        std::vector<std::pair<std::string, std::string>> finalMoves;
+        for (std::size_t rowIndex = 0; rowIndex < variables.size(); ++rowIndex) {
+          bool changedRow = false;
+          for (std::size_t column = 0; column < dimension; ++column) {
+            const std::uint32_t expected = column == rowIndex ? 1u : 0u;
+            if (summary[rowIndex][column] != expected) {
+              changedRow = true;
+              break;
+            }
+          }
+          if (!changedRow || !usedAfterLoop(variables[rowIndex])) {
+            continue;
+          }
+
+          const std::string finalName = newTemp();
+          bool haveValue = false;
+          const std::uint32_t constant = summary[rowIndex][constantColumn];
+          if (constant != 0) {
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(finalName),
+                                     Operand::imm(static_cast<std::int32_t>(constant)),
+                                     Operand::none());
+            haveValue = true;
+          }
+          for (std::size_t column = 0; column < variables.size(); ++column) {
+            const std::uint32_t coefficient = summary[rowIndex][column];
+            if (coefficient == 0) {
+              continue;
+            }
+            Operand term = Operand::localVar(variables[column]);
+            if (coefficient != 1) {
+              const std::string productName = newTemp();
+              replacement.emplace_back(IROp::MUL, Operand::localVar(productName), term,
+                                       Operand::imm(static_cast<std::int32_t>(coefficient)));
+              term = Operand::localVar(productName);
+            }
+            if (!haveValue) {
+              replacement.emplace_back(IROp::ASSIGN, Operand::localVar(finalName), term,
+                                       Operand::none());
+              haveValue = true;
+            } else {
+              replacement.emplace_back(IROp::ADD, Operand::localVar(finalName),
+                                       Operand::localVar(finalName), term);
+            }
+          }
+          if (!haveValue) {
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(finalName), Operand::imm(0),
+                                     Operand::none());
+          }
+          finalMoves.emplace_back(variables[rowIndex], finalName);
+        }
+        for (const auto& [destination, source] : finalMoves) {
+          replacement.emplace_back(IROp::ASSIGN, Operand::localVar(destination),
+                                   Operand::localVar(source), Operand::none());
+        }
+
+        ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(scan),
+                 ir.begin() + static_cast<std::ptrdiff_t>(loopEnd));
+        ir.insert(ir.begin() + static_cast<std::ptrdiff_t>(scan), replacement.begin(),
+                  replacement.end());
+        summarizedAny = true;
+      }
+    }
+  }
+
   // Pass 5: 单次使用临时变量复用（single-use temp recycling）。
   // 必须在 pass 0-4 全部收敛后运行一次：长表达式链的每个中间结果都是单次使用
   // 的临时变量，变量总数 O(链长)，超出寄存器池后全部落栈，每轮循环栈读写往返。
