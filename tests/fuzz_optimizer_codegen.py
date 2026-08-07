@@ -250,6 +250,34 @@ def make_case(rng: random.Random, case_index: int) -> str:
             "  result = result + periodic_acc_sum + periodic_acc_i;",
         ]
     )
+    # A monotone affine guard divides the iteration range into at most three
+    # constant-choice segments, including the singleton produced by ==/!=.
+    threshold_start = rng.randint(0, 5)
+    threshold_trips = rng.randint(3, 18)
+    threshold_scale = rng.randint(1, 4)
+    threshold_bias = rng.randint(-5, 7)
+    threshold_point = rng.randint(threshold_start, threshold_start + threshold_trips - 1)
+    threshold_relation = rng.choice(("<", "<=", ">", ">=", "==", "!="))
+    threshold_value = threshold_point * threshold_scale + threshold_bias
+    threshold_then = rng.randint(-3, 5)
+    threshold_else = rng.randint(-4, 4)
+    lines.extend(
+        [
+            f"  int threshold_i = {threshold_start};",
+            "  int threshold_a = result;",
+            "  int threshold_b = seed;",
+            f"  while (threshold_i < {threshold_start + threshold_trips}) {{",
+            f"    if (threshold_i * {threshold_scale} + {threshold_bias} "
+            f"{threshold_relation} {threshold_value}) {{",
+            f"      threshold_a = threshold_a + threshold_b + {threshold_then};",
+            "    } else {",
+            f"      threshold_b = threshold_b - threshold_a + {threshold_else};",
+            "    }",
+            "    threshold_i = threshold_i + 1;",
+            "  }",
+            "  result = result + threshold_a + threshold_b + threshold_i;",
+        ]
+    )
     lines.append("  result = result % 251;")
     lines.append("  if (result < 0) { result = result + 251; }")
     lines.extend(["  return result;", "}"])

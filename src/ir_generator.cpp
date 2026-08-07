@@ -5002,17 +5002,178 @@ void IRGenerator::optimizePass() {
             symbolic[inst.dest.name] = result;
           }
           const auto guardSymbol = symbolic.find(ir[guardIndex].src1.name);
-          if (!periodicProof || guardSymbol == symbolic.end() ||
-              (guardSymbol->second.kind != PeriodicValue::Kind::CONSTANT &&
-               guardSymbol->second.kind != PeriodicValue::Kind::PERIODIC)) {
-            continue;
+          const bool hasPeriodicGuard =
+              periodicProof && guardSymbol != symbolic.end() &&
+              (guardSymbol->second.kind == PeriodicValue::Kind::CONSTANT ||
+               guardSymbol->second.kind == PeriodicValue::Kind::PERIODIC);
+
+          // 同一个 if/else 骨架也可能由单调的归纳变量阈值控制。把条件前缀证明为
+          // `a*i+b <op> 0`，随后只在真值改变点切段；每段仍复用下面的仿射矩阵。
+          struct AffineScalar {
+            std::int64_t coefficient = 0;
+            std::int64_t constant = 0;
+          };
+          struct ThresholdPredicate {
+            std::int64_t coefficient = 0;
+            std::int64_t constant = 0;
+            IROp relation = IROp::NE;
+          };
+          std::unordered_map<std::string, AffineScalar> affineScalars;
+          std::unordered_map<std::string, ThresholdPredicate> predicates;
+          affineScalars[induction] = {1, 0};
+          const auto checkedAdd64 = [](std::int64_t lhs,
+                                       std::int64_t rhs) -> std::optional<std::int64_t> {
+            std::int64_t result = 0;
+            return __builtin_add_overflow(lhs, rhs, &result) ? std::nullopt
+                                                             : std::optional<std::int64_t>(result);
+          };
+          const auto checkedSub64 = [](std::int64_t lhs,
+                                       std::int64_t rhs) -> std::optional<std::int64_t> {
+            std::int64_t result = 0;
+            return __builtin_sub_overflow(lhs, rhs, &result) ? std::nullopt
+                                                             : std::optional<std::int64_t>(result);
+          };
+          const auto checkedMul64 = [](std::int64_t lhs,
+                                       std::int64_t rhs) -> std::optional<std::int64_t> {
+            std::int64_t result = 0;
+            return __builtin_mul_overflow(lhs, rhs, &result) ? std::nullopt
+                                                             : std::optional<std::int64_t>(result);
+          };
+          const auto affineValue = [&](const Operand& operand) -> std::optional<AffineScalar> {
+            if (operand.isImm()) {
+              return AffineScalar{0, operand.immVal};
+            }
+            if (operand.isLocalVar()) {
+              const auto found = affineScalars.find(operand.name);
+              if (found != affineScalars.end()) {
+                return found->second;
+              }
+              const auto constant = findUniqueConstant(operand.name);
+              if (constant) {
+                return AffineScalar{0, *constant};
+              }
+            }
+            return std::nullopt;
+          };
+          const auto affineRangeFits = [&](const AffineScalar& value) {
+            const auto evaluate = [&](std::int64_t inductionValue) -> std::optional<std::int64_t> {
+              const auto product = checkedMul64(value.coefficient, inductionValue);
+              return product ? checkedAdd64(*product, value.constant) : std::nullopt;
+            };
+            const auto first = evaluate(*initial);
+            const auto last = evaluate(finalInduction - 1);
+            return first && last && std::min(*first, *last) >= INT32_MIN &&
+                   std::max(*first, *last) <= INT32_MAX;
+          };
+          const auto checkedAffine = [&](std::int64_t coefficient,
+                                         std::int64_t constant) -> std::optional<AffineScalar> {
+            const AffineScalar value{coefficient, constant};
+            return affineRangeFits(value) ? std::optional<AffineScalar>(value) : std::nullopt;
+          };
+          const auto invertedRelation = [](IROp relation) -> std::optional<IROp> {
+            switch (relation) {
+            case IROp::LT:
+              return IROp::GE;
+            case IROp::GT:
+              return IROp::LE;
+            case IROp::LE:
+              return IROp::GT;
+            case IROp::GE:
+              return IROp::LT;
+            case IROp::EQ:
+              return IROp::NE;
+            case IROp::NE:
+              return IROp::EQ;
+            default:
+              return std::nullopt;
+            }
+          };
+
+          bool thresholdProof = true;
+          for (std::size_t position = loopStart + 2; position < guardIndex && thresholdProof;
+               ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+              continue;
+            }
+            if (!inst.dest.isLocalVar() || !isCompilerTemp(inst.dest.name)) {
+              thresholdProof = false;
+              break;
+            }
+            const auto lhs = affineValue(inst.src1);
+            const auto rhs = affineValue(inst.src2);
+            std::optional<AffineScalar> result;
+            if (inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) {
+              if (lhs) {
+                result = *lhs;
+              } else if (inst.src1.isLocalVar()) {
+                const auto predicate = predicates.find(inst.src1.name);
+                if (predicate != predicates.end()) {
+                  predicates[inst.dest.name] = predicate->second;
+                  continue;
+                }
+              }
+            } else if ((inst.op == IROp::ADD || inst.op == IROp::SUB) && lhs && rhs) {
+              const auto coefficient = inst.op == IROp::ADD
+                                           ? checkedAdd64(lhs->coefficient, rhs->coefficient)
+                                           : checkedSub64(lhs->coefficient, rhs->coefficient);
+              const auto constant = inst.op == IROp::ADD
+                                        ? checkedAdd64(lhs->constant, rhs->constant)
+                                        : checkedSub64(lhs->constant, rhs->constant);
+              if (coefficient && constant) {
+                result = checkedAffine(*coefficient, *constant);
+              }
+            } else if (inst.op == IROp::MUL && lhs && rhs &&
+                       (lhs->coefficient == 0 || rhs->coefficient == 0)) {
+              const AffineScalar& varying = lhs->coefficient == 0 ? *rhs : *lhs;
+              const std::int64_t factor = lhs->coefficient == 0 ? lhs->constant : rhs->constant;
+              const auto coefficient = checkedMul64(varying.coefficient, factor);
+              const auto constant = checkedMul64(varying.constant, factor);
+              if (coefficient && constant) {
+                result = checkedAffine(*coefficient, *constant);
+              }
+            } else if ((inst.op == IROp::LT || inst.op == IROp::GT || inst.op == IROp::LE ||
+                        inst.op == IROp::GE || inst.op == IROp::EQ || inst.op == IROp::NE) &&
+                       lhs && rhs) {
+              const auto coefficient = checkedSub64(lhs->coefficient, rhs->coefficient);
+              const auto constant = checkedSub64(lhs->constant, rhs->constant);
+              if (coefficient && constant) {
+                predicates[inst.dest.name] = {*coefficient, *constant, inst.op};
+                continue;
+              }
+            } else if (inst.op == IROp::NOT && inst.src1.isLocalVar()) {
+              const auto predicate = predicates.find(inst.src1.name);
+              if (predicate != predicates.end()) {
+                const auto relation = invertedRelation(predicate->second.relation);
+                if (relation) {
+                  predicates[inst.dest.name] = {predicate->second.coefficient,
+                                                predicate->second.constant, *relation};
+                  continue;
+                }
+              } else if (lhs) {
+                predicates[inst.dest.name] = {lhs->coefficient, lhs->constant, IROp::EQ};
+                continue;
+              }
+            }
+            if (!result) {
+              thresholdProof = false;
+              break;
+            }
+            affineScalars[inst.dest.name] = *result;
           }
-          const std::uint64_t period = guardSymbol->second.kind == PeriodicValue::Kind::CONSTANT
-                                           ? 1
-                                           : guardSymbol->second.period;
-          if (period == 0 || period > kMaxPeriodicBranchPhases ||
-              static_cast<std::int64_t>(*initial) + static_cast<std::int64_t>(period) - 1 >
-                  INT32_MAX) {
+          std::optional<ThresholdPredicate> thresholdGuard;
+          if (thresholdProof) {
+            const auto predicate = predicates.find(ir[guardIndex].src1.name);
+            if (predicate != predicates.end()) {
+              thresholdGuard = predicate->second;
+            } else {
+              const auto scalar = affineScalars.find(ir[guardIndex].src1.name);
+              if (scalar != affineScalars.end()) {
+                thresholdGuard = {scalar->second.coefficient, scalar->second.constant, IROp::NE};
+              }
+            }
+          }
+          if (!hasPeriodicGuard && !thresholdGuard) {
             continue;
           }
 
@@ -5105,19 +5266,131 @@ void IRGenerator::optimizePass() {
             return found == values.end() ? std::nullopt : std::optional<int>(found->second);
           };
 
-          std::vector<bool> useThen(period, false);
-          bool valuesKnown = true;
-          for (std::uint64_t phase = 0; phase < period; ++phase) {
-            const auto value = evaluatePrefix(*initial + static_cast<int>(phase));
-            if (!value) {
-              valuesKnown = false;
-              break;
+          std::uint64_t period = 0;
+          std::vector<bool> useThen;
+          struct ThresholdRun {
+            std::uint64_t count = 0;
+            bool useThen = false;
+          };
+          std::vector<ThresholdRun> thresholdRuns;
+          if (hasPeriodicGuard) {
+            period = guardSymbol->second.kind == PeriodicValue::Kind::CONSTANT
+                         ? 1
+                         : guardSymbol->second.period;
+            if (period == 0 || period > kMaxPeriodicBranchPhases ||
+                static_cast<std::int64_t>(*initial) + static_cast<std::int64_t>(period) - 1 >
+                    INT32_MAX) {
+              continue;
             }
-            const bool branchTaken = ir[guardIndex].op == IROp::BEQZ ? *value == 0 : *value != 0;
-            useThen[phase] = !branchTaken;
-          }
-          if (!valuesKnown) {
-            continue;
+            useThen.assign(period, false);
+            bool valuesKnown = true;
+            for (std::uint64_t phase = 0; phase < period; ++phase) {
+              const auto value = evaluatePrefix(*initial + static_cast<int>(phase));
+              if (!value) {
+                valuesKnown = false;
+                break;
+              }
+              const bool branchTaken = ir[guardIndex].op == IROp::BEQZ ? *value == 0 : *value != 0;
+              useThen[phase] = !branchTaken;
+            }
+            if (!valuesKnown) {
+              continue;
+            }
+          } else {
+            ThresholdPredicate predicate = *thresholdGuard;
+            if (predicate.coefficient < 0) {
+              if (predicate.coefficient == INT64_MIN || predicate.constant == INT64_MIN) {
+                continue;
+              }
+              predicate.coefficient = -predicate.coefficient;
+              predicate.constant = -predicate.constant;
+              switch (predicate.relation) {
+              case IROp::LT:
+                predicate.relation = IROp::GT;
+                break;
+              case IROp::GT:
+                predicate.relation = IROp::LT;
+                break;
+              case IROp::LE:
+                predicate.relation = IROp::GE;
+                break;
+              case IROp::GE:
+                predicate.relation = IROp::LE;
+                break;
+              default:
+                break;
+              }
+            }
+            const auto predicateValue =
+                [&](std::uint64_t iteration) -> std::optional<std::int64_t> {
+              const std::int64_t inductionValue =
+                  static_cast<std::int64_t>(*initial) + static_cast<std::int64_t>(iteration);
+              const auto product = checkedMul64(predicate.coefficient, inductionValue);
+              return product ? checkedAdd64(*product, predicate.constant) : std::nullopt;
+            };
+            const auto firstPredicate = predicateValue(0);
+            const auto lastPredicate = predicateValue(static_cast<std::uint64_t>(trips) - 1);
+            if (!firstPredicate || !lastPredicate) {
+              continue;
+            }
+            const auto firstMatching = [&](bool strictPositive) {
+              std::uint64_t low = 0;
+              std::uint64_t high = static_cast<std::uint64_t>(trips);
+              while (low < high) {
+                const std::uint64_t middle = low + (high - low) / 2;
+                const std::int64_t value = *predicateValue(middle);
+                const bool matches = strictPositive ? value > 0 : value >= 0;
+                if (matches) {
+                  high = middle;
+                } else {
+                  low = middle + 1;
+                }
+              }
+              return low;
+            };
+            std::vector<std::uint64_t> boundaries{0, static_cast<std::uint64_t>(trips)};
+            if (predicate.coefficient != 0) {
+              boundaries.push_back(firstMatching(false));
+              boundaries.push_back(firstMatching(true));
+            }
+            std::sort(boundaries.begin(), boundaries.end());
+            boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+            const auto comparisonHolds = [&](std::int64_t value) {
+              switch (predicate.relation) {
+              case IROp::LT:
+                return value < 0;
+              case IROp::GT:
+                return value > 0;
+              case IROp::LE:
+                return value <= 0;
+              case IROp::GE:
+                return value >= 0;
+              case IROp::EQ:
+                return value == 0;
+              case IROp::NE:
+                return value != 0;
+              default:
+                return false;
+              }
+            };
+            for (std::size_t index = 1; index < boundaries.size(); ++index) {
+              const std::uint64_t begin = boundaries[index - 1];
+              const std::uint64_t end = boundaries[index];
+              if (begin == end) {
+                continue;
+              }
+              const bool truth = comparisonHolds(*predicateValue(begin));
+              const bool branchTaken = ir[guardIndex].op == IROp::BEQZ ? !truth : truth;
+              const bool thenBranch = !branchTaken;
+              if (!thresholdRuns.empty() && thresholdRuns.back().useThen == thenBranch) {
+                thresholdRuns.back().count += end - begin;
+              } else {
+                thresholdRuns.push_back({end - begin, thenBranch});
+              }
+            }
+            if (thresholdRuns.empty()) {
+              continue;
+            }
           }
 
           std::vector<std::string> variables;
@@ -5282,27 +5555,38 @@ void IRGenerator::optimizePass() {
             continue;
           }
 
-          AffineMatrix periodTransform = identityMatrix(dimension);
-          for (std::uint64_t phase = 0; phase < period; ++phase) {
-            const AffineMatrix& iteration = useThen[phase] ? thenTransform : elseTransform;
-            periodTransform = multiplyMatrices(iteration, periodTransform);
-          }
-          AffineMatrix power = periodTransform;
           AffineMatrix summary = identityMatrix(dimension);
-          std::uint64_t completePeriods = static_cast<std::uint64_t>(trips) / period;
-          while (completePeriods != 0) {
-            if ((completePeriods & 1u) != 0) {
-              summary = multiplyMatrices(power, summary);
+          const auto appendRepeatedTransform = [&](const AffineMatrix& transform,
+                                                   std::uint64_t count) {
+            AffineMatrix power = transform;
+            AffineMatrix repeated = identityMatrix(dimension);
+            while (count != 0) {
+              if ((count & 1u) != 0) {
+                repeated = multiplyMatrices(power, repeated);
+              }
+              count >>= 1;
+              if (count != 0) {
+                power = multiplyMatrices(power, power);
+              }
             }
-            completePeriods >>= 1;
-            if (completePeriods != 0) {
-              power = multiplyMatrices(power, power);
+            summary = multiplyMatrices(repeated, summary);
+          };
+          if (hasPeriodicGuard) {
+            AffineMatrix periodTransform = identityMatrix(dimension);
+            for (std::uint64_t phase = 0; phase < period; ++phase) {
+              const AffineMatrix& iteration = useThen[phase] ? thenTransform : elseTransform;
+              periodTransform = multiplyMatrices(iteration, periodTransform);
             }
-          }
-          const std::uint64_t remainder = static_cast<std::uint64_t>(trips) % period;
-          for (std::uint64_t phase = 0; phase < remainder; ++phase) {
-            const AffineMatrix& iteration = useThen[phase] ? thenTransform : elseTransform;
-            summary = multiplyMatrices(iteration, summary);
+            appendRepeatedTransform(periodTransform, static_cast<std::uint64_t>(trips) / period);
+            const std::uint64_t remainder = static_cast<std::uint64_t>(trips) % period;
+            for (std::uint64_t phase = 0; phase < remainder; ++phase) {
+              const AffineMatrix& iteration = useThen[phase] ? thenTransform : elseTransform;
+              summary = multiplyMatrices(iteration, summary);
+            }
+          } else {
+            for (const ThresholdRun& run : thresholdRuns) {
+              appendRepeatedTransform(run.useThen ? thenTransform : elseTransform, run.count);
+            }
           }
 
           bool observableChange = false;
