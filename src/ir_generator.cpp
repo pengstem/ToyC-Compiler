@@ -2121,6 +2121,10 @@ void IRGenerator::optimizePass() {
           }
         }
 
+        // 回边按 IR 顺序从内到外出现；先证明的内层循环可作为有限区域参与
+        // 外层循环的终止性证明，而不是让任意嵌套 while 都否决整个纯函数。
+        std::unordered_set<std::size_t> provenBackedges;
+
         const auto provenTerminatingBackedge = [&](std::size_t backedgeIndex,
                                                    std::size_t bodyLabelIndex) {
           if (backedgeIndex < 2 || bodyLabelIndex >= backedgeIndex ||
@@ -2182,8 +2186,15 @@ void IRGenerator::optimizePass() {
                  bodyInst.op == IROp::BNEZ) &&
                 bodyInst.dest.isLabel()) {
               const auto target = labels.find(bodyInst.dest.name);
-              if (target == labels.end() || target->second <= position) {
+              if (target == labels.end()) {
                 return false;
+              }
+              if (target->second <= position) {
+                if (provenBackedges.count(position) == 0) {
+                  return false;
+                }
+                lastInternalControl = position;
+                continue;
               }
               // 向循环退出标签的 break 只会提早终止；循环体内部的前向边
               // 则必须位于归纳更新之前，确保继续迭代的每条路径都执行更新。
@@ -2212,9 +2223,14 @@ void IRGenerator::optimizePass() {
           if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
               inst.dest.isLabel()) {
             const auto target = labels.find(inst.dest.name);
-            if (target == labels.end() ||
-                (target->second <= index && !provenTerminatingBackedge(index, target->second))) {
+            if (target == labels.end()) {
               effects.locallyPureAndTerminatingShape = false;
+            } else if (target->second <= index) {
+              if (provenTerminatingBackedge(index, target->second)) {
+                provenBackedges.insert(index);
+              } else {
+                effects.locallyPureAndTerminatingShape = false;
+              }
             }
           }
         }

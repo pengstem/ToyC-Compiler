@@ -35,6 +35,7 @@ def main() -> int:
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--case", required=True)
     parser.add_argument("--loop-case", required=True)
+    parser.add_argument("--nested-loop-case", required=True)
     parser.add_argument("--side-effect-case", required=True)
     parser.add_argument("--termination-case", required=True)
     parser.add_argument("--moving-loop-case", required=True)
@@ -49,6 +50,10 @@ def main() -> int:
     body = main_body(compile_source(args.compiler, args.loop_case))
     if re.search(r"(?m)^\s*call\s+heavy_loop\b", body):
         raise RuntimeError(f"dead finite-loop call remains:\n{body}")
+
+    body = main_body(compile_source(args.compiler, args.nested_loop_case))
+    if re.search(r"(?m)^\s*call\s+nested_loop\b", body):
+        raise RuntimeError(f"dead nested-loop call remains:\n{body}")
 
     body = main_body(compile_source(args.compiler, args.side_effect_case))
     if not re.search(r"(?m)^\s*call\s+impure\b", body):

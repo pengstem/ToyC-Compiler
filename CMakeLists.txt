@@ -712,6 +712,8 @@ if(TOYCC_BUILD_TESTS)
           --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_pure_call_loop.c"
           --loop-case
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_pure_loop_call.c"
+          --nested-loop-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_nested_pure_loop_call.c"
           --side-effect-case
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_call_side_effect_safety.c"
           --termination-case
