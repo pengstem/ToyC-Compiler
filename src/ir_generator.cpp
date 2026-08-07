@@ -2067,6 +2067,159 @@ void IRGenerator::optimizePass() {
       }
     }
 
+    // Pass 2.75: 删除返回值无用的、已证明纯且必然终止的函数调用。
+    //
+    // 内联预算会保留较大的函数调用，而普通 DCE 必须把任意 CALL 当成副作用根。
+    // 这里仅接受无全局写/STORE/未知调用、无回边且调用图无环的已定义函数；
+    // 无回边 CFG 与已证明终止的被调函数共同保证删除调用不会改变程序终止性。
+    {
+      struct FunctionEffects {
+        std::size_t begin = 0;
+        std::size_t end = 0;
+        std::size_t paramCount = 0;
+        bool locallyPureAndAcyclic = true;
+        std::unordered_set<std::string> callees;
+      };
+
+      std::unordered_map<std::string, FunctionEffects> functions;
+      for (std::size_t begin = 0; begin < ir.size(); ++begin) {
+        if (ir[begin].op != IROp::FUNC_BEGIN || !ir[begin].dest.isFunc()) {
+          continue;
+        }
+        FunctionEffects effects;
+        effects.begin = begin;
+        effects.end = begin + 1;
+        while (effects.end < ir.size() && ir[effects.end].op != IROp::FUNC_END) {
+          ++effects.end;
+        }
+
+        std::unordered_map<std::string, std::size_t> labels;
+        for (std::size_t index = effects.begin + 1; index < effects.end; ++index) {
+          const IRInst& inst = ir[index];
+          if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isParam()) {
+            ++effects.paramCount;
+          }
+          if (inst.op == IROp::LABEL && inst.dest.isLabel()) {
+            labels[inst.dest.name] = index;
+          }
+        }
+        for (std::size_t index = effects.begin + 1; index < effects.end; ++index) {
+          const IRInst& inst = ir[index];
+          const bool globalWrite =
+              inst.dest.isGlobalVar() && inst.op != IROp::PARAM && inst.op != IROp::RETURN;
+          if (globalWrite || inst.op == IROp::STORE) {
+            effects.locallyPureAndAcyclic = false;
+          }
+          if (inst.op == IROp::CALL) {
+            if (!inst.src1.isFunc()) {
+              effects.locallyPureAndAcyclic = false;
+            } else {
+              effects.callees.insert(inst.src1.name);
+            }
+          }
+          if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+              inst.dest.isLabel()) {
+            const auto target = labels.find(inst.dest.name);
+            if (target == labels.end() || target->second <= index) {
+              effects.locallyPureAndAcyclic = false;
+            }
+          }
+        }
+        const std::string functionName = ir[begin].dest.name;
+        const std::size_t functionEnd = effects.end;
+        functions[functionName] = std::move(effects);
+        begin = functionEnd;
+      }
+
+      std::unordered_set<std::string> pureTerminating;
+      bool discoveredFunction = true;
+      while (discoveredFunction) {
+        discoveredFunction = false;
+        for (const auto& entry : functions) {
+          const std::string& name = entry.first;
+          const FunctionEffects& effects = entry.second;
+          if (!effects.locallyPureAndAcyclic || pureTerminating.count(name) != 0) {
+            continue;
+          }
+          const bool calleesProven = std::all_of(
+              effects.callees.begin(), effects.callees.end(), [&](const std::string& callee) {
+                return functions.count(callee) != 0 && pureTerminating.count(callee) != 0;
+              });
+          if (calleesProven) {
+            pureTerminating.insert(name);
+            discoveredFunction = true;
+          }
+        }
+      }
+
+      std::unordered_map<std::string, std::unordered_map<std::string, int>> functionUses;
+      std::string currentFunction;
+      for (const auto& inst : ir) {
+        if (inst.op == IROp::FUNC_BEGIN && inst.dest.isFunc()) {
+          currentFunction = inst.dest.name;
+          continue;
+        }
+        if (inst.op == IROp::FUNC_END) {
+          currentFunction.clear();
+          continue;
+        }
+        if (currentFunction.empty()) {
+          continue;
+        }
+        auto& uses = functionUses[currentFunction];
+        if (inst.src1.isLocalVar()) {
+          ++uses[inst.src1.name];
+        }
+        if (inst.src2.isLocalVar()) {
+          ++uses[inst.src2.name];
+        }
+        if ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) && inst.dest.isLocalVar()) {
+          ++uses[inst.dest.name];
+        }
+      }
+
+      std::vector<IRInst> optimized;
+      optimized.reserve(ir.size());
+      currentFunction.clear();
+      bool removedCall = false;
+      for (const auto& inst : ir) {
+        if (inst.op == IROp::FUNC_BEGIN && inst.dest.isFunc()) {
+          currentFunction = inst.dest.name;
+        } else if (inst.op == IROp::FUNC_END) {
+          currentFunction.clear();
+        }
+
+        bool eraseCall = false;
+        std::size_t paramCount = 0;
+        if (inst.op == IROp::CALL && inst.src1.isFunc() &&
+            pureTerminating.count(inst.src1.name) != 0) {
+          const bool resultUnused =
+              inst.dest.isNone() ||
+              (inst.dest.isLocalVar() && functionUses[currentFunction][inst.dest.name] == 0);
+          const auto callee = functions.find(inst.src1.name);
+          if (resultUnused && callee != functions.end()) {
+            paramCount = callee->second.paramCount;
+            eraseCall = optimized.size() >= paramCount;
+            for (std::size_t parameter = 0; parameter < paramCount && eraseCall; ++parameter) {
+              const IRInst& argument = optimized[optimized.size() - paramCount + parameter];
+              eraseCall = argument.op == IROp::PARAM && argument.src1.isImm() &&
+                          argument.src1.immVal == static_cast<int>(parameter);
+            }
+          }
+        }
+        if (eraseCall) {
+          optimized.resize(optimized.size() - paramCount);
+          removedCall = true;
+          continue;
+        }
+        optimized.push_back(inst);
+      }
+      if (removedCall) {
+        ir = std::move(optimized);
+        changed = true;
+      }
+    }
+
     // Pass 3: 循环反转（loop inversion）
     // 将 "LABEL c; <cond>; BEQZ t,e; LABEL b; <body>; BRANCH c; LABEL e" 转换为
     // "BRANCH c; LABEL b; <body>; LABEL c; <cond>; BNEZ t,b; LABEL e"

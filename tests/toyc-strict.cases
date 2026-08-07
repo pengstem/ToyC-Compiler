@@ -82,6 +82,7 @@ perf/t_nested_affine_summary.c
 perf/t_coupled_affine_summary.c
 perf/t_loop_weighted_regalloc.c
 perf/t_dead_recurrence_loop.c
+perf/t_dead_pure_call_loop.c
 regression/f19_many_arguments.c
 regression/f19_forwarding.c
 regression/pair_unroll_bounds.c
@@ -89,3 +90,4 @@ regression/loop_summary_moving_bound.c
 regression/dead_branched_loop_safety.c
 regression/live_recurrence_safety.c
 regression/conditional_side_effect_safety.c
+regression/dead_call_side_effect_safety.c

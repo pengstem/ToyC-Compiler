@@ -555,6 +555,23 @@ if(TOYCC_BUILD_TESTS)
       )
 
       add_test(
+        NAME toycc.perf.dead-pure-call-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_dead_pure_call_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_pure_call_loop.c"
+          --side-effect-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_call_side_effect_safety.c"
+          --termination-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_call_termination_safety.c"
+      )
+      set_tests_properties(toycc.perf.dead-pure-call-codegen PROPERTIES
+        LABELS "toycc;codegen;performance"
+        TIMEOUT 10
+      )
+
+      add_test(
         NAME toycc.perf.dead-store-codegen
         COMMAND
           "${Python3_EXECUTABLE}"
