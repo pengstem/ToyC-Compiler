@@ -469,6 +469,29 @@ if(TOYCC_BUILD_TESTS)
         TIMEOUT "${TOYCC_TEST_TIMEOUT}"
       )
 
+      add_test(
+        NAME toycc.perf.periodic-affine-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_periodic_affine_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_periodic_affine_branch.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/periodic_negative_start_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/periodic_state_guard_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/periodic_global_effect_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/periodic_reset_state_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/periodic_phase_overflow_safety.c"
+      )
+      set_tests_properties(toycc.perf.periodic-affine-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
       foreach(TOYCC_CLOSED_FORM_CASE IN ITEMS
           "t_copy_loop.c;15"
           "t_cse_loop.c;149")

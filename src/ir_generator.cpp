@@ -3692,6 +3692,735 @@ void IRGenerator::optimizePass() {
       }
     }
 
+    // Pass 5.7: 汇总由归纳变量余数控制的仿射分支循环。
+    //
+    // Pass 5.6 只接受直线循环体，但 `if (i % k == r)` 的选择以 k 为周期重复。
+    // 当两个分支及公共后缀都是局部仿射变换时，先合成一个完整周期的矩阵，再
+    // 对周期矩阵做快速幂。该变换只依赖符号证明，不迭代执行源循环；条件不是
+    // 已证明的余数周期、存在外部跳转/调用/全局状态或任一分支非仿射时均回退。
+    {
+      using AffineRow = std::vector<std::uint32_t>;
+      using AffineMatrix = std::vector<AffineRow>;
+
+      const auto identityMatrix = [](std::size_t dimension) {
+        AffineMatrix identity(dimension, AffineRow(dimension, 0));
+        for (std::size_t index = 0; index < dimension; ++index) {
+          identity[index][index] = 1;
+        }
+        return identity;
+      };
+      const auto multiplyMatrices = [](const AffineMatrix& lhs, const AffineMatrix& rhs) {
+        const std::size_t dimension = lhs.size();
+        AffineMatrix product(dimension, AffineRow(dimension, 0));
+        for (std::size_t row = 0; row < dimension; ++row) {
+          for (std::size_t pivot = 0; pivot < dimension; ++pivot) {
+            if (lhs[row][pivot] == 0) {
+              continue;
+            }
+            for (std::size_t column = 0; column < dimension; ++column) {
+              product[row][column] += static_cast<std::uint32_t>(
+                  static_cast<std::uint64_t>(lhs[row][pivot]) * rhs[pivot][column]);
+            }
+          }
+        }
+        return product;
+      };
+      const auto rowIsConstant = [](const AffineRow& row,
+                                    std::size_t constantColumn) -> std::optional<std::uint32_t> {
+        for (std::size_t column = 0; column < constantColumn; ++column) {
+          if (row[column] != 0) {
+            return std::nullopt;
+          }
+        }
+        return row[constantColumn];
+      };
+      const auto gcd = [](std::uint64_t lhs, std::uint64_t rhs) {
+        while (rhs != 0) {
+          const std::uint64_t remainder = lhs % rhs;
+          lhs = rhs;
+          rhs = remainder;
+        }
+        return lhs;
+      };
+
+      struct PeriodicValue {
+        enum class Kind { UNKNOWN, CONSTANT, INDUCTION, QUOTIENT, QUOTIENT_PRODUCT, PERIODIC };
+        Kind kind = Kind::UNKNOWN;
+        int value = 0;
+        int divisor = 0;
+        std::uint64_t period = 0;
+      };
+
+      for (int summaryRound = 0; summaryRound < 8; ++summaryRound) {
+        std::unordered_map<std::string, int> labelReferences;
+        std::unordered_map<std::string, std::size_t> labelPositions;
+        for (std::size_t index = 0; index < ir.size(); ++index) {
+          const auto& inst = ir[index];
+          if (inst.op == IROp::LABEL && inst.dest.isLabel()) {
+            labelPositions[inst.dest.name] = index;
+          }
+          if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+              inst.dest.isLabel()) {
+            ++labelReferences[inst.dest.name];
+          }
+        }
+
+        bool summarized = false;
+        for (std::size_t loopStart = ir.size(); loopStart-- > 0 && !summarized;) {
+          if (ir[loopStart].op != IROp::BRANCH || !ir[loopStart].dest.isLabel() ||
+              loopStart + 1 >= ir.size() || ir[loopStart + 1].op != IROp::LABEL ||
+              !ir[loopStart + 1].dest.isLabel()) {
+            continue;
+          }
+          const std::string condLabel = ir[loopStart].dest.name;
+          const std::string bodyLabel = ir[loopStart + 1].dest.name;
+          if (labelReferences[condLabel] != 1 || labelReferences[bodyLabel] != 1) {
+            continue;
+          }
+          const auto condPosition = labelPositions.find(condLabel);
+          if (condPosition == labelPositions.end() || condPosition->second <= loopStart + 2) {
+            continue;
+          }
+          const std::size_t condIndex = condPosition->second;
+          if (condIndex + 2 >= ir.size()) {
+            continue;
+          }
+          const IRInst& condition = ir[condIndex + 1];
+          const IRInst& backedge = ir[condIndex + 2];
+          if ((condition.op != IROp::LT && condition.op != IROp::LE) ||
+              !condition.dest.isLocalVar() || !condition.src1.isLocalVar() ||
+              backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
+              backedge.dest.name != bodyLabel || !backedge.src1.isLocalVar() ||
+              backedge.src1.name != condition.dest.name) {
+            continue;
+          }
+          const std::string induction = condition.src1.name;
+
+          const auto findNearbyConstant = [&](const std::string& name) -> std::optional<int> {
+            for (std::size_t position = loopStart; position > 0; --position) {
+              const IRInst& candidate = ir[position - 1];
+              if (candidate.dest.isLocalVar() && candidate.dest.name == name) {
+                if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                    candidate.src1.isImm()) {
+                  return candidate.src1.immVal;
+                }
+                return std::nullopt;
+              }
+              if (candidate.op == IROp::LABEL || candidate.op == IROp::BRANCH ||
+                  candidate.op == IROp::BEQZ || candidate.op == IROp::BNEZ ||
+                  candidate.op == IROp::CALL || candidate.op == IROp::FUNC_BEGIN) {
+                break;
+              }
+            }
+            return std::nullopt;
+          };
+          const auto findUniqueConstant = [&](const std::string& name) -> std::optional<int> {
+            std::size_t functionBegin = loopStart;
+            while (functionBegin > 0 && ir[functionBegin - 1].op != IROp::FUNC_BEGIN) {
+              --functionBegin;
+            }
+            int definitions = 0;
+            std::optional<int> value;
+            for (std::size_t position = functionBegin; position < ir.size(); ++position) {
+              const IRInst& candidate = ir[position];
+              if (candidate.op == IROp::FUNC_END) {
+                break;
+              }
+              if (!candidate.dest.isLocalVar() || candidate.dest.name != name ||
+                  candidate.op == IROp::RETURN || candidate.op == IROp::PARAM ||
+                  (candidate.op == IROp::LOCAL_VAR_DECL && candidate.src1.isNone())) {
+                continue;
+              }
+              ++definitions;
+              if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                  candidate.src1.isImm()) {
+                value = candidate.src1.immVal;
+              } else {
+                value.reset();
+              }
+            }
+            return definitions == 1 ? value : std::nullopt;
+          };
+
+          const auto initial = findNearbyConstant(induction);
+          std::optional<int> upper;
+          if (condition.src2.isImm()) {
+            upper = condition.src2.immVal;
+          } else if (condition.src2.isLocalVar()) {
+            upper = findNearbyConstant(condition.src2.name);
+            if (!upper) {
+              upper = findUniqueConstant(condition.src2.name);
+            }
+          }
+          if (!initial || !upper || *initial < 0 ||
+              (condition.op == IROp::LE && *upper == INT32_MAX && *initial <= *upper)) {
+            continue;
+          }
+          std::int64_t trips = static_cast<std::int64_t>(*upper) - *initial;
+          if (condition.op == IROp::LE) {
+            ++trips;
+          }
+          trips = std::max<std::int64_t>(0, trips);
+          const std::int64_t finalInduction = static_cast<std::int64_t>(*initial) + trips;
+          if (trips < 2 || trips > INT32_MAX || finalInduction > INT32_MAX) {
+            continue;
+          }
+
+          std::size_t guardIndex = loopStart + 2;
+          while (guardIndex < condIndex && ir[guardIndex].op != IROp::BEQZ &&
+                 ir[guardIndex].op != IROp::BNEZ) {
+            ++guardIndex;
+          }
+          if (guardIndex == loopStart + 2 || guardIndex >= condIndex ||
+              !ir[guardIndex].dest.isLabel() || !ir[guardIndex].src1.isLocalVar()) {
+            continue;
+          }
+          const auto elsePosition = labelPositions.find(ir[guardIndex].dest.name);
+          if (elsePosition == labelPositions.end() || elsePosition->second <= guardIndex + 1 ||
+              elsePosition->second >= condIndex || labelReferences[ir[guardIndex].dest.name] != 1) {
+            continue;
+          }
+          const std::size_t elseIndex = elsePosition->second;
+          std::size_t thenJump = elseIndex;
+          while (thenJump > guardIndex + 1 && ir[thenJump - 1].op == IROp::LABEL) {
+            --thenJump;
+          }
+          if (thenJump == guardIndex + 1 || ir[thenJump - 1].op != IROp::BRANCH ||
+              !ir[thenJump - 1].dest.isLabel()) {
+            continue;
+          }
+          --thenJump;
+          const auto joinPosition = labelPositions.find(ir[thenJump].dest.name);
+          if (joinPosition == labelPositions.end() || joinPosition->second <= elseIndex ||
+              joinPosition->second >= condIndex || labelReferences[ir[thenJump].dest.name] != 1) {
+            continue;
+          }
+          const std::size_t joinIndex = joinPosition->second;
+
+          std::unordered_map<std::string, PeriodicValue> symbolic;
+          symbolic[induction] = {PeriodicValue::Kind::INDUCTION, 0, 0, 0};
+          const auto symbolicOperand = [&](const Operand& operand) {
+            if (operand.isImm()) {
+              return PeriodicValue{PeriodicValue::Kind::CONSTANT, operand.immVal, 0, 1};
+            }
+            if (operand.isLocalVar()) {
+              const auto found = symbolic.find(operand.name);
+              if (found != symbolic.end()) {
+                return found->second;
+              }
+            }
+            return PeriodicValue{};
+          };
+          const auto combinePeriod = [&](std::uint64_t lhs, std::uint64_t rhs) -> std::uint64_t {
+            if (lhs == 0 || rhs == 0) {
+              return 0;
+            }
+            const std::uint64_t divisor = gcd(lhs, rhs);
+            if (lhs > 64 / (rhs / divisor)) {
+              return 0;
+            }
+            const std::uint64_t result = lhs * (rhs / divisor);
+            return result <= 64 ? result : 0;
+          };
+
+          bool periodicProof = true;
+          for (std::size_t position = loopStart + 2; position < guardIndex && periodicProof;
+               ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+              continue;
+            }
+            if (!inst.dest.isLocalVar() || !isCompilerTemp(inst.dest.name)) {
+              periodicProof = false;
+              break;
+            }
+            const PeriodicValue lhs = symbolicOperand(inst.src1);
+            const PeriodicValue rhs = symbolicOperand(inst.src2);
+            PeriodicValue result;
+            if (inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) {
+              result = lhs;
+            } else if (inst.op == IROp::NOT) {
+              if (lhs.kind == PeriodicValue::Kind::CONSTANT) {
+                result = {PeriodicValue::Kind::CONSTANT, lhs.value == 0 ? 1 : 0, 0, 1};
+              } else if (lhs.kind == PeriodicValue::Kind::PERIODIC) {
+                result = {PeriodicValue::Kind::PERIODIC, 0, 0, lhs.period};
+              }
+            } else if (inst.op == IROp::DIV && lhs.kind == PeriodicValue::Kind::INDUCTION &&
+                       rhs.kind == PeriodicValue::Kind::CONSTANT && rhs.value != 0 &&
+                       rhs.value != 1 && rhs.value != -1 && rhs.value != INT32_MIN) {
+              result = {PeriodicValue::Kind::QUOTIENT, 0, rhs.value, 0};
+            } else if (inst.op == IROp::MOD && lhs.kind == PeriodicValue::Kind::INDUCTION &&
+                       rhs.kind == PeriodicValue::Kind::CONSTANT && rhs.value != 0 &&
+                       rhs.value != 1 && rhs.value != -1 && rhs.value != INT32_MIN) {
+              const std::uint64_t period = static_cast<std::uint64_t>(
+                  rhs.value < 0 ? -static_cast<std::int64_t>(rhs.value) : rhs.value);
+              if (period <= 64) {
+                result = {PeriodicValue::Kind::PERIODIC, 0, 0, period};
+              }
+            } else if (inst.op == IROp::MUL) {
+              const PeriodicValue* quotient = nullptr;
+              const PeriodicValue* constant = nullptr;
+              if (lhs.kind == PeriodicValue::Kind::QUOTIENT &&
+                  rhs.kind == PeriodicValue::Kind::CONSTANT) {
+                quotient = &lhs;
+                constant = &rhs;
+              } else if (rhs.kind == PeriodicValue::Kind::QUOTIENT &&
+                         lhs.kind == PeriodicValue::Kind::CONSTANT) {
+                quotient = &rhs;
+                constant = &lhs;
+              }
+              if (quotient != nullptr && constant->value == quotient->divisor) {
+                result = {PeriodicValue::Kind::QUOTIENT_PRODUCT, 0, quotient->divisor, 0};
+              }
+            } else if (inst.op == IROp::SUB && lhs.kind == PeriodicValue::Kind::INDUCTION &&
+                       rhs.kind == PeriodicValue::Kind::QUOTIENT_PRODUCT) {
+              const std::uint64_t period = static_cast<std::uint64_t>(
+                  rhs.divisor < 0 ? -static_cast<std::int64_t>(rhs.divisor) : rhs.divisor);
+              if (period <= 64) {
+                result = {PeriodicValue::Kind::PERIODIC, 0, 0, period};
+              }
+            }
+
+            if (result.kind == PeriodicValue::Kind::UNKNOWN &&
+                (inst.op == IROp::ADD || inst.op == IROp::SUB || inst.op == IROp::MUL ||
+                 inst.op == IROp::DIV || inst.op == IROp::MOD || inst.op == IROp::LT ||
+                 inst.op == IROp::GT || inst.op == IROp::LE || inst.op == IROp::GE ||
+                 inst.op == IROp::EQ || inst.op == IROp::NE)) {
+              const bool lhsPeriodic = lhs.kind == PeriodicValue::Kind::CONSTANT ||
+                                       lhs.kind == PeriodicValue::Kind::PERIODIC;
+              const bool rhsPeriodic = rhs.kind == PeriodicValue::Kind::CONSTANT ||
+                                       rhs.kind == PeriodicValue::Kind::PERIODIC;
+              if (lhsPeriodic && rhsPeriodic) {
+                if (lhs.kind == PeriodicValue::Kind::CONSTANT &&
+                    rhs.kind == PeriodicValue::Kind::CONSTANT) {
+                  result = {PeriodicValue::Kind::CONSTANT, 0, 0, 1};
+                } else {
+                  const std::uint64_t period = combinePeriod(lhs.period, rhs.period);
+                  if (period != 0) {
+                    result = {PeriodicValue::Kind::PERIODIC, 0, 0, period};
+                  }
+                }
+              }
+            }
+            if (result.kind == PeriodicValue::Kind::UNKNOWN) {
+              periodicProof = false;
+              break;
+            }
+            symbolic[inst.dest.name] = result;
+          }
+          const auto guardSymbol = symbolic.find(ir[guardIndex].src1.name);
+          if (!periodicProof || guardSymbol == symbolic.end() ||
+              (guardSymbol->second.kind != PeriodicValue::Kind::CONSTANT &&
+               guardSymbol->second.kind != PeriodicValue::Kind::PERIODIC)) {
+            continue;
+          }
+          const std::uint64_t period = guardSymbol->second.kind == PeriodicValue::Kind::CONSTANT
+                                           ? 1
+                                           : guardSymbol->second.period;
+          if (period == 0 || period > 64 ||
+              static_cast<std::int64_t>(*initial) + static_cast<std::int64_t>(period) - 1 >
+                  INT32_MAX) {
+            continue;
+          }
+
+          const auto evaluatePrefix = [&](int inductionValue) -> std::optional<int> {
+            std::unordered_map<std::string, int> values;
+            values[induction] = inductionValue;
+            const auto operandValue = [&](const Operand& operand) -> std::optional<int> {
+              if (operand.isImm()) {
+                return operand.immVal;
+              }
+              if (operand.isLocalVar()) {
+                const auto found = values.find(operand.name);
+                if (found != values.end()) {
+                  return found->second;
+                }
+              }
+              return std::nullopt;
+            };
+            for (std::size_t position = loopStart + 2; position < guardIndex; ++position) {
+              const IRInst& inst = ir[position];
+              if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+                continue;
+              }
+              const auto lhs = operandValue(inst.src1);
+              const auto rhs = operandValue(inst.src2);
+              if (!lhs || !inst.dest.isLocalVar()) {
+                return std::nullopt;
+              }
+              int value = 0;
+              if (inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) {
+                value = *lhs;
+              } else if (inst.op == IROp::NOT) {
+                value = *lhs == 0 ? 1 : 0;
+              } else {
+                if (!rhs) {
+                  return std::nullopt;
+                }
+                switch (inst.op) {
+                case IROp::ADD:
+                  value = static_cast<std::int32_t>(static_cast<std::uint32_t>(*lhs) +
+                                                    static_cast<std::uint32_t>(*rhs));
+                  break;
+                case IROp::SUB:
+                  value = static_cast<std::int32_t>(static_cast<std::uint32_t>(*lhs) -
+                                                    static_cast<std::uint32_t>(*rhs));
+                  break;
+                case IROp::MUL:
+                  value = static_cast<std::int32_t>(static_cast<std::uint32_t>(
+                      static_cast<std::uint64_t>(static_cast<std::uint32_t>(*lhs)) *
+                      static_cast<std::uint32_t>(*rhs)));
+                  break;
+                case IROp::DIV:
+                  if (*rhs == 0) {
+                    return std::nullopt;
+                  }
+                  value = (*lhs == INT32_MIN && *rhs == -1) ? INT32_MIN : *lhs / *rhs;
+                  break;
+                case IROp::MOD:
+                  if (*rhs == 0) {
+                    return std::nullopt;
+                  }
+                  value = (*lhs == INT32_MIN && *rhs == -1) ? 0 : *lhs % *rhs;
+                  break;
+                case IROp::LT:
+                  value = *lhs < *rhs ? 1 : 0;
+                  break;
+                case IROp::GT:
+                  value = *lhs > *rhs ? 1 : 0;
+                  break;
+                case IROp::LE:
+                  value = *lhs <= *rhs ? 1 : 0;
+                  break;
+                case IROp::GE:
+                  value = *lhs >= *rhs ? 1 : 0;
+                  break;
+                case IROp::EQ:
+                  value = *lhs == *rhs ? 1 : 0;
+                  break;
+                case IROp::NE:
+                  value = *lhs != *rhs ? 1 : 0;
+                  break;
+                default:
+                  return std::nullopt;
+                }
+              }
+              values[inst.dest.name] = value;
+            }
+            const auto found = values.find(ir[guardIndex].src1.name);
+            return found == values.end() ? std::nullopt : std::optional<int>(found->second);
+          };
+
+          std::vector<bool> useThen(period, false);
+          bool valuesKnown = true;
+          for (std::uint64_t phase = 0; phase < period; ++phase) {
+            const auto value = evaluatePrefix(*initial + static_cast<int>(phase));
+            if (!value) {
+              valuesKnown = false;
+              break;
+            }
+            const bool branchTaken = ir[guardIndex].op == IROp::BEQZ ? *value == 0 : *value != 0;
+            useThen[phase] = !branchTaken;
+          }
+          if (!valuesKnown) {
+            continue;
+          }
+
+          std::vector<std::string> variables;
+          std::unordered_map<std::string, std::size_t> variableIndex;
+          std::unordered_set<std::string> written;
+          const auto addVariable = [&](const Operand& operand) {
+            if (!operand.isLocalVar() || variableIndex.count(operand.name) != 0) {
+              return;
+            }
+            variableIndex[operand.name] = variables.size();
+            variables.push_back(operand.name);
+          };
+          const auto collectAffineRange = [&](std::size_t begin, std::size_t end) {
+            for (std::size_t position = begin; position < end; ++position) {
+              const IRInst& inst = ir[position];
+              if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+                continue;
+              }
+              if (inst.op != IROp::LOCAL_VAR_DECL && inst.op != IROp::ASSIGN &&
+                  inst.op != IROp::ADD && inst.op != IROp::SUB && inst.op != IROp::MUL) {
+                return false;
+              }
+              if (!inst.dest.isLocalVar() || (!inst.src1.isImm() && !inst.src1.isLocalVar()) ||
+                  (!inst.src2.isNone() && !inst.src2.isImm() && !inst.src2.isLocalVar())) {
+                return false;
+              }
+              addVariable(inst.dest);
+              addVariable(inst.src1);
+              addVariable(inst.src2);
+              written.insert(inst.dest.name);
+            }
+            return true;
+          };
+          const std::size_t thenBegin = guardIndex + 1;
+          const std::size_t elseBegin = elseIndex + 1;
+          const std::size_t suffixBegin = joinIndex + 1;
+          if (!collectAffineRange(thenBegin, thenJump) ||
+              !collectAffineRange(elseBegin, joinIndex) ||
+              !collectAffineRange(suffixBegin, condIndex)) {
+            continue;
+          }
+          addVariable(Operand::localVar(induction));
+          if (variables.empty() || variables.size() > 20 || written.count(induction) == 0 ||
+              (condition.src2.isLocalVar() && written.count(condition.src2.name) != 0)) {
+            continue;
+          }
+
+          const std::size_t constantColumn = variables.size();
+          const std::size_t dimension = variables.size() + 1;
+          const auto applyAffineRange = [&](std::size_t begin, std::size_t end,
+                                            AffineMatrix& transform) {
+            const auto rowForOperand = [&](const Operand& operand) -> std::optional<AffineRow> {
+              AffineRow row(dimension, 0);
+              if (operand.isImm()) {
+                row[constantColumn] = static_cast<std::uint32_t>(operand.immVal);
+                return row;
+              }
+              if (!operand.isLocalVar()) {
+                return std::nullopt;
+              }
+              const auto found = variableIndex.find(operand.name);
+              return found == variableIndex.end()
+                         ? std::nullopt
+                         : std::optional<AffineRow>(transform[found->second]);
+            };
+            for (std::size_t position = begin; position < end; ++position) {
+              const IRInst& inst = ir[position];
+              if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+                continue;
+              }
+              const auto destination = variableIndex.find(inst.dest.name);
+              const auto lhs = rowForOperand(inst.src1);
+              if (destination == variableIndex.end() || !lhs) {
+                return false;
+              }
+              if (inst.op == IROp::LOCAL_VAR_DECL || inst.op == IROp::ASSIGN) {
+                transform[destination->second] = *lhs;
+                continue;
+              }
+              const auto rhs = rowForOperand(inst.src2);
+              if (!rhs) {
+                return false;
+              }
+              AffineRow result(dimension, 0);
+              if (inst.op == IROp::ADD || inst.op == IROp::SUB) {
+                for (std::size_t column = 0; column < dimension; ++column) {
+                  result[column] = inst.op == IROp::ADD ? (*lhs)[column] + (*rhs)[column]
+                                                        : (*lhs)[column] - (*rhs)[column];
+                }
+              } else {
+                const auto lhsConstant = rowIsConstant(*lhs, constantColumn);
+                const auto rhsConstant = rowIsConstant(*rhs, constantColumn);
+                if (!lhsConstant && !rhsConstant) {
+                  return false;
+                }
+                const std::uint32_t factor = lhsConstant ? *lhsConstant : *rhsConstant;
+                const AffineRow& value = lhsConstant ? *rhs : *lhs;
+                for (std::size_t column = 0; column < dimension; ++column) {
+                  result[column] = static_cast<std::uint32_t>(
+                      static_cast<std::uint64_t>(value[column]) * factor);
+                }
+              }
+              transform[destination->second] = std::move(result);
+            }
+            return true;
+          };
+
+          AffineMatrix thenTransform = identityMatrix(dimension);
+          AffineMatrix elseTransform = identityMatrix(dimension);
+          if (!applyAffineRange(thenBegin, thenJump, thenTransform) ||
+              !applyAffineRange(suffixBegin, condIndex, thenTransform) ||
+              !applyAffineRange(elseBegin, joinIndex, elseTransform) ||
+              !applyAffineRange(suffixBegin, condIndex, elseTransform)) {
+            continue;
+          }
+          const std::size_t inductionIndex = variableIndex.at(induction);
+          const auto canonicalInduction = [&](const AffineMatrix& transform) {
+            const AffineRow& row = transform[inductionIndex];
+            if (row[constantColumn] != 1) {
+              return false;
+            }
+            for (std::size_t column = 0; column < constantColumn; ++column) {
+              if (row[column] != (column == inductionIndex ? 1u : 0u)) {
+                return false;
+              }
+            }
+            return true;
+          };
+          if (!canonicalInduction(thenTransform) || !canonicalInduction(elseTransform)) {
+            continue;
+          }
+
+          std::size_t loopEnd = condIndex + 3;
+          const auto usedAfterLoop = [&](const std::string& name) {
+            for (std::size_t position = loopEnd; position < ir.size(); ++position) {
+              const IRInst& inst = ir[position];
+              if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
+                break;
+              }
+              if ((inst.src1.isLocalVar() && inst.src1.name == name) ||
+                  (inst.src2.isLocalVar() && inst.src2.name == name) ||
+                  ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) && inst.dest.isLocalVar() &&
+                   inst.dest.name == name)) {
+                return true;
+              }
+            }
+            return false;
+          };
+          bool resetsObservableState = false;
+          for (const std::string& name : written) {
+            if (name == induction || isCompilerTemp(name) || !usedAfterLoop(name)) {
+              continue;
+            }
+            const std::size_t rowIndex = variableIndex.at(name);
+            if (rowIsConstant(thenTransform[rowIndex], constantColumn) ||
+                rowIsConstant(elseTransform[rowIndex], constantColumn)) {
+              resetsObservableState = true;
+              break;
+            }
+          }
+          if (resetsObservableState) {
+            continue;
+          }
+
+          AffineMatrix periodTransform = identityMatrix(dimension);
+          for (std::uint64_t phase = 0; phase < period; ++phase) {
+            const AffineMatrix& iteration = useThen[phase] ? thenTransform : elseTransform;
+            periodTransform = multiplyMatrices(iteration, periodTransform);
+          }
+          AffineMatrix power = periodTransform;
+          AffineMatrix summary = identityMatrix(dimension);
+          std::uint64_t completePeriods = static_cast<std::uint64_t>(trips) / period;
+          while (completePeriods != 0) {
+            if ((completePeriods & 1u) != 0) {
+              summary = multiplyMatrices(power, summary);
+            }
+            completePeriods >>= 1;
+            if (completePeriods != 0) {
+              power = multiplyMatrices(power, power);
+            }
+          }
+          const std::uint64_t remainder = static_cast<std::uint64_t>(trips) % period;
+          for (std::uint64_t phase = 0; phase < remainder; ++phase) {
+            const AffineMatrix& iteration = useThen[phase] ? thenTransform : elseTransform;
+            summary = multiplyMatrices(iteration, summary);
+          }
+
+          bool observableChange = false;
+          bool validDependencies = true;
+          for (std::size_t rowIndex = 0; rowIndex < variables.size(); ++rowIndex) {
+            const std::string& name = variables[rowIndex];
+            if (!written.count(name) || !usedAfterLoop(name)) {
+              continue;
+            }
+            for (std::size_t column = 0; column < variables.size(); ++column) {
+              if (summary[rowIndex][column] != 0 && isCompilerTemp(variables[column])) {
+                validDependencies = false;
+              }
+            }
+            for (std::size_t column = 0; column < dimension; ++column) {
+              const std::uint32_t expected = column == rowIndex ? 1u : 0u;
+              if (summary[rowIndex][column] != expected) {
+                observableChange = true;
+              }
+            }
+          }
+          if (!observableChange || !validDependencies) {
+            continue;
+          }
+
+          std::vector<IRInst> replacement;
+          std::vector<std::pair<std::string, std::string>> finalMoves;
+          bool writeFinalInduction = false;
+          for (std::size_t rowIndex = 0; rowIndex < variables.size(); ++rowIndex) {
+            const std::string& name = variables[rowIndex];
+            if (!written.count(name) || !usedAfterLoop(name)) {
+              continue;
+            }
+            bool changedRow = false;
+            for (std::size_t column = 0; column < dimension; ++column) {
+              const std::uint32_t expected = column == rowIndex ? 1u : 0u;
+              if (summary[rowIndex][column] != expected) {
+                changedRow = true;
+                break;
+              }
+            }
+            if (!changedRow) {
+              continue;
+            }
+            if (name == induction) {
+              writeFinalInduction = true;
+              continue;
+            }
+            const std::string finalName = newTemp();
+            bool haveValue = false;
+            for (std::size_t column = 0; column < variables.size(); ++column) {
+              const std::uint32_t coefficient = summary[rowIndex][column];
+              if (coefficient == 0) {
+                continue;
+              }
+              Operand term = Operand::localVar(variables[column]);
+              if (coefficient != 1) {
+                const std::string productName = newTemp();
+                replacement.emplace_back(IROp::MUL, Operand::localVar(productName), term,
+                                         Operand::imm(static_cast<std::int32_t>(coefficient)));
+                term = Operand::localVar(productName);
+              }
+              if (!haveValue) {
+                replacement.emplace_back(IROp::ASSIGN, Operand::localVar(finalName), term,
+                                         Operand::none());
+                haveValue = true;
+              } else {
+                replacement.emplace_back(IROp::ADD, Operand::localVar(finalName),
+                                         Operand::localVar(finalName), term);
+              }
+            }
+            const std::uint32_t constant = summary[rowIndex][constantColumn];
+            if (!haveValue) {
+              replacement.emplace_back(IROp::ASSIGN, Operand::localVar(finalName),
+                                       Operand::imm(static_cast<std::int32_t>(constant)),
+                                       Operand::none());
+            } else if (constant != 0) {
+              replacement.emplace_back(IROp::ADD, Operand::localVar(finalName),
+                                       Operand::localVar(finalName),
+                                       Operand::imm(static_cast<std::int32_t>(constant)));
+            }
+            finalMoves.push_back({name, finalName});
+          }
+          for (const auto& move : finalMoves) {
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(move.first),
+                                     Operand::localVar(move.second), Operand::none());
+          }
+          if (writeFinalInduction) {
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(induction),
+                                     Operand::imm(static_cast<int>(finalInduction)),
+                                     Operand::none());
+          }
+          if (replacement.empty()) {
+            continue;
+          }
+
+          if (loopEnd < ir.size() && ir[loopEnd].op == IROp::LABEL && ir[loopEnd].dest.isLabel() &&
+              labelReferences[ir[loopEnd].dest.name] == 0) {
+            ++loopEnd;
+          }
+          ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(loopStart),
+                   ir.begin() + static_cast<std::ptrdiff_t>(loopEnd));
+          ir.insert(ir.begin() + static_cast<std::ptrdiff_t>(loopStart), replacement.begin(),
+                    replacement.end());
+          summarized = true;
+        }
+        if (!summarized) {
+          break;
+        }
+      }
+    }
+
     // Pass 6: 常数迭代循环消除（闭合形式）
     // 模式（循环反转后）：
     //   <循环前> ASSIGN i, #i0; ASSIGN s, #s0;

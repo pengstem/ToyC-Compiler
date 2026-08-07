@@ -80,6 +80,7 @@ perf/t_overwritten_dead_store.c
 perf/t_hot_constants.c
 perf/t_nested_affine_summary.c
 perf/t_coupled_affine_summary.c
+perf/t_periodic_affine_branch.c
 perf/t_loop_weighted_regalloc.c
 perf/t_dead_recurrence_loop.c
 perf/t_dead_pure_call_loop.c
@@ -91,3 +92,8 @@ regression/dead_branched_loop_safety.c
 regression/live_recurrence_safety.c
 regression/conditional_side_effect_safety.c
 regression/dead_call_side_effect_safety.c
+regression/periodic_negative_start_safety.c
+regression/periodic_state_guard_safety.c
+regression/periodic_global_effect_safety.c
+regression/periodic_reset_state_safety.c
+regression/periodic_phase_overflow_safety.c

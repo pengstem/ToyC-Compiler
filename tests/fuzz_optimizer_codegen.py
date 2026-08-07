@@ -169,6 +169,43 @@ def make_case(rng: random.Random, case_index: int) -> str:
             "  result = result + coupled_a + coupled_b + coupled_total + ci;",
         ]
     )
+    # A modulo-controlled affine branch has a finite phase period. The optimizer
+    # may summarize a whole period, but must preserve sequential assignments and
+    # the phase implied by a non-zero induction start.
+    periodic_start = rng.randint(0, 8)
+    periodic_trips = rng.randint(2, 12)
+    periodic_bound = periodic_start + periodic_trips
+    periodic_modulus = rng.randint(2, 7)
+    periodic_residue = rng.randrange(periodic_modulus)
+    periodic_relation = rng.choice(("==", "!="))
+    periodic_a = rng.randint(-5, 7)
+    periodic_b = rng.randint(-5, 7)
+    periodic_total = rng.randint(-9, 11)
+    then_a_coeff = rng.choice((-1, 1))
+    then_b_coeff = rng.choice((-1, 1))
+    else_a_coeff = rng.choice((-1, 1))
+    else_i_coeff = rng.randint(-2, 2)
+    lines.extend(
+        [
+            f"  int pi = {periodic_start};",
+            f"  int periodic_a = result % 13 + {periodic_a};",
+            f"  int periodic_b = seed % 11 + {periodic_b};",
+            f"  int periodic_total = {periodic_total};",
+            f"  while (pi < {periodic_bound}) {{",
+            f"    if (pi % {periodic_modulus} {periodic_relation} {periodic_residue}) {{",
+            f"      periodic_a = periodic_a * {then_a_coeff} + "
+            f"periodic_b * {then_b_coeff} + pi;",
+            "      periodic_total = periodic_total + periodic_a;",
+            "    } else {",
+            f"      periodic_b = periodic_b - periodic_a * {else_a_coeff} + "
+            f"pi * {else_i_coeff};",
+            "      periodic_total = periodic_total - periodic_b;",
+            "    }",
+            "    pi = pi + 1;",
+            "  }",
+            "  result = result + periodic_a + periodic_b + periodic_total + pi;",
+        ]
+    )
     lines.append("  result = result % 251;")
     lines.append("  if (result < 0) { result = result + 251; }")
     lines.extend(["  return result;", "}"])
