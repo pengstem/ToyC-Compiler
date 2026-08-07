@@ -2991,6 +2991,26 @@ void IRGenerator::optimizePass() {
             continue;
           }
 
+          // 不跨越“每轮把用户状态重置为常量”的循环做二次摘要。这种形态通常
+          // 来自 Pass 5.5 已删除的内层循环；保留外层回边可避免把两个独立证明
+          // 组合成一个更强但尚未验证的嵌套状态证明。编译器临时的常量定义不算
+          // 循环状态，直接的耦合递推仍由本 Pass 处理。
+          bool resetsUserState = false;
+          for (const std::string& name : written) {
+            if (name == induction || isCompilerTemp(name)) {
+              continue;
+            }
+            const auto position = variableIndex.find(name);
+            if (position != variableIndex.end() &&
+                rowIsConstant(transform[position->second], constantColumn)) {
+              resetsUserState = true;
+              break;
+            }
+          }
+          if (resetsUserState) {
+            continue;
+          }
+
           const std::size_t inductionIndex = variableIndex.at(induction);
           const AffineRow& inductionRow = transform[inductionIndex];
           bool canonicalInduction = inductionRow[constantColumn] == 1;
