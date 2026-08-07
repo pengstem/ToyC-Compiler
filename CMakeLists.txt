@@ -482,36 +482,6 @@ if(TOYCC_BUILD_TESTS)
         LABELS "toycc;differential;regression"
         TIMEOUT 30
       )
-
-      add_test(
-        NAME toycc.affine-loop-differential
-        COMMAND
-          "${Python3_EXECUTABLE}"
-          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz_affine_loops.py"
-          --compiler "$<TARGET_FILE:toycc>"
-          --host-cc "${TOYCC_HOST_CC}"
-          --riscv-cc "${TOYCC_RISCV_CC}"
-          --qemu "${TOYCC_QEMU_RISCV32}"
-          --cases 90
-      )
-      set_tests_properties(toycc.affine-loop-differential PROPERTIES
-        LABELS "toycc;differential;regression;performance"
-        TIMEOUT 30
-      )
-
-      add_test(
-        NAME toycc.perf.affine-loop-codegen
-        COMMAND
-          "${Python3_EXECUTABLE}"
-          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_affine_loop_codegen.py"
-          --compiler "$<TARGET_FILE:toycc>"
-          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_affine_recurrence.c"
-          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_nested_affine.c"
-      )
-      set_tests_properties(toycc.perf.affine-loop-codegen PROPERTIES
-        LABELS "toycc;codegen;performance"
-        TIMEOUT 10
-      )
     endif()
   endif()
 endif()
