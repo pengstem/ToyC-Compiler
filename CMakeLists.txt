@@ -482,6 +482,19 @@ if(TOYCC_BUILD_TESTS)
         LABELS "toycc;differential;regression"
         TIMEOUT 30
       )
+
+      add_test(
+        NAME toycc.perf.dead-loop-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_dead_loop_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_result_loop.c"
+      )
+      set_tests_properties(toycc.perf.dead-loop-codegen PROPERTIES
+        LABELS "toycc;codegen;performance"
+        TIMEOUT 10
+      )
     endif()
   endif()
 endif()

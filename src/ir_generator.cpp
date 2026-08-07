@@ -2033,6 +2033,106 @@ void IRGenerator::optimizePass() {
     }
   }
 
+  // Pass 4.5: 删除结果完全不可观察的纯计数循环。
+  // DCE 会先清掉循环体中的死算术，但归纳变量与回边本身互相活跃，普通
+  // 指令级活跃性无法删掉它们。这里仅处理无内部控制流、调用、内存写入或
+  // 全局写入的反转循环；若体内所有被定义的局部值在循环后均不再使用，
+  // 整个循环可按 C 的 as-if 规则删除。
+  {
+    bool removedLoop = true;
+    while (removedLoop) {
+      removedLoop = false;
+      std::unordered_map<std::string, int> labelReferences;
+      for (const auto& inst : ir) {
+        if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+            inst.dest.isLabel()) {
+          ++labelReferences[inst.dest.name];
+        }
+      }
+
+      for (std::size_t index = 0; index + 1 < ir.size() && !removedLoop; ++index) {
+        if (ir[index].op != IROp::BRANCH || !ir[index].dest.isLabel() ||
+            ir[index + 1].op != IROp::LABEL || !ir[index + 1].dest.isLabel()) {
+          continue;
+        }
+        const std::string condLabel = ir[index].dest.name;
+        const std::string bodyLabel = ir[index + 1].dest.name;
+        if (labelReferences[condLabel] != 1 || labelReferences[bodyLabel] != 1) {
+          continue;
+        }
+
+        std::size_t condIndex = index + 2;
+        while (condIndex < ir.size() &&
+               !(ir[condIndex].op == IROp::LABEL && ir[condIndex].dest.isLabel() &&
+                 ir[condIndex].dest.name == condLabel)) {
+          ++condIndex;
+        }
+        if (condIndex + 2 >= ir.size() || ir[condIndex + 2].op != IROp::BNEZ ||
+            !ir[condIndex + 2].dest.isLabel() || ir[condIndex + 2].dest.name != bodyLabel) {
+          continue;
+        }
+
+        bool pureStraightBody = condIndex > index + 2;
+        std::unordered_set<std::string> definitions;
+        for (std::size_t body = index + 2; body < condIndex && pureStraightBody; ++body) {
+          const auto& inst = ir[body];
+          switch (inst.op) {
+          case IROp::LOCAL_VAR_DECL:
+          case IROp::ASSIGN:
+          case IROp::ADD:
+          case IROp::SUB:
+          case IROp::MUL:
+          case IROp::DIV:
+          case IROp::MOD:
+          case IROp::NOT:
+          case IROp::LT:
+          case IROp::GT:
+          case IROp::LE:
+          case IROp::GE:
+          case IROp::EQ:
+          case IROp::NE:
+            break;
+          default:
+            pureStraightBody = false;
+            continue;
+          }
+          if (!inst.dest.isLocalVar()) {
+            pureStraightBody = false;
+            continue;
+          }
+          definitions.insert(inst.dest.name);
+        }
+        if (!pureStraightBody || definitions.empty()) {
+          continue;
+        }
+
+        std::size_t loopEnd = condIndex + 3;
+        bool liveAfter = false;
+        for (std::size_t after = loopEnd; after < ir.size() && !liveAfter; ++after) {
+          const auto& inst = ir[after];
+          if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
+            break;
+          }
+          liveAfter = (inst.src1.isLocalVar() && definitions.count(inst.src1.name) != 0) ||
+                      (inst.src2.isLocalVar() && definitions.count(inst.src2.name) != 0) ||
+                      ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) &&
+                       inst.dest.isLocalVar() && definitions.count(inst.dest.name) != 0);
+        }
+        if (liveAfter) {
+          continue;
+        }
+
+        if (loopEnd < ir.size() && ir[loopEnd].op == IROp::LABEL && ir[loopEnd].dest.isLabel() &&
+            labelReferences[ir[loopEnd].dest.name] == 0) {
+          ++loopEnd;
+        }
+        ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(index),
+                 ir.begin() + static_cast<std::ptrdiff_t>(loopEnd));
+        removedLoop = true;
+      }
+    }
+  }
+
   // Pass 5: 单次使用临时变量复用（single-use temp recycling）。
   // 必须在 pass 0-4 全部收敛后运行一次：长表达式链的每个中间结果都是单次使用
   // 的临时变量，变量总数 O(链长)，超出寄存器池后全部落栈，每轮循环栈读写往返。
