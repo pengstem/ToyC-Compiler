@@ -151,6 +151,29 @@ def make_case(rng: random.Random, case_index: int) -> str:
             "  result = result + bounded_total + bounded_i;",
         ]
     )
+    # A small modular state machine has a finite transition graph independent
+    # of its much larger trip count. Exercise cycle discovery and symbolic
+    # proof that the accumulator remains an additive translation.
+    state_modulus = rng.randint(3, 31)
+    state_multiplier = rng.randint(2, 11)
+    state_bias = rng.randint(1, 13)
+    state_initial = rng.randrange(state_modulus)
+    state_score = rng.randint(1, 4)
+    state_trips = rng.randint(1100, 1250)
+    lines.extend(
+        [
+            "  int state_i = 0;",
+            f"  int cycle_state = {state_initial};",
+            "  int cycle_total = result;",
+            f"  while (state_i < {state_trips}) {{",
+            "    cycle_state = "
+            f"(cycle_state * {state_multiplier} + {state_bias}) % {state_modulus};",
+            f"    cycle_total = cycle_total + cycle_state * {state_score} + 3;",
+            "    state_i = state_i + 1;",
+            "  }",
+            "  result = result + cycle_total + cycle_state + state_i;",
+        ]
+    )
     # Constant-trip nested affine loops exercise the runtime-initial-value
     # summary. Include zero-trip and negative-induction starts across cases.
     outer_bound = rng.randint(1, 6)

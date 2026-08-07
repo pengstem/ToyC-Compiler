@@ -4694,6 +4694,613 @@ void IRGenerator::optimizePass() {
       }
     }
 
+    // Pass 5.57: 汇总单个有界模状态驱动的自主循环。
+    //
+    // `state = transition(state) % m; sum += f(state)` 不是归纳变量周期，也不是
+    // 仿射递推，但更新后的有符号余数只能落在 [-(m-1), m-1]。对小常量 m，
+    // 状态转移必在至多 2*m-1 个状态内进入环。这里解释的是这一有限状态转移，
+    // 而不是按源循环的千万/亿次迭代执行；累加器用符号系数证明仅作独立加法。
+    {
+      constexpr int kMaxStateModulus = 16384;
+      constexpr int kMaxAccumulators = 8;
+
+      struct SymbolicStateValue {
+        std::int32_t constant = 0;
+        std::vector<std::uint32_t> coefficients;
+      };
+      struct StateTransition {
+        std::int32_t nextState = 0;
+        std::vector<std::uint32_t> deltas;
+      };
+
+      const auto sameOperand = [](const Operand& lhs, const Operand& rhs) {
+        if (lhs.type != rhs.type) {
+          return false;
+        }
+        if (lhs.isImm()) {
+          return lhs.immVal == rhs.immVal;
+        }
+        if (lhs.isLocalVar() || lhs.isGlobalVar() || lhs.isLabel() || lhs.isParam()) {
+          return lhs.name == rhs.name;
+        }
+        return lhs.isNone() && rhs.isNone();
+      };
+      const auto wrappedBinary = [](IROp op, std::int32_t lhs,
+                                    std::int32_t rhs) -> std::optional<std::int32_t> {
+        switch (op) {
+        case IROp::ADD:
+          return static_cast<std::int32_t>(static_cast<std::uint32_t>(lhs) +
+                                           static_cast<std::uint32_t>(rhs));
+        case IROp::SUB:
+          return static_cast<std::int32_t>(static_cast<std::uint32_t>(lhs) -
+                                           static_cast<std::uint32_t>(rhs));
+        case IROp::MUL:
+          return static_cast<std::int32_t>(static_cast<std::uint32_t>(
+              static_cast<std::uint64_t>(static_cast<std::uint32_t>(lhs)) *
+              static_cast<std::uint32_t>(rhs)));
+        case IROp::DIV:
+          if (rhs == 0 || (lhs == INT32_MIN && rhs == -1)) {
+            return std::nullopt;
+          }
+          return lhs / rhs;
+        case IROp::MOD:
+          if (rhs == 0 || (lhs == INT32_MIN && rhs == -1)) {
+            return std::nullopt;
+          }
+          return lhs % rhs;
+        case IROp::LT:
+          return lhs < rhs ? 1 : 0;
+        case IROp::GT:
+          return lhs > rhs ? 1 : 0;
+        case IROp::LE:
+          return lhs <= rhs ? 1 : 0;
+        case IROp::GE:
+          return lhs >= rhs ? 1 : 0;
+        case IROp::EQ:
+          return lhs == rhs ? 1 : 0;
+        case IROp::NE:
+          return lhs != rhs ? 1 : 0;
+        default:
+          return std::nullopt;
+        }
+      };
+
+      for (int summaryRound = 0; summaryRound < 8; ++summaryRound) {
+        std::unordered_map<std::string, int> labelReferences;
+        std::unordered_map<std::string, std::size_t> labelPositions;
+        for (std::size_t index = 0; index < ir.size(); ++index) {
+          const IRInst& inst = ir[index];
+          if (inst.op == IROp::LABEL && inst.dest.isLabel()) {
+            labelPositions[inst.dest.name] = index;
+          }
+          if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+              inst.dest.isLabel()) {
+            ++labelReferences[inst.dest.name];
+          }
+        }
+
+        bool summarized = false;
+        for (std::size_t loopStart = ir.size(); loopStart-- > 0 && !summarized;) {
+          if (ir[loopStart].op != IROp::BRANCH || !ir[loopStart].dest.isLabel() ||
+              loopStart + 1 >= ir.size() || ir[loopStart + 1].op != IROp::LABEL ||
+              !ir[loopStart + 1].dest.isLabel()) {
+            continue;
+          }
+          const std::string condLabel = ir[loopStart].dest.name;
+          const std::string bodyLabel = ir[loopStart + 1].dest.name;
+          if (labelReferences[condLabel] != 1 || labelReferences[bodyLabel] != 1) {
+            continue;
+          }
+          const auto condPosition = labelPositions.find(condLabel);
+          if (condPosition == labelPositions.end() || condPosition->second <= loopStart + 2) {
+            continue;
+          }
+          const std::size_t condIndex = condPosition->second;
+          if (condIndex + 2 >= ir.size()) {
+            continue;
+          }
+          const IRInst& condition = ir[condIndex + 1];
+          const IRInst& backedge = ir[condIndex + 2];
+          if ((condition.op != IROp::LT && condition.op != IROp::LE) ||
+              !condition.dest.isLocalVar() || !condition.src1.isLocalVar() ||
+              backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
+              backedge.dest.name != bodyLabel || !backedge.src1.isLocalVar() ||
+              backedge.src1.name != condition.dest.name) {
+            continue;
+          }
+          const std::string induction = condition.src1.name;
+
+          const auto findNearbyConstant = [&](const std::string& name) -> std::optional<int> {
+            for (std::size_t position = loopStart; position > 0; --position) {
+              const IRInst& candidate = ir[position - 1];
+              if (candidate.dest.isLocalVar() && candidate.dest.name == name) {
+                if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                    candidate.src1.isImm()) {
+                  return candidate.src1.immVal;
+                }
+                return std::nullopt;
+              }
+              if (candidate.op == IROp::LABEL || candidate.op == IROp::BRANCH ||
+                  candidate.op == IROp::BEQZ || candidate.op == IROp::BNEZ ||
+                  candidate.op == IROp::CALL || candidate.op == IROp::FUNC_BEGIN) {
+                break;
+              }
+            }
+            return std::nullopt;
+          };
+          const auto findUniqueConstant = [&](const std::string& name) -> std::optional<int> {
+            std::size_t functionBegin = loopStart;
+            while (functionBegin > 0 && ir[functionBegin - 1].op != IROp::FUNC_BEGIN) {
+              --functionBegin;
+            }
+            int definitions = 0;
+            std::optional<int> value;
+            for (std::size_t position = functionBegin; position < ir.size(); ++position) {
+              const IRInst& candidate = ir[position];
+              if (candidate.op == IROp::FUNC_END) {
+                break;
+              }
+              if (!candidate.dest.isLocalVar() || candidate.dest.name != name ||
+                  candidate.op == IROp::RETURN || candidate.op == IROp::PARAM ||
+                  (candidate.op == IROp::LOCAL_VAR_DECL && candidate.src1.isNone())) {
+                continue;
+              }
+              ++definitions;
+              if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                  candidate.src1.isImm()) {
+                value = candidate.src1.immVal;
+              } else {
+                value.reset();
+              }
+            }
+            return definitions == 1 ? value : std::nullopt;
+          };
+
+          const auto initial = findNearbyConstant(induction);
+          std::optional<int> upper;
+          if (condition.src2.isImm()) {
+            upper = condition.src2.immVal;
+          } else if (condition.src2.isLocalVar()) {
+            upper = findNearbyConstant(condition.src2.name);
+            if (!upper) {
+              upper = findUniqueConstant(condition.src2.name);
+            }
+          }
+          if (!initial || !upper ||
+              (condition.op == IROp::LE && *upper == INT32_MAX && *initial <= *upper)) {
+            continue;
+          }
+          std::int64_t trips = static_cast<std::int64_t>(*upper) - *initial;
+          if (condition.op == IROp::LE) {
+            ++trips;
+          }
+          trips = std::max<std::int64_t>(0, trips);
+          const std::int64_t finalInduction = static_cast<std::int64_t>(*initial) + trips;
+          if (trips < 1000 || trips > INT32_MAX || finalInduction < INT32_MIN ||
+              finalInduction > INT32_MAX) {
+            continue;
+          }
+
+          bool bodySupported = true;
+          bool inductionIncremented = false;
+          int inductionWrites = 0;
+          std::unordered_map<std::string, int> writeCounts;
+          for (std::size_t position = loopStart + 2; position < condIndex && bodySupported;
+               ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+              continue;
+            }
+            if (!inst.dest.isLocalVar() || inductionIncremented) {
+              bodySupported = false;
+              break;
+            }
+            ++writeCounts[inst.dest.name];
+            if (inst.dest.name == induction) {
+              ++inductionWrites;
+              inductionIncremented = inductionWrites == 1 && inst.op == IROp::ADD &&
+                                     inst.src1.isLocalVar() && inst.src1.name == induction &&
+                                     inst.src2.isImm() && inst.src2.immVal == 1;
+              if (!inductionIncremented) {
+                bodySupported = false;
+              }
+              continue;
+            }
+            switch (inst.op) {
+            case IROp::LOCAL_VAR_DECL:
+            case IROp::ASSIGN:
+            case IROp::ADD:
+            case IROp::SUB:
+            case IROp::MUL:
+            case IROp::DIV:
+            case IROp::MOD:
+            case IROp::NOT:
+            case IROp::LT:
+            case IROp::GT:
+            case IROp::LE:
+            case IROp::GE:
+            case IROp::EQ:
+            case IROp::NE:
+              break;
+            default:
+              bodySupported = false;
+              break;
+            }
+          }
+          if (!bodySupported || inductionWrites != 1 || !inductionIncremented ||
+              (condition.src2.isLocalVar() && writeCounts.count(condition.src2.name) != 0)) {
+            continue;
+          }
+
+          const std::size_t loopEnd = condIndex + 3;
+          const auto usedAfterLoop = [&](const std::string& name) {
+            for (std::size_t position = loopEnd; position < ir.size(); ++position) {
+              const IRInst& inst = ir[position];
+              if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
+                break;
+              }
+              if ((inst.src1.isLocalVar() && inst.src1.name == name) ||
+                  (inst.src2.isLocalVar() && inst.src2.name == name) ||
+                  ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) && inst.dest.isLocalVar() &&
+                   inst.dest.name == name)) {
+                return true;
+              }
+            }
+            return false;
+          };
+          const auto previousBodyDefinition =
+              [&](const std::string& name, std::size_t before) -> std::optional<std::size_t> {
+            for (std::size_t position = before; position > loopStart + 2; --position) {
+              const IRInst& candidate = ir[position - 1];
+              if (candidate.dest.isLocalVar() && candidate.dest.name == name &&
+                  !(candidate.op == IROp::LOCAL_VAR_DECL && candidate.src1.isNone())) {
+                return position - 1;
+              }
+            }
+            return std::nullopt;
+          };
+          const auto reducedModulus = [&](const std::string& state) -> std::optional<int> {
+            if (writeCounts[state] != 1) {
+              return std::nullopt;
+            }
+            for (std::size_t position = loopStart + 2; position < condIndex; ++position) {
+              const IRInst& inst = ir[position];
+              if (!inst.dest.isLocalVar() || inst.dest.name != state) {
+                continue;
+              }
+              if (inst.op == IROp::MOD && inst.src2.isImm() && inst.src2.immVal > 1 &&
+                  inst.src2.immVal <= kMaxStateModulus) {
+                return inst.src2.immVal;
+              }
+              if (inst.op != IROp::SUB || !inst.src2.isLocalVar()) {
+                return std::nullopt;
+              }
+              const auto productDefinition = previousBodyDefinition(inst.src2.name, position);
+              if (!productDefinition) {
+                return std::nullopt;
+              }
+              const IRInst& product = ir[*productDefinition];
+              const Operand* quotientOperand = nullptr;
+              const Operand* divisorOperand = nullptr;
+              if (product.op == IROp::MUL && product.src1.isLocalVar() && product.src2.isImm()) {
+                quotientOperand = &product.src1;
+                divisorOperand = &product.src2;
+              } else if (product.op == IROp::MUL && product.src2.isLocalVar() &&
+                         product.src1.isImm()) {
+                quotientOperand = &product.src2;
+                divisorOperand = &product.src1;
+              }
+              if (quotientOperand == nullptr || divisorOperand->immVal <= 1 ||
+                  divisorOperand->immVal > kMaxStateModulus) {
+                return std::nullopt;
+              }
+              const auto quotientDefinition =
+                  previousBodyDefinition(quotientOperand->name, *productDefinition);
+              if (!quotientDefinition) {
+                return std::nullopt;
+              }
+              const IRInst& quotient = ir[*quotientDefinition];
+              if (quotient.op != IROp::DIV || !quotient.src2.isImm() ||
+                  quotient.src2.immVal != divisorOperand->immVal ||
+                  !sameOperand(quotient.src1, inst.src1)) {
+                return std::nullopt;
+              }
+              return divisorOperand->immVal;
+            }
+            return std::nullopt;
+          };
+
+          bool leaksCompilerTemporary = false;
+          for (const auto& [name, writes] : writeCounts) {
+            if (writes > 0 && isCompilerTemp(name) && usedAfterLoop(name)) {
+              leaksCompilerTemporary = true;
+              break;
+            }
+          }
+          if (leaksCompilerTemporary) {
+            continue;
+          }
+
+          std::vector<std::string> stateCandidates;
+          for (const auto& [name, writes] : writeCounts) {
+            if (writes > 0 && name != induction && !isCompilerTemp(name) && reducedModulus(name)) {
+              stateCandidates.push_back(name);
+            }
+          }
+          std::sort(stateCandidates.begin(), stateCandidates.end());
+
+          for (const std::string& state : stateCandidates) {
+            const auto modulus = reducedModulus(state);
+            const auto initialState = findNearbyConstant(state);
+            if (!modulus || !initialState) {
+              continue;
+            }
+
+            std::vector<std::string> accumulators;
+            for (const auto& [name, writes] : writeCounts) {
+              if (writes == 0 || name == induction || name == state || isCompilerTemp(name)) {
+                continue;
+              }
+              if (usedAfterLoop(name)) {
+                accumulators.push_back(name);
+              }
+            }
+            if (accumulators.size() > kMaxAccumulators) {
+              continue;
+            }
+            std::sort(accumulators.begin(), accumulators.end());
+
+            const std::size_t coefficientCount = accumulators.size() + 1;
+            const auto coefficientsAreZero = [](const SymbolicStateValue& value) {
+              return std::all_of(value.coefficients.begin(), value.coefficients.end(),
+                                 [](std::uint32_t coefficient) { return coefficient == 0; });
+            };
+            const auto combineValues = [](const SymbolicStateValue& lhs,
+                                          const SymbolicStateValue& rhs, bool subtract) {
+              SymbolicStateValue result;
+              result.constant = static_cast<std::int32_t>(
+                  subtract ? static_cast<std::uint32_t>(lhs.constant) -
+                                 static_cast<std::uint32_t>(rhs.constant)
+                           : static_cast<std::uint32_t>(lhs.constant) +
+                                 static_cast<std::uint32_t>(rhs.constant));
+              result.coefficients.resize(lhs.coefficients.size());
+              for (std::size_t index = 0; index < result.coefficients.size(); ++index) {
+                result.coefficients[index] =
+                    subtract ? lhs.coefficients[index] - rhs.coefficients[index]
+                             : lhs.coefficients[index] + rhs.coefficients[index];
+              }
+              return result;
+            };
+            const auto scaleValue = [](SymbolicStateValue value, std::uint32_t factor) {
+              value.constant = static_cast<std::int32_t>(static_cast<std::uint32_t>(
+                  static_cast<std::uint64_t>(static_cast<std::uint32_t>(value.constant)) * factor));
+              for (auto& coefficient : value.coefficients) {
+                coefficient =
+                    static_cast<std::uint32_t>(static_cast<std::uint64_t>(coefficient) * factor);
+              }
+              return value;
+            };
+
+            const auto evaluateTransition =
+                [&](std::int32_t currentState) -> std::optional<StateTransition> {
+              std::unordered_map<std::string, SymbolicStateValue> values;
+              values[state] = {currentState, std::vector<std::uint32_t>(coefficientCount, 0)};
+              for (std::size_t index = 0; index < accumulators.size(); ++index) {
+                SymbolicStateValue accumulator{0, std::vector<std::uint32_t>(coefficientCount, 0)};
+                accumulator.coefficients[index] = 1;
+                values[accumulators[index]] = std::move(accumulator);
+              }
+              SymbolicStateValue symbolicInduction{0,
+                                                   std::vector<std::uint32_t>(coefficientCount, 0)};
+              symbolicInduction.coefficients.back() = 1;
+              values[induction] = std::move(symbolicInduction);
+
+              const auto valueOf =
+                  [&](const Operand& operand) -> std::optional<SymbolicStateValue> {
+                if (operand.isImm()) {
+                  return SymbolicStateValue{operand.immVal,
+                                            std::vector<std::uint32_t>(coefficientCount, 0)};
+                }
+                if (operand.isLocalVar()) {
+                  const auto found = values.find(operand.name);
+                  if (found != values.end()) {
+                    return found->second;
+                  }
+                  const auto constant = findUniqueConstant(operand.name);
+                  if (constant) {
+                    return SymbolicStateValue{*constant,
+                                              std::vector<std::uint32_t>(coefficientCount, 0)};
+                  }
+                }
+                return std::nullopt;
+              };
+
+              for (std::size_t position = loopStart + 2; position < condIndex; ++position) {
+                const IRInst& inst = ir[position];
+                if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+                  values.erase(inst.dest.name);
+                  continue;
+                }
+                if (!inst.dest.isLocalVar()) {
+                  return std::nullopt;
+                }
+                if (inst.dest.name == induction) {
+                  continue;
+                }
+                const auto lhs = valueOf(inst.src1);
+                if (!lhs) {
+                  return std::nullopt;
+                }
+                std::optional<SymbolicStateValue> result;
+                if (inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) {
+                  result = *lhs;
+                } else if (inst.op == IROp::NOT) {
+                  if (coefficientsAreZero(*lhs)) {
+                    result = SymbolicStateValue{lhs->constant == 0 ? 1 : 0,
+                                                std::vector<std::uint32_t>(coefficientCount, 0)};
+                  }
+                } else {
+                  const auto rhs = valueOf(inst.src2);
+                  if (!rhs) {
+                    return std::nullopt;
+                  }
+                  if (inst.op == IROp::ADD || inst.op == IROp::SUB) {
+                    result = combineValues(*lhs, *rhs, inst.op == IROp::SUB);
+                  } else if (inst.op == IROp::MUL) {
+                    const bool lhsConstant = coefficientsAreZero(*lhs);
+                    const bool rhsConstant = coefficientsAreZero(*rhs);
+                    if (lhsConstant || rhsConstant) {
+                      result = lhsConstant
+                                   ? scaleValue(*rhs, static_cast<std::uint32_t>(lhs->constant))
+                                   : scaleValue(*lhs, static_cast<std::uint32_t>(rhs->constant));
+                    }
+                  } else if (coefficientsAreZero(*lhs) && coefficientsAreZero(*rhs)) {
+                    const auto folded = wrappedBinary(inst.op, lhs->constant, rhs->constant);
+                    if (folded) {
+                      result = SymbolicStateValue{*folded,
+                                                  std::vector<std::uint32_t>(coefficientCount, 0)};
+                    }
+                  }
+                }
+                if (!result) {
+                  return std::nullopt;
+                }
+                values[inst.dest.name] = std::move(*result);
+              }
+
+              const auto finalState = values.find(state);
+              if (finalState == values.end() || !coefficientsAreZero(finalState->second)) {
+                return std::nullopt;
+              }
+              StateTransition transition;
+              transition.nextState = finalState->second.constant;
+              transition.deltas.resize(accumulators.size());
+              for (std::size_t row = 0; row < accumulators.size(); ++row) {
+                const auto finalAccumulator = values.find(accumulators[row]);
+                if (finalAccumulator == values.end()) {
+                  return std::nullopt;
+                }
+                for (std::size_t column = 0; column < coefficientCount; ++column) {
+                  const std::uint32_t expected = column == row ? 1u : 0u;
+                  if (finalAccumulator->second.coefficients[column] != expected) {
+                    return std::nullopt;
+                  }
+                }
+                transition.deltas[row] =
+                    static_cast<std::uint32_t>(finalAccumulator->second.constant);
+              }
+              return transition;
+            };
+
+            const std::uint64_t maximumStates = static_cast<std::uint64_t>(*modulus) * 2 + 1;
+            // 小循环交给正常代码生成；本 Pass 只在状态空间远小于动态迭代数时
+            // 寻找周期，避免退化成按源循环次数进行编译期求值。
+            if (static_cast<std::uint64_t>(trips) <= maximumStates) {
+              continue;
+            }
+            std::unordered_map<std::int32_t, std::uint64_t> seen;
+            std::vector<std::int32_t> states;
+            std::vector<std::vector<std::uint32_t>> totals;
+            seen.reserve(static_cast<std::size_t>(maximumStates));
+            states.reserve(static_cast<std::size_t>(maximumStates));
+            totals.reserve(static_cast<std::size_t>(maximumStates));
+            states.push_back(*initialState);
+            totals.push_back(std::vector<std::uint32_t>(accumulators.size(), 0));
+            seen.emplace(*initialState, 0);
+
+            std::uint64_t simulated = 0;
+            std::uint64_t cycleStart = 0;
+            std::uint64_t cycleEnd = 0;
+            bool foundCycle = false;
+            bool evaluated = true;
+            while (simulated < static_cast<std::uint64_t>(trips) && simulated < maximumStates) {
+              const auto transition = evaluateTransition(states.back());
+              if (!transition || transition->nextState <= -*modulus ||
+                  transition->nextState >= *modulus) {
+                evaluated = false;
+                break;
+              }
+              std::vector<std::uint32_t> nextTotals = totals.back();
+              for (std::size_t index = 0; index < accumulators.size(); ++index) {
+                nextTotals[index] += transition->deltas[index];
+              }
+              ++simulated;
+              states.push_back(transition->nextState);
+              totals.push_back(std::move(nextTotals));
+              const auto [found, inserted] = seen.emplace(states.back(), simulated);
+              if (!inserted) {
+                cycleStart = found->second;
+                cycleEnd = simulated;
+                foundCycle = true;
+                break;
+              }
+            }
+            if (!evaluated || (simulated < static_cast<std::uint64_t>(trips) && !foundCycle)) {
+              continue;
+            }
+
+            std::int32_t finalState = states.back();
+            std::vector<std::uint32_t> totalDelta(accumulators.size(), 0);
+            if (simulated == static_cast<std::uint64_t>(trips)) {
+              totalDelta = totals.back();
+            } else {
+              const std::uint64_t cycleLength = cycleEnd - cycleStart;
+              const std::uint64_t remaining = static_cast<std::uint64_t>(trips) - cycleStart;
+              const std::uint64_t completeCycles = remaining / cycleLength;
+              const std::uint64_t remainder = remaining % cycleLength;
+              finalState = states[static_cast<std::size_t>(cycleStart + remainder)];
+              for (std::size_t index = 0; index < accumulators.size(); ++index) {
+                const std::uint32_t prefix = totals[static_cast<std::size_t>(cycleStart)][index];
+                const std::uint32_t cycle =
+                    totals[static_cast<std::size_t>(cycleEnd)][index] - prefix;
+                const std::uint32_t tail =
+                    totals[static_cast<std::size_t>(cycleStart + remainder)][index] - prefix;
+                totalDelta[index] =
+                    prefix +
+                    static_cast<std::uint32_t>(static_cast<std::uint64_t>(cycle) * completeCycles) +
+                    tail;
+              }
+            }
+
+            std::vector<IRInst> replacement;
+            if (usedAfterLoop(state)) {
+              replacement.emplace_back(IROp::ASSIGN, Operand::localVar(state),
+                                       Operand::imm(finalState), Operand::none());
+            }
+            for (std::size_t index = 0; index < accumulators.size(); ++index) {
+              if (totalDelta[index] != 0) {
+                replacement.emplace_back(
+                    IROp::ADD, Operand::localVar(accumulators[index]),
+                    Operand::localVar(accumulators[index]),
+                    Operand::imm(static_cast<std::int32_t>(totalDelta[index])));
+              }
+            }
+            if (usedAfterLoop(induction)) {
+              replacement.emplace_back(IROp::ASSIGN, Operand::localVar(induction),
+                                       Operand::imm(static_cast<int>(finalInduction)),
+                                       Operand::none());
+            }
+
+            std::size_t eraseEnd = loopEnd;
+            if (eraseEnd < ir.size() && ir[eraseEnd].op == IROp::LABEL &&
+                ir[eraseEnd].dest.isLabel() && labelReferences[ir[eraseEnd].dest.name] == 0) {
+              ++eraseEnd;
+            }
+            ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(loopStart),
+                     ir.begin() + static_cast<std::ptrdiff_t>(eraseEnd));
+            ir.insert(ir.begin() + static_cast<std::ptrdiff_t>(loopStart), replacement.begin(),
+                      replacement.end());
+            summarized = true;
+            changed = true;
+            break;
+          }
+        }
+        if (!summarized) {
+          break;
+        }
+      }
+    }
+
     // Pass 5.6: 汇总耦合仿射状态循环。
     //
     // Pass 5.5 只接受 `x' = x + affine(invariants, induction)`，因此会保守拒绝

@@ -84,6 +84,7 @@ perf/t_periodic_affine_branch.c
 perf/t_polynomial_accumulator_summary.c
 perf/t_periodic_accumulator_summary.c
 perf/t_bounded_helper_summary.c
+perf/t_modular_state_cycle_summary.c
 perf/t_periodic_affine_branch_large_period.c
 perf/t_threshold_affine_branch.c
 perf/t_loop_weighted_regalloc.c
@@ -106,6 +107,11 @@ regression/bounded_helper_moving_bound_safety.c
 regression/bounded_helper_negative_outer_safety.c
 regression/bounded_helper_recurrence_safety.c
 regression/bounded_helper_stale_remainder_safety.c
+regression/modular_state_accumulator_recurrence_safety.c
+regression/modular_state_induction_safety.c
+regression/modular_state_large_modulus_safety.c
+regression/modular_state_cross_state_safety.c
+regression/modular_state_short_cycle_safety.c
 regression/polynomial_geometric_safety.c
 regression/polynomial_step_safety.c
 regression/polynomial_cross_state_safety.c
