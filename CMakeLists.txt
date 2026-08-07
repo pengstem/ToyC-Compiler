@@ -515,6 +515,26 @@ if(TOYCC_BUILD_TESTS)
       )
 
       add_test(
+        NAME toycc.perf.quotient-accumulator-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_quotient_accumulator_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_quotient_accumulator_summary.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/quotient_negative_range_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/quotient_recurrence_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/quotient_moving_divisor_safety.c"
+      )
+      set_tests_properties(toycc.perf.quotient-accumulator-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
         NAME toycc.perf.periodic-accumulator-summary-codegen
         COMMAND
           "${Python3_EXECUTABLE}"

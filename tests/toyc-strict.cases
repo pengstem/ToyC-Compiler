@@ -86,6 +86,7 @@ perf/t_nested_affine_summary.c
 perf/t_coupled_affine_summary.c
 perf/t_periodic_affine_branch.c
 perf/t_polynomial_accumulator_summary.c
+perf/t_quotient_accumulator_summary.c
 perf/t_periodic_accumulator_summary.c
 perf/t_bounded_helper_summary.c
 perf/t_modular_state_cycle_summary.c
@@ -109,6 +110,9 @@ regression/periodic_state_guard_safety.c
 regression/periodic_global_effect_safety.c
 regression/periodic_reset_state_safety.c
 regression/periodic_phase_overflow_safety.c
+regression/quotient_negative_range_safety.c
+regression/quotient_recurrence_safety.c
+regression/quotient_moving_divisor_safety.c
 regression/bounded_helper_moving_bound_safety.c
 regression/bounded_helper_negative_outer_safety.c
 regression/bounded_helper_recurrence_safety.c

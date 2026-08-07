@@ -4333,6 +4333,461 @@ void IRGenerator::optimizePass() {
       }
     }
 
+    // Pass 5.555: 汇总非负线性归纳变量的整除桶累加。
+    //
+    // 对 `sum += a * ((i + c) / d) + b`，商在每 d 个连续输入上保持不变。
+    // 使用 floor 前缀和按除法桶闭式计算全部增量，不枚举源循环。为保持 C 的
+    // 截断语义，只接受被除数全程位于 [0, INT32_MAX]、常量非零除数、规范
+    // `i += 1` 和直线局部计算；负被除数、可变除数和交叉状态均保守回退。
+    {
+      struct BucketValue {
+        enum class Kind { UNKNOWN, CONSTANT, INDUCTION, QUOTIENT };
+        Kind kind = Kind::UNKNOWN;
+        int constant = 0;
+        std::int64_t offset = 0;
+        std::uint64_t divisor = 1;
+        std::uint32_t quotientCoefficient = 0;
+        std::uint32_t additiveConstant = 0;
+        std::unordered_map<std::string, std::uint32_t> stateCoefficients;
+      };
+      struct BucketAccumulator {
+        std::string name;
+        std::int64_t offset = 0;
+        std::uint64_t divisor = 1;
+        std::uint32_t quotientCoefficient = 0;
+        std::uint32_t additiveConstant = 0;
+      };
+
+      const auto sameQuotient = [](const BucketValue& lhs, const BucketValue& rhs) {
+        return lhs.kind == BucketValue::Kind::QUOTIENT && rhs.kind == BucketValue::Kind::QUOTIENT &&
+               lhs.offset == rhs.offset && lhs.divisor == rhs.divisor;
+      };
+      const auto foldBucketConstant = [](IROp op, int lhs, int rhs) -> std::optional<int> {
+        const std::uint32_t left = static_cast<std::uint32_t>(lhs);
+        const std::uint32_t right = static_cast<std::uint32_t>(rhs);
+        switch (op) {
+        case IROp::ADD:
+          return static_cast<std::int32_t>(left + right);
+        case IROp::SUB:
+          return static_cast<std::int32_t>(left - right);
+        case IROp::MUL:
+          return static_cast<std::int32_t>(
+              static_cast<std::uint32_t>(static_cast<std::uint64_t>(left) * right));
+        case IROp::DIV:
+          if (rhs == 0 || (lhs == INT32_MIN && rhs == -1)) {
+            return std::nullopt;
+          }
+          return lhs / rhs;
+        default:
+          return std::nullopt;
+        }
+      };
+      const auto quotientPrefix = [](std::uint64_t count, std::uint64_t divisor) {
+        const std::uint64_t quotient = count / divisor;
+        const std::uint64_t remainder = count % divisor;
+        std::uint64_t first = quotient;
+        std::uint64_t second = quotient == 0 ? 0 : quotient - 1;
+        if ((first & 1u) == 0) {
+          first /= 2;
+        } else {
+          second /= 2;
+        }
+        return divisor * first * second + quotient * remainder;
+      };
+
+      for (int summaryRound = 0; summaryRound < 8; ++summaryRound) {
+        std::unordered_map<std::string, int> labelReferences;
+        for (const auto& inst : ir) {
+          if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+              inst.dest.isLabel()) {
+            ++labelReferences[inst.dest.name];
+          }
+        }
+
+        bool summarized = false;
+        for (std::size_t loopStart = ir.size(); loopStart-- > 0 && !summarized;) {
+          if (ir[loopStart].op != IROp::BRANCH || !ir[loopStart].dest.isLabel() ||
+              loopStart + 1 >= ir.size() || ir[loopStart + 1].op != IROp::LABEL ||
+              !ir[loopStart + 1].dest.isLabel()) {
+            continue;
+          }
+          const std::string condLabel = ir[loopStart].dest.name;
+          const std::string bodyLabel = ir[loopStart + 1].dest.name;
+          if (labelReferences[condLabel] != 1 || labelReferences[bodyLabel] != 1) {
+            continue;
+          }
+          std::size_t condIndex = loopStart + 2;
+          while (condIndex < ir.size() && ir[condIndex].op != IROp::FUNC_END &&
+                 !(ir[condIndex].op == IROp::LABEL && ir[condIndex].dest.isLabel() &&
+                   ir[condIndex].dest.name == condLabel)) {
+            ++condIndex;
+          }
+          if (condIndex + 2 >= ir.size() || ir[condIndex].op == IROp::FUNC_END) {
+            continue;
+          }
+          const IRInst& condition = ir[condIndex + 1];
+          const IRInst& backedge = ir[condIndex + 2];
+          if ((condition.op != IROp::LT && condition.op != IROp::LE) ||
+              !condition.dest.isLocalVar() || !condition.src1.isLocalVar() ||
+              backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
+              backedge.dest.name != bodyLabel || !backedge.src1.isLocalVar() ||
+              backedge.src1.name != condition.dest.name) {
+            continue;
+          }
+          const std::string induction = condition.src1.name;
+
+          const auto findNearbyConstant = [&](const std::string& name) -> std::optional<int> {
+            for (std::size_t position = loopStart; position > 0; --position) {
+              const IRInst& candidate = ir[position - 1];
+              if (candidate.dest.isLocalVar() && candidate.dest.name == name) {
+                if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                    candidate.src1.isImm()) {
+                  return candidate.src1.immVal;
+                }
+                return std::nullopt;
+              }
+              if (candidate.op == IROp::LABEL || candidate.op == IROp::BRANCH ||
+                  candidate.op == IROp::BEQZ || candidate.op == IROp::BNEZ ||
+                  candidate.op == IROp::CALL || candidate.op == IROp::FUNC_BEGIN) {
+                break;
+              }
+            }
+            return std::nullopt;
+          };
+          const auto findUniqueConstant = [&](const std::string& name) -> std::optional<int> {
+            std::size_t functionBegin = loopStart;
+            while (functionBegin > 0 && ir[functionBegin - 1].op != IROp::FUNC_BEGIN) {
+              --functionBegin;
+            }
+            int definitions = 0;
+            std::optional<int> value;
+            for (std::size_t position = functionBegin; position < ir.size(); ++position) {
+              const IRInst& candidate = ir[position];
+              if (candidate.op == IROp::FUNC_END) {
+                break;
+              }
+              if (!candidate.dest.isLocalVar() || candidate.dest.name != name ||
+                  candidate.op == IROp::RETURN || candidate.op == IROp::PARAM ||
+                  (candidate.op == IROp::LOCAL_VAR_DECL && candidate.src1.isNone())) {
+                continue;
+              }
+              ++definitions;
+              if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                  candidate.src1.isImm()) {
+                value = candidate.src1.immVal;
+              } else {
+                value.reset();
+              }
+            }
+            return definitions == 1 ? value : std::nullopt;
+          };
+
+          const auto initial = findNearbyConstant(induction);
+          std::optional<int> upper;
+          if (condition.src2.isImm()) {
+            upper = condition.src2.immVal;
+          } else if (condition.src2.isLocalVar()) {
+            upper = findNearbyConstant(condition.src2.name);
+            if (!upper) {
+              upper = findUniqueConstant(condition.src2.name);
+            }
+          }
+          if (!initial || !upper ||
+              (condition.op == IROp::LE && *upper == INT32_MAX && *initial <= *upper)) {
+            continue;
+          }
+          std::int64_t tripCount = static_cast<std::int64_t>(*upper) - *initial;
+          if (condition.op == IROp::LE) {
+            ++tripCount;
+          }
+          tripCount = std::max<std::int64_t>(0, tripCount);
+          const std::int64_t finalInduction = static_cast<std::int64_t>(*initial) + tripCount;
+          if (tripCount < 2 || tripCount > INT32_MAX || finalInduction > INT32_MAX) {
+            continue;
+          }
+          const std::uint64_t trips = static_cast<std::uint64_t>(tripCount);
+          const auto inductionRangeSafe = [&](std::int64_t offset) {
+            const std::int64_t lowest = static_cast<std::int64_t>(*initial) + offset;
+            const std::int64_t highest = finalInduction - 1 + offset;
+            return lowest >= 0 && highest <= INT32_MAX;
+          };
+
+          std::unordered_map<std::string, BucketValue> values;
+          values[induction] = {BucketValue::Kind::INDUCTION, 0, 0, 1, 0, 0, {}};
+          const auto valueOf = [&](const Operand& operand) {
+            if (operand.isImm()) {
+              return BucketValue{BucketValue::Kind::CONSTANT, operand.immVal, 0, 1, 0, 0, {}};
+            }
+            if (operand.isLocalVar()) {
+              const auto found = values.find(operand.name);
+              if (found != values.end()) {
+                return found->second;
+              }
+              const auto constant = findUniqueConstant(operand.name);
+              if (constant) {
+                return BucketValue{BucketValue::Kind::CONSTANT, *constant, 0, 1, 0, 0, {}};
+              }
+              if (!isCompilerTemp(operand.name)) {
+                BucketValue state;
+                state.kind = BucketValue::Kind::QUOTIENT;
+                state.stateCoefficients[operand.name] = 1;
+                return state;
+              }
+            }
+            return BucketValue{};
+          };
+
+          bool bodySupported = true;
+          bool inductionIncremented = false;
+          int inductionWrites = 0;
+          std::unordered_set<std::string> written;
+          std::unordered_set<std::string> derivedDefinitions;
+          std::vector<BucketAccumulator> accumulators;
+          for (std::size_t position = loopStart + 2; position < condIndex && bodySupported;
+               ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+              continue;
+            }
+            if (!inst.dest.isLocalVar() || inductionIncremented) {
+              bodySupported = false;
+              break;
+            }
+            written.insert(inst.dest.name);
+            if (inst.dest.name == induction) {
+              ++inductionWrites;
+              inductionIncremented = inductionWrites == 1 && inst.op == IROp::ADD &&
+                                     inst.src1.isLocalVar() && inst.src1.name == induction &&
+                                     inst.src2.isImm() && inst.src2.immVal == 1;
+              if (!inductionIncremented) {
+                bodySupported = false;
+              }
+              continue;
+            }
+
+            const bool lhsSelf = inst.src1.isLocalVar() && inst.src1.name == inst.dest.name;
+            const bool rhsSelf = inst.src2.isLocalVar() && inst.src2.name == inst.dest.name;
+            if ((inst.op == IROp::ADD || inst.op == IROp::SUB) && (lhsSelf || rhsSelf) &&
+                !(inst.op == IROp::SUB && rhsSelf)) {
+              const BucketValue delta = valueOf(lhsSelf ? inst.src2 : inst.src1);
+              if (!isCompilerTemp(inst.dest.name) && delta.kind == BucketValue::Kind::QUOTIENT &&
+                  delta.quotientCoefficient != 0 && delta.stateCoefficients.empty()) {
+                const bool subtract = inst.op == IROp::SUB;
+                accumulators.push_back(
+                    {inst.dest.name, delta.offset, delta.divisor,
+                     subtract ? 0u - delta.quotientCoefficient : delta.quotientCoefficient,
+                     subtract ? 0u - delta.additiveConstant : delta.additiveConstant});
+                values.erase(inst.dest.name);
+                continue;
+              }
+            }
+
+            const BucketValue lhs = valueOf(inst.src1);
+            const BucketValue rhs = valueOf(inst.src2);
+            BucketValue result;
+            if (inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) {
+              result = lhs;
+            } else if ((inst.op == IROp::ADD || inst.op == IROp::SUB) &&
+                       lhs.kind == BucketValue::Kind::CONSTANT &&
+                       rhs.kind == BucketValue::Kind::CONSTANT) {
+              const auto folded = foldBucketConstant(inst.op, lhs.constant, rhs.constant);
+              if (folded) {
+                result = {BucketValue::Kind::CONSTANT, *folded, 0, 1, 0, 0, {}};
+              }
+            } else if (inst.op == IROp::ADD || inst.op == IROp::SUB) {
+              const int direction = inst.op == IROp::ADD ? 1 : -1;
+              if (lhs.kind == BucketValue::Kind::INDUCTION &&
+                  rhs.kind == BucketValue::Kind::CONSTANT) {
+                const std::int64_t offset =
+                    lhs.offset + static_cast<std::int64_t>(direction) * rhs.constant;
+                if (inductionRangeSafe(offset)) {
+                  result = {BucketValue::Kind::INDUCTION, 0, offset, 1, 0, 0, {}};
+                }
+              } else if (inst.op == IROp::ADD && lhs.kind == BucketValue::Kind::CONSTANT &&
+                         rhs.kind == BucketValue::Kind::INDUCTION) {
+                const std::int64_t offset = rhs.offset + lhs.constant;
+                if (inductionRangeSafe(offset)) {
+                  result = {BucketValue::Kind::INDUCTION, 0, offset, 1, 0, 0, {}};
+                }
+              } else {
+                const bool lhsLinear = lhs.kind == BucketValue::Kind::CONSTANT ||
+                                       lhs.kind == BucketValue::Kind::QUOTIENT;
+                const bool rhsLinear = rhs.kind == BucketValue::Kind::CONSTANT ||
+                                       rhs.kind == BucketValue::Kind::QUOTIENT;
+                const bool lhsHasQuotient =
+                    lhs.kind == BucketValue::Kind::QUOTIENT && lhs.quotientCoefficient != 0;
+                const bool rhsHasQuotient =
+                    rhs.kind == BucketValue::Kind::QUOTIENT && rhs.quotientCoefficient != 0;
+                if (lhsLinear && rhsLinear &&
+                    (!lhsHasQuotient || !rhsHasQuotient || sameQuotient(lhs, rhs))) {
+                  result.kind = BucketValue::Kind::QUOTIENT;
+                  const BucketValue& quotientSource = lhsHasQuotient ? lhs : rhs;
+                  if (lhsHasQuotient || rhsHasQuotient) {
+                    result.offset = quotientSource.offset;
+                    result.divisor = quotientSource.divisor;
+                  }
+                  const std::uint32_t lhsQuotient =
+                      lhs.kind == BucketValue::Kind::QUOTIENT ? lhs.quotientCoefficient : 0;
+                  const std::uint32_t rhsQuotient =
+                      rhs.kind == BucketValue::Kind::QUOTIENT ? rhs.quotientCoefficient : 0;
+                  result.quotientCoefficient =
+                      inst.op == IROp::ADD ? lhsQuotient + rhsQuotient : lhsQuotient - rhsQuotient;
+                  const std::uint32_t lhsConstant = lhs.kind == BucketValue::Kind::CONSTANT
+                                                        ? static_cast<std::uint32_t>(lhs.constant)
+                                                        : lhs.additiveConstant;
+                  const std::uint32_t rhsConstant = rhs.kind == BucketValue::Kind::CONSTANT
+                                                        ? static_cast<std::uint32_t>(rhs.constant)
+                                                        : rhs.additiveConstant;
+                  result.additiveConstant =
+                      inst.op == IROp::ADD ? lhsConstant + rhsConstant : lhsConstant - rhsConstant;
+                  result.stateCoefficients = lhs.stateCoefficients;
+                  for (const auto& [name, coefficient] : rhs.stateCoefficients) {
+                    auto& destination = result.stateCoefficients[name];
+                    destination = inst.op == IROp::ADD ? destination + coefficient
+                                                       : destination - coefficient;
+                    if (destination == 0) {
+                      result.stateCoefficients.erase(name);
+                    }
+                  }
+                }
+              }
+            } else if (inst.op == IROp::MUL) {
+              const BucketValue* quotient = nullptr;
+              const BucketValue* constant = nullptr;
+              if (lhs.kind == BucketValue::Kind::QUOTIENT &&
+                  rhs.kind == BucketValue::Kind::CONSTANT) {
+                quotient = &lhs;
+                constant = &rhs;
+              } else if (rhs.kind == BucketValue::Kind::QUOTIENT &&
+                         lhs.kind == BucketValue::Kind::CONSTANT) {
+                quotient = &rhs;
+                constant = &lhs;
+              }
+              if (quotient != nullptr) {
+                result = *quotient;
+                const std::uint32_t factor = static_cast<std::uint32_t>(constant->constant);
+                result.quotientCoefficient = static_cast<std::uint32_t>(
+                    static_cast<std::uint64_t>(result.quotientCoefficient) * factor);
+                result.additiveConstant = static_cast<std::uint32_t>(
+                    static_cast<std::uint64_t>(result.additiveConstant) * factor);
+                for (auto& [name, coefficient] : result.stateCoefficients) {
+                  (void) name;
+                  coefficient =
+                      static_cast<std::uint32_t>(static_cast<std::uint64_t>(coefficient) * factor);
+                }
+              }
+            } else if (inst.op == IROp::DIV && lhs.kind == BucketValue::Kind::INDUCTION &&
+                       rhs.kind == BucketValue::Kind::CONSTANT && rhs.constant != 0 &&
+                       rhs.constant != INT32_MIN && inductionRangeSafe(lhs.offset)) {
+              const bool negative = rhs.constant < 0;
+              const std::uint64_t divisor = static_cast<std::uint64_t>(
+                  negative ? -static_cast<std::int64_t>(rhs.constant) : rhs.constant);
+              result = {BucketValue::Kind::QUOTIENT,           0, lhs.offset, divisor,
+                        negative ? std::uint32_t{0} - 1u : 1u, 0, {}};
+            }
+            if (result.kind == BucketValue::Kind::UNKNOWN) {
+              bodySupported = false;
+              break;
+            }
+            if (!isCompilerTemp(inst.dest.name) && result.kind == BucketValue::Kind::QUOTIENT &&
+                result.quotientCoefficient != 0 && result.stateCoefficients.size() == 1) {
+              const auto self = result.stateCoefficients.find(inst.dest.name);
+              if (self != result.stateCoefficients.end() && self->second == 1) {
+                accumulators.push_back({inst.dest.name, result.offset, result.divisor,
+                                        result.quotientCoefficient, result.additiveConstant});
+                values.erase(inst.dest.name);
+                continue;
+              }
+            }
+            if (!result.stateCoefficients.empty() && !isCompilerTemp(inst.dest.name)) {
+              bodySupported = false;
+              break;
+            }
+            values[inst.dest.name] = result;
+            if (!isCompilerTemp(inst.dest.name)) {
+              derivedDefinitions.insert(inst.dest.name);
+            }
+          }
+          if (!bodySupported || inductionWrites != 1 || !inductionIncremented ||
+              accumulators.empty() ||
+              (condition.src2.isLocalVar() && written.count(condition.src2.name) != 0)) {
+            continue;
+          }
+
+          const std::size_t loopEnd = condIndex + 3;
+          const auto usedAfterLoop = [&](const std::string& name) {
+            for (std::size_t position = loopEnd; position < ir.size(); ++position) {
+              const IRInst& inst = ir[position];
+              if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
+                break;
+              }
+              if ((inst.src1.isLocalVar() && inst.src1.name == name) ||
+                  (inst.src2.isLocalVar() && inst.src2.name == name) ||
+                  ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) && inst.dest.isLocalVar() &&
+                   inst.dest.name == name)) {
+                return true;
+              }
+            }
+            return false;
+          };
+          bool leaksDerivedValue = false;
+          for (const std::string& name : derivedDefinitions) {
+            if (usedAfterLoop(name)) {
+              leaksDerivedValue = true;
+              break;
+            }
+          }
+          if (leaksDerivedValue) {
+            continue;
+          }
+
+          std::unordered_map<std::string, std::uint32_t> deltas;
+          std::vector<std::string> accumulatorOrder;
+          for (const BucketAccumulator& accumulator : accumulators) {
+            const std::uint64_t first = static_cast<std::uint64_t>(
+                static_cast<std::int64_t>(*initial) + accumulator.offset);
+            const std::uint64_t quotientSum = quotientPrefix(first + trips, accumulator.divisor) -
+                                              quotientPrefix(first, accumulator.divisor);
+            const std::uint32_t delta =
+                static_cast<std::uint32_t>(quotientSum * accumulator.quotientCoefficient +
+                                           trips * accumulator.additiveConstant);
+            if (deltas.count(accumulator.name) == 0) {
+              accumulatorOrder.push_back(accumulator.name);
+            }
+            deltas[accumulator.name] += delta;
+          }
+
+          std::vector<IRInst> replacement;
+          for (const std::string& name : accumulatorOrder) {
+            if (usedAfterLoop(name) && deltas[name] != 0) {
+              replacement.emplace_back(IROp::ADD, Operand::localVar(name), Operand::localVar(name),
+                                       Operand::imm(static_cast<std::int32_t>(deltas[name])));
+            }
+          }
+          if (usedAfterLoop(induction)) {
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(induction),
+                                     Operand::imm(static_cast<int>(finalInduction)),
+                                     Operand::none());
+          }
+
+          std::size_t eraseEnd = loopEnd;
+          if (eraseEnd < ir.size() && ir[eraseEnd].op == IROp::LABEL &&
+              ir[eraseEnd].dest.isLabel() && labelReferences[ir[eraseEnd].dest.name] == 0) {
+            ++eraseEnd;
+          }
+          ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(loopStart),
+                   ir.begin() + static_cast<std::ptrdiff_t>(eraseEnd));
+          ir.insert(ir.begin() + static_cast<std::ptrdiff_t>(loopStart), replacement.begin(),
+                    replacement.end());
+          summarized = true;
+          changed = true;
+        }
+        if (!summarized) {
+          break;
+        }
+      }
+    }
+
     // Pass 5.56: 汇总由归纳变量余数驱动的直线累加循环。
     //
     // `i % k`（以及由它组合出的算术表达式）在非负、无回绕的 `i += 1`

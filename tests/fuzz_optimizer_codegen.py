@@ -151,6 +151,28 @@ def make_case(rng: random.Random, case_index: int) -> str:
             "  result = result + bounded_total + bounded_i;",
         ]
     )
+    # Nonnegative induction division is a sequence of constant-width quotient
+    # buckets. Differentially exercise its closed form, including a helper-like
+    # offset, signed scaling, and a constant added through a temporary chain.
+    quotient_start = rng.randint(0, 5)
+    quotient_trips = rng.randint(2, 40)
+    quotient_offset = rng.randint(0, 9)
+    quotient_divisor = rng.randint(2, 13)
+    quotient_scale = rng.choice((-3, -2, -1, 1, 2, 3, 4))
+    quotient_bias = rng.randint(-7, 9)
+    lines.extend(
+        [
+            f"  int quotient_i = {quotient_start};",
+            "  int quotient_total = result;",
+            f"  while (quotient_i < {quotient_start + quotient_trips}) {{",
+            "    quotient_total = quotient_total + "
+            f"((quotient_i + {quotient_offset}) / {quotient_divisor}) * "
+            f"{quotient_scale} + {quotient_bias};",
+            "    quotient_i = quotient_i + 1;",
+            "  }",
+            "  result = result + quotient_total + quotient_i;",
+        ]
+    )
     # A small modular state machine has a finite transition graph independent
     # of its much larger trip count. Exercise cycle discovery and symbolic
     # proof that the accumulator remains an additive translation.
