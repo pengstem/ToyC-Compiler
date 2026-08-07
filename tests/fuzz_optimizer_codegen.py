@@ -206,6 +206,28 @@ def make_case(rng: random.Random, case_index: int) -> str:
             "  result = result + periodic_a + periodic_b + periodic_total + pi;",
         ]
     )
+    # Polynomial induction accumulators exercise the closed-form sums for
+    # powers zero through three, including a negative induction start.
+    polynomial_start = rng.randint(-5, 3)
+    polynomial_trips = rng.randint(2, 10)
+    polynomial_is_le = rng.choice((False, True))
+    polynomial_bound = polynomial_start + polynomial_trips - (1 if polynomial_is_le else 0)
+    polynomial_relation = "<=" if polynomial_is_le else "<"
+    polynomial_coefficients = [rng.choice((-3, -2, -1, 1, 2, 3)) for _ in range(4)]
+    lines.extend(
+        [
+            f"  int polynomial_i = {polynomial_start};",
+            "  int polynomial_sum = result;",
+            f"  while (polynomial_i {polynomial_relation} {polynomial_bound}) {{",
+            "    polynomial_sum = polynomial_sum + "
+            f"polynomial_i * polynomial_i * polynomial_i * {polynomial_coefficients[3]} + "
+            f"polynomial_i * polynomial_i * {polynomial_coefficients[2]} + "
+            f"polynomial_i * {polynomial_coefficients[1]} + {polynomial_coefficients[0]};",
+            "    polynomial_i = polynomial_i + 1;",
+            "  }",
+            "  result = result + polynomial_sum + polynomial_i;",
+        ]
+    )
     lines.append("  result = result % 251;")
     lines.append("  if (result < 0) { result = result + 251; }")
     lines.extend(["  return result;", "}"])
@@ -217,7 +239,9 @@ def compile_and_run(args: argparse.Namespace, source: str, case_dir: Path) -> tu
     source_path.write_text(source, encoding="utf-8")
 
     host_path = case_dir / "host"
-    host = run([args.host_cc, "-O2", "-w", str(source_path), "-o", str(host_path)])
+    # ToyC targets RV32 two's-complement arithmetic; keep the host oracle from
+    # exploiting C signed-overflow UB in generated stress expressions.
+    host = run([args.host_cc, "-O0", "-fwrapv", "-w", str(source_path), "-o", str(host_path)])
     if host.returncode != 0:
         raise RuntimeError(f"host compile failed:\n{host.stderr}")
     host_run = run([str(host_path)])

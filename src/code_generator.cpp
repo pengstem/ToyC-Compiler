@@ -486,10 +486,8 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
           var.ranges.back().end = ref.first;
         }
       }
-      var.ranges.erase(
-          std::remove_if(var.ranges.begin(), var.ranges.end(),
-                         [](const LiveRange& range) { return range.start == range.end; }),
-          var.ranges.end());
+      // 即使某一段定义没有使用，机器指令仍会写该寄存器。把零长度段作为真实的
+      // 点冲突保留在图中；删除它会允许该死写覆盖同寄存器中仍存活的参数/局部值。
       if (!ok || var.ranges.empty()) {
         continue;
       }

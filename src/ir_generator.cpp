@@ -1,6 +1,7 @@
 #include "ir_generator.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cctype>
 #include <cstdint>
@@ -2253,11 +2254,15 @@ void IRGenerator::optimizePass() {
           }
           if (j < ir.size() && ir[j].op == IROp::BEQZ && j + 1 < ir.size()) {
             const std::string endLabel = ir[j].dest.name;
-            // BEQZ 之后必须是 LABEL b（循环体开始）
-            if (ir[j + 1].op == IROp::LABEL) {
-              const std::string bodyLabel = ir[j + 1].dest.name;
+            // 原始 IR 在 BEQZ 后有 LABEL b。内联后若该标签没有其它引用，标签清理
+            // 会把它删除；循环语义不变，但后续反转/摘要会失去规范入口。此时创建
+            // 一个只供新回边使用的 body 标签，使内联循环也进入同一优化链。
+            const bool hasBodyLabel = ir[j + 1].op == IROp::LABEL;
+            const std::string bodyLabel = hasBodyLabel ? ir[j + 1].dest.name : newLabel();
+            const std::size_t bodyStart = j + 1;
+            {
               // 向后扫描到 LABEL e，记录最后一个 BRANCH c（循环尾跳转）
-              std::size_t k = j + 1;
+              std::size_t k = bodyStart;
               std::size_t lastBranchC = 0;
               bool foundEnd = false;
               for (; k < ir.size(); ++k) {
@@ -2334,8 +2339,12 @@ void IRGenerator::optimizePass() {
                 // 4. 条件块移动到测试点（循环体末尾）重新执行
                 optimized.push_back(IRInst(IROp::BRANCH, Operand::label(condLabel), Operand::none(),
                                            Operand::none()));
+                if (!hasBodyLabel) {
+                  optimized.push_back(IRInst(IROp::LABEL, Operand::label(bodyLabel),
+                                             Operand::none(), Operand::none()));
+                }
                 // 循环体（LABEL b 到循环尾跳转之前）
-                for (std::size_t m = j + 1; m < lastBranchC; ++m) {
+                for (std::size_t m = bodyStart; m < lastBranchC; ++m) {
                   optimized.push_back(ir[m]);
                 }
                 // 循环尾: BRANCH c -> LABEL c（测试点）
@@ -3252,6 +3261,450 @@ void IRGenerator::optimizePass() {
         }
         ir = std::move(summarized);
         changed = true;
+      }
+    }
+
+    // Pass 5.55: 汇总最高三次的归纳变量多项式累加循环。
+    //
+    // 对 `sum = sum + P(i); i = i + 1`，其中 P 的次数不超过 3，利用
+    // Faulhaber 求和把整个循环替换为一次 32 位环绕加法。这里只构造并计算
+    // 符号闭式，不逐轮执行源程序；多次写同一累加器、交叉状态、分支、调用、
+    // 全局状态、可变上界或非 +1 归纳均保守回退。
+    {
+      struct Polynomial {
+        std::array<std::uint32_t, 4> coeff{};
+      };
+      struct PolynomialExpr {
+        Polynomial polynomial;
+        std::unordered_map<std::string, std::uint32_t> stateCoefficients;
+      };
+
+      const auto scalePolynomial = [](const Polynomial& value, std::uint32_t factor) {
+        Polynomial result;
+        for (std::size_t degree = 0; degree < result.coeff.size(); ++degree) {
+          result.coeff[degree] =
+              static_cast<std::uint32_t>(static_cast<std::uint64_t>(value.coeff[degree]) * factor);
+        }
+        return result;
+      };
+      const auto multiplyPolynomial = [](const Polynomial& lhs,
+                                         const Polynomial& rhs) -> std::optional<Polynomial> {
+        Polynomial result;
+        for (std::size_t left = 0; left < lhs.coeff.size(); ++left) {
+          if (lhs.coeff[left] == 0) {
+            continue;
+          }
+          for (std::size_t right = 0; right < rhs.coeff.size(); ++right) {
+            if (rhs.coeff[right] == 0) {
+              continue;
+            }
+            if (left + right >= result.coeff.size()) {
+              return std::nullopt;
+            }
+            result.coeff[left + right] += static_cast<std::uint32_t>(
+                static_cast<std::uint64_t>(lhs.coeff[left]) * rhs.coeff[right]);
+          }
+        }
+        return result;
+      };
+      const auto constantPolynomial = [](int value) {
+        Polynomial result;
+        result.coeff[0] = static_cast<std::uint32_t>(value);
+        return result;
+      };
+      const auto constantValue =
+          [](const PolynomialExpr& expression) -> std::optional<std::uint32_t> {
+        if (!expression.stateCoefficients.empty()) {
+          return std::nullopt;
+        }
+        for (std::size_t degree = 1; degree < expression.polynomial.coeff.size(); ++degree) {
+          if (expression.polynomial.coeff[degree] != 0) {
+            return std::nullopt;
+          }
+        }
+        return expression.polynomial.coeff[0];
+      };
+      const auto combineExpression = [](const PolynomialExpr& lhs, const PolynomialExpr& rhs,
+                                        bool subtract) {
+        PolynomialExpr result;
+        for (std::size_t degree = 0; degree < result.polynomial.coeff.size(); ++degree) {
+          result.polynomial.coeff[degree] =
+              subtract ? lhs.polynomial.coeff[degree] - rhs.polynomial.coeff[degree]
+                       : lhs.polynomial.coeff[degree] + rhs.polynomial.coeff[degree];
+        }
+        result.stateCoefficients = lhs.stateCoefficients;
+        for (const auto& [name, coefficient] : rhs.stateCoefficients) {
+          auto& destination = result.stateCoefficients[name];
+          destination = subtract ? destination - coefficient : destination + coefficient;
+          if (destination == 0) {
+            result.stateCoefficients.erase(name);
+          }
+        }
+        return result;
+      };
+      const auto scaleExpression = [&](const PolynomialExpr& expression, std::uint32_t factor) {
+        PolynomialExpr result;
+        result.polynomial = scalePolynomial(expression.polynomial, factor);
+        for (const auto& [name, coefficient] : expression.stateCoefficients) {
+          const std::uint32_t scaled =
+              static_cast<std::uint32_t>(static_cast<std::uint64_t>(coefficient) * factor);
+          if (scaled != 0) {
+            result.stateCoefficients[name] = scaled;
+          }
+        }
+        return result;
+      };
+      const auto multiplyExpression =
+          [&](const PolynomialExpr& lhs,
+              const PolynomialExpr& rhs) -> std::optional<PolynomialExpr> {
+        const auto lhsConstant = constantValue(lhs);
+        const auto rhsConstant = constantValue(rhs);
+        if (lhsConstant) {
+          return scaleExpression(rhs, *lhsConstant);
+        }
+        if (rhsConstant) {
+          return scaleExpression(lhs, *rhsConstant);
+        }
+        if (!lhs.stateCoefficients.empty() || !rhs.stateCoefficients.empty()) {
+          return std::nullopt;
+        }
+        const auto product = multiplyPolynomial(lhs.polynomial, rhs.polynomial);
+        if (!product) {
+          return std::nullopt;
+        }
+        PolynomialExpr result;
+        result.polynomial = *product;
+        return result;
+      };
+      const auto multiply32 = [](std::uint32_t lhs, std::uint32_t rhs) {
+        return static_cast<std::uint32_t>(static_cast<std::uint64_t>(lhs) * rhs);
+      };
+      const auto sumPowersFromZero = [&](std::uint64_t count) {
+        std::array<std::uint32_t, 4> sums{};
+        sums[0] = static_cast<std::uint32_t>(count);
+        if (count == 0) {
+          return sums;
+        }
+        std::uint64_t first = count;
+        std::uint64_t second = count - 1;
+        if ((first & 1u) == 0) {
+          first /= 2;
+        } else {
+          second /= 2;
+        }
+        sums[1] = multiply32(static_cast<std::uint32_t>(first), static_cast<std::uint32_t>(second));
+
+        first = count;
+        second = count - 1;
+        std::uint64_t third = count * 2 - 1;
+        if ((first & 1u) == 0) {
+          first /= 2;
+        } else {
+          second /= 2;
+        }
+        if (first % 3 == 0) {
+          first /= 3;
+        } else if (second % 3 == 0) {
+          second /= 3;
+        } else {
+          third /= 3;
+        }
+        sums[2] = multiply32(
+            multiply32(static_cast<std::uint32_t>(first), static_cast<std::uint32_t>(second)),
+            static_cast<std::uint32_t>(third));
+        sums[3] = multiply32(sums[1], sums[1]);
+        return sums;
+      };
+      const auto sumPolynomial = [&](const Polynomial& polynomial, int initial,
+                                     std::uint64_t trips) {
+        const auto sums = sumPowersFromZero(trips);
+        const std::uint32_t start = static_cast<std::uint32_t>(initial);
+        const std::uint32_t start2 = multiply32(start, start);
+        const std::uint32_t start3 = multiply32(start2, start);
+        std::array<std::uint32_t, 4> shifted{};
+        shifted[0] = sums[0];
+        shifted[1] = multiply32(start, sums[0]) + sums[1];
+        shifted[2] =
+            multiply32(start2, sums[0]) + multiply32(multiply32(2, start), sums[1]) + sums[2];
+        shifted[3] = multiply32(start3, sums[0]) + multiply32(multiply32(3, start2), sums[1]) +
+                     multiply32(multiply32(3, start), sums[2]) + sums[3];
+        std::uint32_t result = 0;
+        for (std::size_t degree = 0; degree < polynomial.coeff.size(); ++degree) {
+          result += multiply32(polynomial.coeff[degree], shifted[degree]);
+        }
+        return result;
+      };
+
+      for (int summaryRound = 0; summaryRound < 8; ++summaryRound) {
+        std::unordered_map<std::string, int> labelReferences;
+        for (const auto& inst : ir) {
+          if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+              inst.dest.isLabel()) {
+            ++labelReferences[inst.dest.name];
+          }
+        }
+
+        bool summarized = false;
+        for (std::size_t loopStart = ir.size(); loopStart-- > 0 && !summarized;) {
+          if (ir[loopStart].op != IROp::BRANCH || !ir[loopStart].dest.isLabel() ||
+              loopStart + 1 >= ir.size() || ir[loopStart + 1].op != IROp::LABEL ||
+              !ir[loopStart + 1].dest.isLabel()) {
+            continue;
+          }
+          const std::string condLabel = ir[loopStart].dest.name;
+          const std::string bodyLabel = ir[loopStart + 1].dest.name;
+          if (labelReferences[condLabel] != 1 || labelReferences[bodyLabel] != 1) {
+            continue;
+          }
+          std::size_t condIndex = loopStart + 2;
+          while (condIndex < ir.size() && ir[condIndex].op != IROp::FUNC_END &&
+                 !(ir[condIndex].op == IROp::LABEL && ir[condIndex].dest.isLabel() &&
+                   ir[condIndex].dest.name == condLabel)) {
+            ++condIndex;
+          }
+          if (condIndex + 2 >= ir.size() || ir[condIndex].op == IROp::FUNC_END) {
+            continue;
+          }
+          const IRInst& condition = ir[condIndex + 1];
+          const IRInst& backedge = ir[condIndex + 2];
+          if ((condition.op != IROp::LT && condition.op != IROp::LE) ||
+              !condition.dest.isLocalVar() || !condition.src1.isLocalVar() ||
+              backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
+              backedge.dest.name != bodyLabel || !backedge.src1.isLocalVar() ||
+              backedge.src1.name != condition.dest.name) {
+            continue;
+          }
+          const std::string induction = condition.src1.name;
+
+          const auto findNearbyConstant = [&](const std::string& name) -> std::optional<int> {
+            for (std::size_t position = loopStart; position > 0; --position) {
+              const IRInst& candidate = ir[position - 1];
+              if (candidate.dest.isLocalVar() && candidate.dest.name == name) {
+                if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                    candidate.src1.isImm()) {
+                  return candidate.src1.immVal;
+                }
+                return std::nullopt;
+              }
+              if (candidate.op == IROp::LABEL || candidate.op == IROp::BRANCH ||
+                  candidate.op == IROp::BEQZ || candidate.op == IROp::BNEZ ||
+                  candidate.op == IROp::CALL || candidate.op == IROp::FUNC_BEGIN) {
+                break;
+              }
+            }
+            return std::nullopt;
+          };
+          const auto findUniqueConstant = [&](const std::string& name) -> std::optional<int> {
+            std::size_t functionBegin = loopStart;
+            while (functionBegin > 0 && ir[functionBegin - 1].op != IROp::FUNC_BEGIN) {
+              --functionBegin;
+            }
+            int definitions = 0;
+            std::optional<int> value;
+            for (std::size_t position = functionBegin; position < ir.size(); ++position) {
+              const IRInst& candidate = ir[position];
+              if (candidate.op == IROp::FUNC_END) {
+                break;
+              }
+              if (!candidate.dest.isLocalVar() || candidate.dest.name != name ||
+                  candidate.op == IROp::RETURN || candidate.op == IROp::PARAM ||
+                  (candidate.op == IROp::LOCAL_VAR_DECL && candidate.src1.isNone())) {
+                continue;
+              }
+              ++definitions;
+              if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                  candidate.src1.isImm()) {
+                value = candidate.src1.immVal;
+              } else {
+                value.reset();
+              }
+            }
+            return definitions == 1 ? value : std::nullopt;
+          };
+
+          const auto initial = findNearbyConstant(induction);
+          std::optional<int> upper;
+          if (condition.src2.isImm()) {
+            upper = condition.src2.immVal;
+          } else if (condition.src2.isLocalVar()) {
+            upper = findNearbyConstant(condition.src2.name);
+            if (!upper) {
+              upper = findUniqueConstant(condition.src2.name);
+            }
+          }
+          if (!initial || !upper ||
+              (condition.op == IROp::LE && *upper == INT32_MAX && *initial <= *upper)) {
+            continue;
+          }
+          const bool runs = condition.op == IROp::LT ? *initial < *upper : *initial <= *upper;
+          const std::uint64_t trips =
+              runs ? static_cast<std::uint64_t>(static_cast<std::int64_t>(*upper) - *initial +
+                                                (condition.op == IROp::LE ? 1 : 0))
+                   : 0;
+          const std::int64_t finalInduction =
+              static_cast<std::int64_t>(*initial) + static_cast<std::int64_t>(trips);
+          if (trips < 2 || finalInduction < INT32_MIN || finalInduction > INT32_MAX) {
+            continue;
+          }
+
+          std::unordered_map<std::string, PolynomialExpr> values;
+          std::unordered_map<std::string, Polynomial> accumulatorDeltas;
+          std::unordered_set<std::string> written;
+          bool bodySupported = true;
+          bool inductionIncremented = false;
+          int inductionWrites = 0;
+          const auto expressionForOperand =
+              [&](const Operand& operand) -> std::optional<PolynomialExpr> {
+            PolynomialExpr expression;
+            if (operand.isImm()) {
+              expression.polynomial = constantPolynomial(operand.immVal);
+              return expression;
+            }
+            if (!operand.isLocalVar()) {
+              return std::nullopt;
+            }
+            if (operand.name == induction) {
+              expression.polynomial.coeff[1] = 1;
+              return expression;
+            }
+            const auto temporary = values.find(operand.name);
+            if (temporary != values.end()) {
+              return temporary->second;
+            }
+            const auto constant = findUniqueConstant(operand.name);
+            if (constant) {
+              expression.polynomial = constantPolynomial(*constant);
+              return expression;
+            }
+            expression.stateCoefficients[operand.name] = 1;
+            return expression;
+          };
+
+          for (std::size_t position = loopStart + 2; position < condIndex && bodySupported;
+               ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+              continue;
+            }
+            if ((inst.op == IROp::ADD || inst.op == IROp::SUB) && inst.dest.isLocalVar() &&
+                inst.dest.name == induction && inst.src1.isLocalVar() &&
+                inst.src1.name == induction && inst.src2.isImm()) {
+              const int step = inst.op == IROp::ADD ? inst.src2.immVal : -inst.src2.immVal;
+              ++inductionWrites;
+              inductionIncremented = step == 1;
+              continue;
+            }
+            if (inductionIncremented ||
+                (inst.op != IROp::LOCAL_VAR_DECL && inst.op != IROp::ASSIGN &&
+                 inst.op != IROp::ADD && inst.op != IROp::SUB && inst.op != IROp::MUL) ||
+                !inst.dest.isLocalVar()) {
+              bodySupported = false;
+              break;
+            }
+            const auto lhs = expressionForOperand(inst.src1);
+            if (!lhs) {
+              bodySupported = false;
+              break;
+            }
+            PolynomialExpr expression;
+            if (inst.op == IROp::LOCAL_VAR_DECL || inst.op == IROp::ASSIGN) {
+              expression = *lhs;
+            } else {
+              const auto rhs = expressionForOperand(inst.src2);
+              if (!rhs) {
+                bodySupported = false;
+                break;
+              }
+              if (inst.op == IROp::ADD || inst.op == IROp::SUB) {
+                expression = combineExpression(*lhs, *rhs, inst.op == IROp::SUB);
+              } else {
+                const auto product = multiplyExpression(*lhs, *rhs);
+                if (!product) {
+                  bodySupported = false;
+                  break;
+                }
+                expression = *product;
+              }
+            }
+
+            if (isCompilerTemp(inst.dest.name)) {
+              values[inst.dest.name] = std::move(expression);
+              continue;
+            }
+            if (inst.dest.name == induction || written.count(inst.dest.name) != 0 ||
+                expression.stateCoefficients.size() != 1) {
+              bodySupported = false;
+              break;
+            }
+            const auto self = expression.stateCoefficients.find(inst.dest.name);
+            if (self == expression.stateCoefficients.end() || self->second != 1) {
+              bodySupported = false;
+              break;
+            }
+            written.insert(inst.dest.name);
+            accumulatorDeltas[inst.dest.name] = expression.polynomial;
+          }
+          bool hasNonlinearTerm = false;
+          for (const auto& [name, polynomial] : accumulatorDeltas) {
+            (void) name;
+            hasNonlinearTerm =
+                hasNonlinearTerm || polynomial.coeff[2] != 0 || polynomial.coeff[3] != 0;
+          }
+          if (!bodySupported || inductionWrites != 1 || !inductionIncremented ||
+              accumulatorDeltas.empty() || !hasNonlinearTerm ||
+              (condition.src2.isLocalVar() && written.count(condition.src2.name) != 0)) {
+            continue;
+          }
+
+          const std::size_t loopEnd = condIndex + 3;
+          const auto usedAfterLoop = [&](const std::string& name) {
+            for (std::size_t position = loopEnd; position < ir.size(); ++position) {
+              const IRInst& inst = ir[position];
+              if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
+                break;
+              }
+              if ((inst.src1.isLocalVar() && inst.src1.name == name) ||
+                  (inst.src2.isLocalVar() && inst.src2.name == name) ||
+                  ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) && inst.dest.isLocalVar() &&
+                   inst.dest.name == name)) {
+                return true;
+              }
+            }
+            return false;
+          };
+
+          std::vector<IRInst> replacement;
+          for (const auto& [name, polynomial] : accumulatorDeltas) {
+            if (!usedAfterLoop(name)) {
+              continue;
+            }
+            const std::uint32_t delta = sumPolynomial(polynomial, *initial, trips);
+            if (delta != 0) {
+              replacement.emplace_back(IROp::ADD, Operand::localVar(name), Operand::localVar(name),
+                                       Operand::imm(static_cast<std::int32_t>(delta)));
+            }
+          }
+          if (usedAfterLoop(induction)) {
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(induction),
+                                     Operand::imm(static_cast<int>(finalInduction)),
+                                     Operand::none());
+          }
+
+          std::size_t eraseEnd = loopEnd;
+          if (eraseEnd < ir.size() && ir[eraseEnd].op == IROp::LABEL &&
+              ir[eraseEnd].dest.isLabel() && labelReferences[ir[eraseEnd].dest.name] == 0) {
+            ++eraseEnd;
+          }
+          ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(loopStart),
+                   ir.begin() + static_cast<std::ptrdiff_t>(eraseEnd));
+          ir.insert(ir.begin() + static_cast<std::ptrdiff_t>(loopStart), replacement.begin(),
+                    replacement.end());
+          summarized = true;
+          changed = true;
+        }
+        if (!summarized) {
+          break;
+        }
       }
     }
 
