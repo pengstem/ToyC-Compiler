@@ -751,6 +751,21 @@ if(TOYCC_BUILD_TESTS)
       )
 
       add_test(
+        NAME toycc.perf.dead-strided-loop-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_dead_strided_loop_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_strided_loop.c"
+          --overflow-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_strided_overflow_safety.c"
+      )
+      set_tests_properties(toycc.perf.dead-strided-loop-codegen PROPERTIES
+        LABELS "toycc;codegen;performance"
+        TIMEOUT 10
+      )
+
+      add_test(
         NAME toycc.perf.dead-recurrence-codegen
         COMMAND
           "${Python3_EXECUTABLE}"

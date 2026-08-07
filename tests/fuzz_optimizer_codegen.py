@@ -155,6 +155,21 @@ def make_case(rng: random.Random, case_index: int) -> str:
             "  result = result + read_fuzz_observed_global();",
         ]
     )
+    dead_stride_step = rng.randint(2, 7)
+    dead_stride_trips = rng.randint(2, 12)
+    dead_stride_start = rng.randint(-5, 5)
+    dead_stride_bound = dead_stride_start + dead_stride_step * dead_stride_trips - 1
+    lines.extend(
+        [
+            f"  int dead_stride_i = {dead_stride_start};",
+            "  int dead_stride_state = result % 17;",
+            f"  while (dead_stride_i < {dead_stride_bound}) {{",
+            "    dead_stride_state = "
+            "(dead_stride_state * 11 + dead_stride_i * 5 + 23) % 991;",
+            f"    dead_stride_i = dead_stride_i + {dead_stride_step};",
+            "  }",
+        ]
+    )
     # A helper-local loop has a runtime bound, but the caller proves its input
     # nonnegative and periodic. Differentially cover the inner closed form and
     # the subsequent periodic outer-loop summary as one optimization cascade.

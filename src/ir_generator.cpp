@@ -2947,24 +2947,11 @@ void IRGenerator::optimizePass() {
           bound = findNearbyConstant(boundOperand.name);
         }
         const bool increasing = relation == IROp::LT || relation == IROp::LE;
-        const int inductionStep = increasing ? 1 : -1;
-
-        // 严格比较配合单位步进对任意不变 int32 边界都必然终止：若进入循环，
-        // 归纳变量会在溢出前恰好等于边界。<= INT32_MAX 与 >= INT32_MIN 则会在
-        // 边界仍执行一次并溢出，只有已知安全边界时才能删除。
-        if ((relation == IROp::LE || relation == IROp::GE) && !bound) {
-          continue;
-        }
-        if (relation == IROp::LE && *bound == INT32_MAX) {
-          continue;
-        }
-        if (relation == IROp::GE && *bound == INT32_MIN) {
-          continue;
-        }
 
         bool bodySupported = true;
         std::unordered_set<std::string> definitions;
         int inductionWrites = 0;
+        std::optional<int> inductionStep;
         std::size_t inductionWriteIndex = 0;
         std::size_t firstControlIndex = condIndex;
         std::size_t lastControlIndex = loopStart + 1;
@@ -3005,12 +2992,24 @@ void IRGenerator::optimizePass() {
             if (inst.dest.name == induction) {
               ++inductionWrites;
               inductionWriteIndex = position;
-              const bool unitStep = ((inst.op == IROp::ADD && inductionStep == 1) ||
-                                     (inst.op == IROp::SUB && inductionStep == -1)) &&
-                                    inst.src1.isLocalVar() && inst.src1.name == induction &&
-                                    inst.src2.isImm() && inst.src2.immVal == 1;
-              if (!unitStep) {
+              std::optional<std::int64_t> candidateStep;
+              if (inst.op == IROp::ADD) {
+                if (inst.src1.isLocalVar() && inst.src1.name == induction && inst.src2.isImm()) {
+                  candidateStep = inst.src2.immVal;
+                } else if (inst.src2.isLocalVar() && inst.src2.name == induction &&
+                           inst.src1.isImm()) {
+                  candidateStep = inst.src1.immVal;
+                }
+              } else if (inst.op == IROp::SUB && inst.src1.isLocalVar() &&
+                         inst.src1.name == induction && inst.src2.isImm()) {
+                candidateStep = -static_cast<std::int64_t>(inst.src2.immVal);
+              }
+              if (!candidateStep || *candidateStep == 0 || *candidateStep < INT32_MIN ||
+                  *candidateStep > INT32_MAX ||
+                  (inductionStep && *inductionStep != static_cast<int>(*candidateStep))) {
                 bodySupported = false;
+              } else {
+                inductionStep = static_cast<int>(*candidateStep);
               }
             }
             break;
@@ -3056,8 +3055,34 @@ void IRGenerator::optimizePass() {
         const bool incrementDominatesControl =
             hasContinue && inductionWriteIndex < firstControlIndex;
         const bool incrementFollowsControl = !hasContinue && inductionWriteIndex > lastControlIndex;
-        if (!bodySupported || inductionWrites != 1 ||
+        if (!bodySupported || inductionWrites != 1 || !inductionStep ||
             (!incrementDominatesControl && !incrementFollowsControl)) {
+          continue;
+        }
+
+        // 常量跨步也能证明终止，但必须保证越过边界的最后一次更新仍在 int32
+        // 范围内。未知边界只接受严格比较的单位步进；它会恰好命中边界，不会
+        // 先回绕。已知边界则用最坏的最后一个循环内值证明跨越更新不溢出。
+        const std::int64_t step = *inductionStep;
+        bool terminatingStep = false;
+        if (increasing && step > 0) {
+          if (bound) {
+            const std::int64_t lastUpdateUpper =
+                static_cast<std::int64_t>(*bound) + step - (relation == IROp::LT ? 1 : 0);
+            terminatingStep = lastUpdateUpper <= INT32_MAX;
+          } else {
+            terminatingStep = relation == IROp::LT && step == 1;
+          }
+        } else if (!increasing && step < 0) {
+          if (bound) {
+            const std::int64_t lastUpdateLower =
+                static_cast<std::int64_t>(*bound) + step + (relation == IROp::GT ? 1 : 0);
+            terminatingStep = lastUpdateLower >= INT32_MIN;
+          } else {
+            terminatingStep = relation == IROp::GT && step == -1;
+          }
+        }
+        if (!terminatingStep) {
           continue;
         }
 

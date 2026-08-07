@@ -81,6 +81,7 @@ perf/t_dead_reversed_loop.c
 perf/t_dead_break_loop.c
 perf/t_dead_continue_loop.c
 perf/t_dead_global_recurrence.c
+perf/t_dead_strided_loop.c
 perf/t_dead_pure_loop_call.c
 perf/t_dead_nested_pure_loop_call.c
 perf/t_overwritten_dead_store.c
