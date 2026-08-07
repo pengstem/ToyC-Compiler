@@ -495,6 +495,19 @@ if(TOYCC_BUILD_TESTS)
         LABELS "toycc;codegen;performance"
         TIMEOUT 10
       )
+
+      add_test(
+        NAME toycc.perf.dead-store-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_dead_store_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_overwritten_dead_store.c"
+      )
+      set_tests_properties(toycc.perf.dead-store-codegen PROPERTIES
+        LABELS "toycc;codegen;performance"
+        TIMEOUT 10
+      )
     endif()
   endif()
 endif()

@@ -1745,16 +1745,84 @@ void IRGenerator::optimizePass() {
 
     // Pass 2: 死代码消除
     {
-      std::unordered_map<std::string, int> useCount;
-      countUses(ir, useCount);
+      // 指令级 CFG 活跃性：相比全函数 useCount，能够识别同一变量后续被
+      // 覆盖的死存储，例如 `x = expensive; x = 5; return x;`。
+      std::unordered_map<std::string, std::size_t> labelPositions;
+      for (std::size_t index = 0; index < ir.size(); ++index) {
+        if (ir[index].op == IROp::LABEL && ir[index].dest.isLabel()) {
+          labelPositions[ir[index].dest.name] = index;
+        }
+      }
+
+      std::vector<std::vector<std::size_t>> successors(ir.size());
+      for (std::size_t index = 0; index < ir.size(); ++index) {
+        const auto& inst = ir[index];
+        const auto addTarget = [&](const Operand& target) {
+          if (!target.isLabel()) {
+            return;
+          }
+          const auto found = labelPositions.find(target.name);
+          if (found != labelPositions.end()) {
+            successors[index].push_back(found->second);
+          }
+        };
+        if (inst.op == IROp::BRANCH) {
+          addTarget(inst.dest);
+        } else if (inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) {
+          addTarget(inst.dest);
+          if (index + 1 < ir.size()) {
+            successors[index].push_back(index + 1);
+          }
+        } else if (inst.op != IROp::RETURN && inst.op != IROp::FUNC_END && index + 1 < ir.size()) {
+          successors[index].push_back(index + 1);
+        }
+      }
+
+      std::vector<std::unordered_set<std::string>> liveIn(ir.size());
+      std::vector<std::unordered_set<std::string>> liveOut(ir.size());
+      bool livenessChanged = true;
+      while (livenessChanged) {
+        livenessChanged = false;
+        for (std::size_t reverse = ir.size(); reverse-- > 0;) {
+          std::unordered_set<std::string> nextOut;
+          for (const std::size_t successor : successors[reverse]) {
+            nextOut.insert(liveIn[successor].begin(), liveIn[successor].end());
+          }
+          std::unordered_set<std::string> nextIn = nextOut;
+          const auto& inst = ir[reverse];
+          const bool definesLocal = inst.dest.isLocalVar() && inst.op != IROp::RETURN &&
+                                    inst.op != IROp::PARAM && inst.op != IROp::BRANCH &&
+                                    inst.op != IROp::BEQZ && inst.op != IROp::BNEZ;
+          if (definesLocal) {
+            nextIn.erase(inst.dest.name);
+          }
+          if (inst.src1.isLocalVar()) {
+            nextIn.insert(inst.src1.name);
+          }
+          if (inst.src2.isLocalVar()) {
+            nextIn.insert(inst.src2.name);
+          }
+          if ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) && inst.dest.isLocalVar()) {
+            nextIn.insert(inst.dest.name);
+          }
+          if (nextOut != liveOut[reverse] || nextIn != liveIn[reverse]) {
+            liveOut[reverse] = std::move(nextOut);
+            liveIn[reverse] = std::move(nextIn);
+            livenessChanged = true;
+          }
+        }
+      }
 
       std::vector<IRInst> optimized;
-      for (const auto& inst : ir) {
-        if (isCombinableOp(inst.op) && inst.dest.isLocalVar() && useCount[inst.dest.name] == 0) {
+      for (std::size_t index = 0; index < ir.size(); ++index) {
+        const auto& inst = ir[index];
+        if (isCombinableOp(inst.op) && inst.dest.isLocalVar() &&
+            liveOut[index].count(inst.dest.name) == 0) {
           changed = true;
           continue;
         }
-        if (inst.op == IROp::ASSIGN && inst.dest.isLocalVar() && useCount[inst.dest.name] == 0) {
+        if (inst.op == IROp::ASSIGN && inst.dest.isLocalVar() &&
+            liveOut[index].count(inst.dest.name) == 0) {
           changed = true;
           continue;
         }

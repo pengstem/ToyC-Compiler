@@ -76,6 +76,7 @@ perf/t_hot_leaf_calls.c
 perf/t_copy_loop.c
 perf/t_cse_loop.c
 perf/t_dead_result_loop.c
+perf/t_overwritten_dead_store.c
 perf/t_loop_weighted_regalloc.c
 regression/f19_many_arguments.c
 regression/f19_forwarding.c
