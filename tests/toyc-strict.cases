@@ -80,6 +80,7 @@ perf/t_dead_descending_loop.c
 perf/t_dead_reversed_loop.c
 perf/t_dead_break_loop.c
 perf/t_dead_continue_loop.c
+perf/t_dead_global_recurrence.c
 perf/t_dead_pure_loop_call.c
 perf/t_dead_nested_pure_loop_call.c
 perf/t_overwritten_dead_store.c
@@ -104,6 +105,7 @@ regression/f19_forwarding.c
 regression/pair_unroll_bounds.c
 regression/loop_summary_moving_bound.c
 regression/coupled_reset_dependency_safety.c
+regression/global_store_dependency_safety.c
 regression/leading_break_moving_bound_safety.c
 regression/dead_inclusive_overflow_loop.c
 regression/dead_call_moving_loop_safety.c

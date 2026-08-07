@@ -66,6 +66,11 @@ def make_case(rng: random.Random, case_index: int) -> str:
     bounded_coefficient = rng.randint(1, 5)
     bounded_bias = rng.randint(-4, 6)
     lines = [
+        "int fuzz_dead_global = 7;",
+        "int fuzz_observed_global = 3;",
+        "",
+        "int read_fuzz_observed_global() { return fuzz_observed_global; }",
+        "",
         opaque_function(),
         "",
         bounded_bucket_function(bounded_modulus, bounded_coefficient, bounded_bias),
@@ -136,6 +141,20 @@ def make_case(rng: random.Random, case_index: int) -> str:
     lines.append(f"  int seed = opaque({case_index % 31 + 1});")
     arguments = [f"(seed + {index * 3 + 1}) % 997" for index in range(parameter_count)]
     lines.append(f"  int result = work({', '.join(arguments)});")
+    dead_global_trips = rng.randint(2, 9)
+    observed_global_value = rng.randint(-20, 30)
+    lines.extend(
+        [
+            "  int dead_global_i = 0;",
+            f"  while (dead_global_i < {dead_global_trips}) {{",
+            "    fuzz_dead_global = "
+            "(fuzz_dead_global * 13 + dead_global_i * 7 + 19) % 997;",
+            "    dead_global_i = dead_global_i + 1;",
+            "  }",
+            f"  fuzz_observed_global = {observed_global_value};",
+            "  result = result + read_fuzz_observed_global();",
+        ]
+    )
     # A helper-local loop has a runtime bound, but the caller proves its input
     # nonnegative and periodic. Differentially cover the inner closed form and
     # the subsequent periodic outer-loop summary as one optimization cascade.

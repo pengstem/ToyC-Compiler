@@ -1834,13 +1834,14 @@ void IRGenerator::optimizePass() {
       }
     }
 
-    // Pass 2.5: 删除无法到达可观察行为的局部递推。
+    // Pass 2.5: 删除无法到达可观察行为的局部/全局递推。
     //
     // 普通活跃性会把 `dead = f(dead)` 保留下来：本轮定义被下一轮自引用，
-    // 因而形成一个没有出口的活跃环。这里从 RETURN、分支条件、实参和副作用
-    // 指令反向传播“有用变量”，只保留能够到达这些根的局部计算。按变量名
-    // 而非单次定义分析会保守保留同名变量的所有赋值，但不会误删非 SSA IR
-    // 中某条可达定义。
+    // 因而形成一个没有出口的活跃环。全局变量也可能只在死 store 之间互相
+    // 供值；ToyC 没有指针、volatile 或外部可见内存，因此这种全局写同样不
+    // 是可观察行为。这里从 RETURN、分支条件、实参和真正的副作用指令反向
+    // 传播“有用变量”，只保留能够到达这些根的计算。局部/全局 key 显式区分，
+    // 按变量而非单次定义分析会保守保留同一变量的所有可达赋值。
     {
       struct StructuredIf {
         std::size_t branchIndex;
@@ -1848,6 +1849,22 @@ void IRGenerator::optimizePass() {
         std::unordered_set<std::string> conditionVars;
         std::unordered_set<std::string> controlledDefs;
         std::unordered_set<std::size_t> controlledBranches;
+      };
+
+      const auto variableKey = [](const Operand& operand) -> std::optional<std::string> {
+        if (operand.isLocalVar()) {
+          return "L:" + operand.name;
+        }
+        if (operand.isGlobalVar()) {
+          return "G:" + operand.name;
+        }
+        return std::nullopt;
+      };
+      const auto addVariableUse = [&](const Operand& operand,
+                                      std::unordered_set<std::string>& variables) {
+        if (const auto key = variableKey(operand)) {
+          variables.insert(*key);
+        }
       };
 
       std::unordered_map<std::string, std::size_t> labelPositions;
@@ -1894,11 +1911,12 @@ void IRGenerator::optimizePass() {
         std::unordered_set<std::size_t> controlledBranches;
         for (std::size_t index = branchIndex + 1; index < joinIndex && removableControl; ++index) {
           const IRInst& inst = ir[index];
-          const bool pureLocalDefinition =
-              inst.dest.isLocalVar() && (isCombinableOp(inst.op) || inst.op == IROp::ASSIGN ||
-                                         inst.op == IROp::LOCAL_VAR_DECL);
-          if (pureLocalDefinition) {
-            controlledDefs.insert(inst.dest.name);
+          const bool pureVariableDefinition =
+              (inst.dest.isLocalVar() || inst.dest.isGlobalVar()) &&
+              (isCombinableOp(inst.op) || inst.op == IROp::ASSIGN ||
+               (inst.op == IROp::LOCAL_VAR_DECL && inst.dest.isLocalVar()));
+          if (pureVariableDefinition) {
+            controlledDefs.insert(*variableKey(inst.dest));
             continue;
           }
           if (inst.op == IROp::LABEL && inst.dest.isLabel()) {
@@ -1913,12 +1931,8 @@ void IRGenerator::optimizePass() {
                                target->second <= joinIndex;
             if (removableControl && (inst.op == IROp::BEQZ || inst.op == IROp::BNEZ)) {
               controlledBranches.insert(index);
-              if (inst.src1.isLocalVar()) {
-                conditionVars.insert(inst.src1.name);
-              }
-              if (inst.src2.isLocalVar()) {
-                conditionVars.insert(inst.src2.name);
-              }
+              addVariableUse(inst.src1, conditionVars);
+              addVariableUse(inst.src2, conditionVars);
             }
             continue;
           }
@@ -1951,12 +1965,8 @@ void IRGenerator::optimizePass() {
 
         StructuredIf candidate{branchIndex, joinIndex, std::move(conditionVars),
                                std::move(controlledDefs), std::move(controlledBranches)};
-        if (branch.src1.isLocalVar()) {
-          candidate.conditionVars.insert(branch.src1.name);
-        }
-        if (branch.src2.isLocalVar()) {
-          candidate.conditionVars.insert(branch.src2.name);
-        }
+        addVariableUse(branch.src1, candidate.conditionVars);
+        addVariableUse(branch.src2, candidate.conditionVars);
         candidate.controlledBranches.insert(branchIndex);
         suppressBranchRoots.insert(candidate.controlledBranches.begin(),
                                    candidate.controlledBranches.end());
@@ -1966,20 +1976,16 @@ void IRGenerator::optimizePass() {
       std::unordered_map<std::string, std::unordered_set<std::string>> dependencies;
       std::unordered_set<std::string> useful;
 
-      const auto addLocalUse = [](const Operand& operand, std::unordered_set<std::string>& vars) {
-        if (operand.isLocalVar()) {
-          vars.insert(operand.name);
-        }
-      };
-
       for (std::size_t index = 0; index < ir.size(); ++index) {
         const IRInst& inst = ir[index];
-        const bool pureLocalDefinition =
-            inst.dest.isLocalVar() &&
-            (isCombinableOp(inst.op) || inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL);
-        if (pureLocalDefinition) {
-          addLocalUse(inst.src1, dependencies[inst.dest.name]);
-          addLocalUse(inst.src2, dependencies[inst.dest.name]);
+        const bool pureVariableDefinition =
+            (inst.dest.isLocalVar() || inst.dest.isGlobalVar()) &&
+            (isCombinableOp(inst.op) || inst.op == IROp::ASSIGN ||
+             (inst.op == IROp::LOCAL_VAR_DECL && inst.dest.isLocalVar()));
+        if (pureVariableDefinition) {
+          auto& definitionDependencies = dependencies[*variableKey(inst.dest)];
+          addVariableUse(inst.src1, definitionDependencies);
+          addVariableUse(inst.src2, definitionDependencies);
           continue;
         }
 
@@ -1987,12 +1993,12 @@ void IRGenerator::optimizePass() {
           continue;
         }
 
-        // 对不可删除指令，只把真正读取的局部操作数作为根；普通 dest 是定义，
+        // 对不可删除指令，只把真正读取的变量操作数作为根；普通 dest 是定义，
         // RETURN/PARAM 的 dest 则按 IR 约定是被读取的值。
-        addLocalUse(inst.src1, useful);
-        addLocalUse(inst.src2, useful);
+        addVariableUse(inst.src1, useful);
+        addVariableUse(inst.src2, useful);
         if (inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
-          addLocalUse(inst.dest, useful);
+          addVariableUse(inst.dest, useful);
         }
       }
 
@@ -2068,10 +2074,10 @@ void IRGenerator::optimizePass() {
         }
 
         const IRInst& inst = ir[index];
-        const bool deadLocalDefinition = inst.dest.isLocalVar() &&
-                                         useful.count(inst.dest.name) == 0 &&
-                                         (isCombinableOp(inst.op) || inst.op == IROp::ASSIGN);
-        if (deadLocalDefinition) {
+        const bool deadVariableDefinition = (inst.dest.isLocalVar() || inst.dest.isGlobalVar()) &&
+                                            useful.count(*variableKey(inst.dest)) == 0 &&
+                                            (isCombinableOp(inst.op) || inst.op == IROp::ASSIGN);
+        if (deadVariableDefinition) {
           rootedDceChanged = true;
           continue;
         }
