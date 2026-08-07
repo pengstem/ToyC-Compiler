@@ -1833,6 +1833,76 @@ void IRGenerator::optimizePass() {
       }
     }
 
+    // Pass 2.5: 删除无法到达可观察行为的局部递推。
+    //
+    // 普通活跃性会把 `dead = f(dead)` 保留下来：本轮定义被下一轮自引用，
+    // 因而形成一个没有出口的活跃环。这里从 RETURN、分支条件、实参和副作用
+    // 指令反向传播“有用变量”，只保留能够到达这些根的局部计算。按变量名
+    // 而非单次定义分析会保守保留同名变量的所有赋值，但不会误删非 SSA IR
+    // 中某条可达定义。
+    {
+      std::unordered_map<std::string, std::unordered_set<std::string>> dependencies;
+      std::unordered_set<std::string> useful;
+
+      const auto addLocalUse = [](const Operand& operand, std::unordered_set<std::string>& vars) {
+        if (operand.isLocalVar()) {
+          vars.insert(operand.name);
+        }
+      };
+
+      for (const auto& inst : ir) {
+        const bool pureLocalDefinition =
+            inst.dest.isLocalVar() &&
+            (isCombinableOp(inst.op) || inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL);
+        if (pureLocalDefinition) {
+          addLocalUse(inst.src1, dependencies[inst.dest.name]);
+          addLocalUse(inst.src2, dependencies[inst.dest.name]);
+          continue;
+        }
+
+        // 对不可删除指令，只把真正读取的局部操作数作为根；普通 dest 是定义，
+        // RETURN/PARAM 的 dest 则按 IR 约定是被读取的值。
+        addLocalUse(inst.src1, useful);
+        addLocalUse(inst.src2, useful);
+        if (inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
+          addLocalUse(inst.dest, useful);
+        }
+      }
+
+      std::vector<std::string> worklist(useful.begin(), useful.end());
+      while (!worklist.empty()) {
+        const std::string variable = std::move(worklist.back());
+        worklist.pop_back();
+        const auto found = dependencies.find(variable);
+        if (found == dependencies.end()) {
+          continue;
+        }
+        for (const auto& dependency : found->second) {
+          if (useful.insert(dependency).second) {
+            worklist.push_back(dependency);
+          }
+        }
+      }
+
+      std::vector<IRInst> optimized;
+      optimized.reserve(ir.size());
+      bool rootedDceChanged = false;
+      for (const auto& inst : ir) {
+        const bool deadLocalDefinition = inst.dest.isLocalVar() &&
+                                         useful.count(inst.dest.name) == 0 &&
+                                         (isCombinableOp(inst.op) || inst.op == IROp::ASSIGN);
+        if (deadLocalDefinition) {
+          rootedDceChanged = true;
+          continue;
+        }
+        optimized.push_back(inst);
+      }
+      if (rootedDceChanged) {
+        ir = std::move(optimized);
+        changed = true;
+      }
+    }
+
     // Pass 3: 循环反转（loop inversion）
     // 将 "LABEL c; <cond>; BEQZ t,e; LABEL b; <body>; BRANCH c; LABEL e" 转换为
     // "BRANCH c; LABEL b; <body>; LABEL c; <cond>; BNEZ t,b; LABEL e"

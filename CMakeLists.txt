@@ -538,6 +538,21 @@ if(TOYCC_BUILD_TESTS)
       )
 
       add_test(
+        NAME toycc.perf.dead-recurrence-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_dead_recurrence_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_recurrence_loop.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/live_recurrence_safety.c"
+      )
+      set_tests_properties(toycc.perf.dead-recurrence-codegen PROPERTIES
+        LABELS "toycc;codegen;performance"
+        TIMEOUT 10
+      )
+
+      add_test(
         NAME toycc.perf.dead-store-codegen
         COMMAND
           "${Python3_EXECUTABLE}"

@@ -80,13 +80,24 @@ def make_case(rng: random.Random, case_index: int) -> str:
             expression = f"(v{lhs} + v{rhs}) * (v{lhs} - v{rhs}) % 997"
         lines.append(f"  v{dest} = {expression};")
 
-    lines.extend(["  int i = 0;", "  int sum = e0 + e1 + e2;"])
+    # A mutually recursive but unobservable SCC must not be kept alive merely
+    # by its own loop-carried uses.
+    lines.extend(
+        [
+            "  int dead0 = v3;",
+            "  int dead1 = v4;",
+            "  int i = 0;",
+            "  int sum = e0 + e1 + e2;",
+        ]
+    )
     lines.append("  while (i < 7) {")
     lines.append("    int a = v0;")
     lines.append("    int b = a;")
     lines.append("    int c = b;")
     lines.append("    sum = (sum + c + v1 * v2) % 10007;")
     lines.append("    v1 = (v1 + 3) % 997;")
+    lines.append("    dead0 = (dead0 * 3 + dead1 + i) % 997;")
+    lines.append("    dead1 = (dead1 * 5 + dead0 + i) % 997;")
     lines.append("    i = i + 1;")
     lines.append("  }")
     weighted = " + ".join(f"v{i} * {i + 1}" for i in range(variable_count))
