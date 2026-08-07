@@ -15,6 +15,8 @@ def main() -> int:
     parser.add_argument("--case", required=True)
     parser.add_argument("--descending-case", required=True)
     parser.add_argument("--reversed-case", required=True)
+    parser.add_argument("--break-case", required=True)
+    parser.add_argument("--live-break-case", required=True)
     parser.add_argument("--must-keep-case", required=True)
     parser.add_argument("--overflow-case", required=True)
     args = parser.parse_args()
@@ -77,6 +79,43 @@ def main() -> int:
         raise RuntimeError(f"reversed-comparison dead loop remains:\n{body}")
     if "li a0, 83" not in body:
         raise RuntimeError(f"unexpected reversed-loop result:\n{body}")
+
+    process = subprocess.run(
+        [args.compiler, "-opt"],
+        input=Path(args.break_case).read_bytes(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(process.stderr.decode(errors="replace"))
+    assembly = process.stdout.decode(errors="replace")
+    match = re.search(r"(?ms)^main:\n(.*?)^\s*\.size\s+main,", assembly)
+    if match is None:
+        raise RuntimeError("generated assembly has no main")
+    body = match.group(1)
+    if re.search(r"(?m)^\s*(?:b\w+|j)\s+L\w+", body):
+        raise RuntimeError(f"dead loop with break remains:\n{body}")
+    if "li a0, 67" not in body:
+        raise RuntimeError(f"unexpected dead-break result:\n{body}")
+
+    process = subprocess.run(
+        [args.compiler, "-opt"],
+        input=Path(args.live_break_case).read_bytes(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(process.stderr.decode(errors="replace"))
+    assembly = process.stdout.decode(errors="replace")
+    match = re.search(r"(?ms)^main:\n(.*?)^\s*\.size\s+main,", assembly)
+    if match is None:
+        raise RuntimeError("generated assembly has no main")
+    if not re.search(r"(?m)^\s*(?:b\w+|j)\s+L\w+", match.group(1)):
+        raise RuntimeError("live loop with break was unsafely deleted")
 
     process = subprocess.run(
         [args.compiler, "-opt"],

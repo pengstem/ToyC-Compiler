@@ -2647,7 +2647,8 @@ void IRGenerator::optimizePass() {
   // Pass 4.5: 删除结果完全不可观察的有限局部循环。
   //
   // `if/else` 中的死状态会反过来保持条件、分支和归纳变量活跃，使普通 DCE
-  // 无法拆掉整个控制流环。这里接受直线循环体或只有前向边的局部 CFG，但同时
+  // 无法拆掉整个控制流环。这里接受直线循环体、只有前向边的局部 CFG，以及
+  // 直接跳到本循环唯一退出标签的 break 边，但同时
   // 要求可证明终止的单调归纳变量、无调用/全局状态，并证明循环写入的所有
   // 局部量在退出后均不再使用。严格 `<`/`>` 循环即使边界是运行期不变量也会
   // 在恰好到达边界时退出；非严格比较还要排除 INT32 边界处的步进溢出。
@@ -2845,10 +2846,15 @@ void IRGenerator::optimizePass() {
               break;
             }
             const auto target = labelPositions.find(inst.dest.name);
-            // 仅允许循环体内部的前向边；内部回边可能不终止，跳出/continue
-            // 则需要额外的路径证明，均保守回退。
-            if (target == labelPositions.end() || target->second <= position ||
-                target->second >= condIndex) {
+            // 循环体内部的前向边不影响单位归纳更新。跳到规范退出标签的 break
+            // 只会缩短一个已经证明有限的循环，也可安全接受；其它外跳、回边与
+            // continue 仍需额外的路径证明，保守回退。
+            const bool internalForward = target != labelPositions.end() &&
+                                         target->second > position && target->second < condIndex;
+            const bool exitsLoop = target != labelPositions.end() &&
+                                   target->second == condIndex + 3 &&
+                                   ir[target->second].op == IROp::LABEL;
+            if (!internalForward && !exitsLoop) {
               bodySupported = false;
               break;
             }

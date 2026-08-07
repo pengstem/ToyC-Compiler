@@ -78,6 +78,7 @@ perf/t_cse_loop.c
 perf/t_dead_result_loop.c
 perf/t_dead_descending_loop.c
 perf/t_dead_reversed_loop.c
+perf/t_dead_break_loop.c
 perf/t_dead_pure_loop_call.c
 perf/t_dead_nested_pure_loop_call.c
 perf/t_overwritten_dead_store.c
@@ -102,6 +103,7 @@ regression/loop_summary_moving_bound.c
 regression/dead_inclusive_overflow_loop.c
 regression/dead_call_moving_loop_safety.c
 regression/dead_branched_loop_safety.c
+regression/dead_break_live_state_safety.c
 regression/live_recurrence_safety.c
 regression/conditional_side_effect_safety.c
 regression/dead_call_side_effect_safety.c
