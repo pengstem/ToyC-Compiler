@@ -6160,6 +6160,9 @@ void IRGenerator::optimizePass() {
     // 结果仍是普通的 RV32 三地址算术；循环有分支、调用、全局状态、可变上界，
     // 或归纳变量不是严格 +1 时均不应用。
     {
+      // 覆盖 5x5/6x6 一类标量化状态以及少量表达式临时量，同时给 O(n^3)
+      // 矩阵乘法保留明确的编译时上限。
+      constexpr std::size_t kMaxCoupledAffineVariables = 48;
       using AffineRow = std::vector<std::uint32_t>;
       using AffineMatrix = std::vector<AffineRow>;
 
@@ -6342,8 +6345,8 @@ void IRGenerator::optimizePass() {
             written.insert(inst.dest.name);
           }
           addVariable(condition.src1);
-          if (!bodySupported || variables.empty() || variables.size() > 20 ||
-              written.count(induction) == 0 ||
+          if (!bodySupported || variables.empty() ||
+              variables.size() > kMaxCoupledAffineVariables || written.count(induction) == 0 ||
               (condition.src2.isLocalVar() && written.count(condition.src2.name) != 0)) {
             continue;
           }

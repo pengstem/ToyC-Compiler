@@ -289,6 +289,21 @@ def make_case(rng: random.Random, case_index: int) -> str:
             "  result = result + coupled_a + coupled_b + coupled_total + ci;",
         ]
     )
+    # Keep more than twenty observable affine states live so matrix summary
+    # coverage cannot silently regress to the old narrow dimension cap.
+    wide_count = 21
+    wide_trips = rng.randint(2, 8)
+    lines.append("  int wide_i = 0;")
+    for index in range(wide_count):
+        lines.append(f"  int wide_{index} = result % 17 + {index - 10};")
+    lines.append(f"  while (wide_i < {wide_trips}) {{")
+    for index in range(wide_count - 1):
+        lines.append(f"    wide_{index} = wide_{index + 1};")
+    lines.append("    wide_20 = wide_0;")
+    lines.append("    wide_i = wide_i + 1;")
+    lines.append("  }")
+    wide_sum = " + ".join(f"wide_{index}" for index in range(wide_count))
+    lines.append(f"  result = result + {wide_sum} + wide_i;")
     # Nested coupled recurrences reset the inner state on every outer
     # iteration. The outer affine summary may compose with the inner one only
     # when those reset variables' entry values are fully killed.
