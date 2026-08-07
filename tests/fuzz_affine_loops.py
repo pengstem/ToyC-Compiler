@@ -15,6 +15,15 @@ STARTUP_ASM = """\
     .globl _start
 _start:
     call main
+    addi sp, sp, -16
+    sw a0, 0(sp)
+    li a0, 1
+    mv a1, sp
+    li a2, 4
+    li a7, 64
+    ecall
+    lw a0, 0(sp)
+    addi sp, sp, 16
     li a7, 93
     ecall
 """
@@ -108,7 +117,7 @@ int main() {{
 
 
 def matrix_case(rng: random.Random) -> str:
-    count = rng.randint(4, 9)
+    count = rng.randint(10, 20)
     trips = rng.randint(0, 120)
     values = [rng.randint(-100, 100) for _ in range(count)]
     lines = ["int main() {", "    int i = 0;"]
@@ -118,7 +127,7 @@ def matrix_case(rng: random.Random) -> str:
         lhs = rng.randrange(count)
         rhs = rng.randrange(count)
         sign = "+" if rng.randrange(2) == 0 else "-"
-        lines.append(f"        v{index} = v{lhs} {sign} v{rhs} + {rng.randint(-9, 9)};")
+        lines.append(f"        v{index} = v{lhs} {sign} v{rhs};")
     lines.extend(["        i = i + 1;", "    }"])
     result = " + ".join(f"v{index} * {index + 1}" for index in range(count))
     lines.extend([f"    return ({result} + i) % 251;", "}"])
@@ -180,7 +189,13 @@ int main() {{
 
 def check_case(args: argparse.Namespace, source: str, work: Path) -> tuple[bool, str]:
     source_path = work / "case.c"
-    source_path.write_text(source, encoding="utf-8")
+    host_source = source.replace("int main()", "int toy_main()", 1)
+    host_source += (
+        "\n#include <unistd.h>\n"
+        "int main(void) { int value = toy_main(); "
+        "write(1, &value, sizeof(value)); return value; }\n"
+    )
+    source_path.write_text(host_source, encoding="utf-8")
     reference = work / "reference"
     host = run([args.host_cc, "-O0", "-w", str(source_path), "-o", str(reference)])
     if host.returncode != 0:
@@ -209,8 +224,11 @@ def check_case(args: argparse.Namespace, source: str, work: Path) -> tuple[bool,
     if linked.returncode != 0:
         return False, linked.stderr.decode(errors="replace")
     actual = run([args.qemu, str(executable)])
-    if actual.returncode != expected.returncode:
-        return False, f"expected rc={expected.returncode}, got rc={actual.returncode}"
+    if actual.returncode != expected.returncode or actual.stdout != expected.stdout:
+        return False, (
+            f"expected rc={expected.returncode}, value={expected.stdout.hex()}, "
+            f"got rc={actual.returncode}, value={actual.stdout.hex()}"
+        )
     return True, ""
 
 
