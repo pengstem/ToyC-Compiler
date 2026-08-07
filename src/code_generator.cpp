@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <ostream>
 #include <sstream>
 #include <string>
@@ -223,48 +224,89 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
     }
   }
 
-  // 第二遍：统计每个局部变量的使用频率（读写次数）
-  std::unordered_map<std::string, int> useFreq;
-  // 全局变量使用频率（仅当函数无函数调用时启用寄存器分配，避免跨调用同步）
-  std::unordered_map<std::string, int> globalUseFreq;
+  // 第二遍：由后向边恢复循环区间，并按循环深度估算每次读写的动态成本。
+  // 同一循环头可能因 continue 等控制流产生多条回边，只保留覆盖最广的一条，
+  // 避免把一个循环误算成多层嵌套。每深入一层权重乘 8，最深封顶以免溢出。
+  std::unordered_map<std::string, std::size_t> labelPositions;
+  for (std::size_t i = function.begin; i < function.end; ++i) {
+    if (ir_[i].op == IROp::LABEL && ir_[i].dest.isLabel()) {
+      labelPositions[ir_[i].dest.name] = i;
+    }
+  }
+
+  std::unordered_map<std::size_t, std::size_t> loopEndsByHeader;
+  for (std::size_t i = function.begin; i < function.end; ++i) {
+    const auto& inst = ir_[i];
+    if ((inst.op != IROp::BRANCH && inst.op != IROp::BEQZ && inst.op != IROp::BNEZ) ||
+        !inst.dest.isLabel()) {
+      continue;
+    }
+    const auto target = labelPositions.find(inst.dest.name);
+    if (target == labelPositions.end() || target->second >= i) {
+      continue;
+    }
+    auto [found, inserted] = loopEndsByHeader.emplace(target->second, i);
+    if (!inserted) {
+      found->second = std::max(found->second, i);
+    }
+  }
+
+  std::vector<unsigned> loopDepth(function.end - function.begin, 0);
+  for (const auto& [header, end] : loopEndsByHeader) {
+    for (std::size_t i = header; i <= end; ++i) {
+      auto& depth = loopDepth[i - function.begin];
+      depth = std::min(depth + 1, 7u);
+    }
+  }
+  const auto useWeightAt = [&](std::size_t index) -> std::uint64_t {
+    return std::uint64_t{1} << (3u * loopDepth[index - function.begin]);
+  };
+  const auto addWeight = [](auto& weights, const std::string& name, std::uint64_t amount) {
+    auto& value = weights[name];
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    value = maximum - value < amount ? maximum : value + amount;
+  };
+
+  std::unordered_map<std::string, std::uint64_t> useWeight;
+  // 全局变量使用权重（仅当函数无函数调用时启用寄存器分配，避免跨调用同步）
+  std::unordered_map<std::string, std::uint64_t> globalUseWeight;
   bool hasCall = false;
   for (std::size_t i = function.begin; i < function.end; ++i) {
     const auto& inst = ir_[i];
+    const std::uint64_t weight = useWeightAt(i);
     if (inst.op == IROp::CALL) {
       hasCall = true;
     }
     if (inst.src1.isLocalVar()) {
-      useFreq[inst.src1.name]++;
+      addWeight(useWeight, inst.src1.name, weight);
     }
     if (inst.src2.isLocalVar()) {
-      useFreq[inst.src2.name]++;
+      addWeight(useWeight, inst.src2.name, weight);
     }
-    if (inst.dest.isLocalVar()) {
-      useFreq[inst.dest.name]++;
+    // 无初始化声明不产生机器指令，不能因声明本身获得寄存器优先级。
+    if (inst.dest.isLocalVar() && !(inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone())) {
+      addWeight(useWeight, inst.dest.name, weight);
     }
     if (inst.src1.isGlobalVar()) {
-      globalUseFreq[inst.src1.name]++;
+      addWeight(globalUseWeight, inst.src1.name, weight);
     }
     if (inst.src2.isGlobalVar()) {
-      globalUseFreq[inst.src2.name]++;
+      addWeight(globalUseWeight, inst.src2.name, weight);
     }
     if (inst.dest.isGlobalVar()) {
-      globalUseFreq[inst.dest.name]++;
+      addWeight(globalUseWeight, inst.dest.name, weight);
     }
   }
   frame.hasCall = hasCall;
 
-  // 按使用频率降序排列，优先为高频变量分配寄存器（循环计数器等）
-  // 循环常量提升变量（'k' 前缀）无条件优先，保证循环内比较变成寄存器比较
-  std::stable_sort(varOrder.begin(), varOrder.end(),
-                   [&](const std::string& a, const std::string& b) {
-                     const bool aHoisted = !a.empty() && a[0] == 'k';
-                     const bool bHoisted = !b.empty() && b[0] == 'k';
-                     if (aHoisted != bHoisted) {
-                       return aHoisted;
-                     }
-                     return useFreq[a] > useFreq[b];
-                   });
+  for (const auto& name : varOrder) {
+    useWeight.try_emplace(name, 0);
+  }
+
+  // 按估算的动态读写成本降序排列，让循环状态优先占用稀缺寄存器。
+  std::stable_sort(
+      varOrder.begin(), varOrder.end(),
+      [&](const std::string& a, const std::string& b) { return useWeight[a] > useWeight[b]; });
 
   // 临时变量 t 寄存器分配（t4-t6）：
   // 一个 IR 名可能被临时回收 pass 在多个基本块内重新定义。把每次定义切成独立
@@ -423,12 +465,12 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
   // 循环内对全局的访问从 la+lw/sw（6 条指令）降为寄存器直用
   if (!hasCall) {
     std::vector<std::string> globalOrder;
-    for (const auto& entry : globalUseFreq) {
+    for (const auto& entry : globalUseWeight) {
       globalOrder.push_back(entry.first);
     }
     std::stable_sort(globalOrder.begin(), globalOrder.end(),
                      [&](const std::string& a, const std::string& b) {
-                       return globalUseFreq[a] > globalUseFreq[b];
+                       return globalUseWeight[a] > globalUseWeight[b];
                      });
     for (const auto& name : globalOrder) {
       if (nextReg <= 11) {

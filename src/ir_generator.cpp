@@ -2692,8 +2692,9 @@ void IRGenerator::optimizePass() {
   //   2. 循环体为直线代码（无 LABEL/BRANCH/BEQZ/BNEZ/CALL/RETURN）
   //   3. 条件为 LT/LE，计数变量自增步长为常量
   //   4. 循环体不超过 24 条指令（避免代码膨胀）
-  // 展开策略：复制循环体，第一次执行后检查中间条件，若满足继续第二次，
-  // 否则跳出。第二次执行后走原有的循环尾条件。
+  // 对 i < bound, i = i + 1 且 bound 循环不变的规范循环，用原条件预检、
+  // 成对迭代和单次余数处理把回边分支减半；其余循环保守地在两份循环体之间
+  // 保留条件检查。
   {
     std::vector<IRInst> optimized;
     std::size_t i = 0;
@@ -2732,12 +2733,16 @@ void IRGenerator::optimizePass() {
             // 检查循环体无分支/调用，并识别计数变量自增
             std::size_t indIncIdx = ir.size();
             int indIncStep = 0;
+            int indWriteCount = 0;
             for (std::size_t k = i + 2; k < condIdx && straightLine; ++k) {
               const auto& inst = ir[k];
               if (inst.op == IROp::LABEL || inst.op == IROp::BRANCH || inst.op == IROp::BEQZ ||
                   inst.op == IROp::BNEZ || inst.op == IROp::CALL || inst.op == IROp::RETURN) {
                 straightLine = false;
                 break;
+              }
+              if (inst.dest.isLocalVar() && inst.dest.name == indName) {
+                ++indWriteCount;
               }
               // 识别计数变量自增
               if ((inst.op == IROp::ADD || inst.op == IROp::SUB) && inst.dest.isLocalVar() &&
@@ -2748,6 +2753,70 @@ void IRGenerator::optimizePass() {
               }
             }
             if (straightLine && indIncIdx < ir.size() && indIncStep != 0) {
+              bool boundInvariant =
+                  cond.src2.isImm() || cond.src2.isLocalVar() || cond.src2.isGlobalVar();
+              if (!cond.src2.isImm()) {
+                for (std::size_t k = i + 2; k < condIdx && boundInvariant; ++k) {
+                  if (ir[k].dest.type == cond.src2.type && ir[k].dest.name == cond.src2.name) {
+                    boundInvariant = false;
+                  }
+                }
+              }
+
+              // 对规范的 i < bound, i = i + 1 循环使用成对迭代。先以原条件
+              // 保护零次循环和 bound == INT_MIN，再用 bound - 1 判断是否至少
+              // 还剩两次迭代。热路径每两轮只保留一个回边分支，退出时再执行
+              // 一次原条件来处理 0/1 个余数。上界必须在循环体内不变。
+              const bool canPairWithoutMidGuard = isLT && indIncStep == 1 && indWriteCount == 1 &&
+                                                  boundInvariant && bnezIdx == condIdx + 2;
+              if (canPairWithoutMidGuard) {
+                const std::string pairLimitName = "u" + std::to_string(i);
+                const Operand pairLimit = Operand::localVar(pairLimitName);
+                const std::string exitLabel = "L_unroll_exit_" + std::to_string(i);
+
+                // pair_limit = bound - 1。即使 bound 为 INT_MIN，原条件预检也会
+                // 在使用回绕后的 pair_limit 前退出，保持 RV32 整数语义。
+                optimized.push_back(IRInst(IROp::SUB, pairLimit, cond.src2, Operand::imm(1)));
+
+                // 原条件预检：零次循环直接退出。
+                optimized.push_back(cond);
+                optimized.push_back(
+                    IRInst(IROp::BEQZ, Operand::label(exitLabel), cond.dest, Operand::none()));
+                // 首次跳到成对循环的尾条件。
+                optimized.push_back(ir[i]);
+                // LABEL Lb
+                optimized.push_back(ir[i + 1]);
+
+                // 每次成对执行两份循环体。
+                for (int copy = 0; copy < 2; ++copy) {
+                  for (std::size_t k = i + 2; k < condIdx; ++k) {
+                    optimized.push_back(ir[k]);
+                  }
+                }
+
+                // LABEL Lc; i < pair_limit; BNEZ Lb
+                optimized.push_back(ir[condIdx]);
+                IRInst pairCond = cond;
+                pairCond.src2 = pairLimit;
+                optimized.push_back(std::move(pairCond));
+                optimized.push_back(ir[bnezIdx]);
+
+                // 若还剩恰好一次迭代，执行一份余数循环体。
+                optimized.push_back(cond);
+                optimized.push_back(
+                    IRInst(IROp::BEQZ, Operand::label(exitLabel), cond.dest, Operand::none()));
+                for (std::size_t k = i + 2; k < condIdx; ++k) {
+                  optimized.push_back(ir[k]);
+                }
+                optimized.push_back(IRInst(IROp::LABEL, Operand::label(exitLabel), Operand::none(),
+                                           Operand::none()));
+
+                i = bnezIdx + 1;
+                unrolledHere = true;
+                unrolled = true;
+                continue;
+              }
+
               // 展开 2 倍：
               // 原始: BRANCH Lc; LABEL Lb; <body>; LABEL Lc; <cond>; BNEZ Lb
               // 展开: BRANCH Lc; LABEL Lb;
