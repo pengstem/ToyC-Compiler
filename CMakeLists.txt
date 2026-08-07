@@ -700,8 +700,14 @@ if(TOYCC_BUILD_TESTS)
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_reversed_loop.c"
           --break-case
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_break_loop.c"
+          --continue-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_continue_loop.c"
           --live-break-case
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_break_live_state_safety.c"
+          --live-continue-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_continue_live_state_safety.c"
+          --unsafe-continue-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_continue_termination_safety.c"
           --must-keep-case
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_moving_bound_loop.c"
           --overflow-case

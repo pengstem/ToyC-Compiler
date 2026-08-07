@@ -2676,8 +2676,9 @@ void IRGenerator::optimizePass() {
         }
         const std::string condLabel = ir[loopStart].dest.name;
         const std::string bodyLabel = ir[loopStart + 1].dest.name;
-        // continue 或额外入口会增加引用计数；当前证明不覆盖这些控制流。
-        if (labelReferences[condLabel] != 1 || labelReferences[bodyLabel] != 1) {
+        // continue 会增加条件标签引用；其路径在下面单独验证。循环体仍只能由
+        // 规范回边进入，外部入口也会在删除前再次检查。
+        if (labelReferences[condLabel] < 1 || labelReferences[bodyLabel] != 1) {
           continue;
         }
 
@@ -2786,7 +2787,9 @@ void IRGenerator::optimizePass() {
         std::unordered_set<std::string> definitions;
         int inductionWrites = 0;
         std::size_t inductionWriteIndex = 0;
+        std::size_t firstControlIndex = condIndex;
         std::size_t lastControlIndex = loopStart + 1;
+        bool hasContinue = false;
         for (std::size_t position = loopStart + 2; position < condIndex && bodySupported;
              ++position) {
           const IRInst& inst = ir[position];
@@ -2836,6 +2839,7 @@ void IRGenerator::optimizePass() {
             if (!inst.dest.isLabel()) {
               bodySupported = false;
             }
+            firstControlIndex = std::min(firstControlIndex, position);
             lastControlIndex = position;
             break;
           case IROp::BRANCH:
@@ -2847,17 +2851,21 @@ void IRGenerator::optimizePass() {
             }
             const auto target = labelPositions.find(inst.dest.name);
             // 循环体内部的前向边不影响单位归纳更新。跳到规范退出标签的 break
-            // 只会缩短一个已经证明有限的循环，也可安全接受；其它外跳、回边与
-            // continue 仍需额外的路径证明，保守回退。
+            // 只会缩短一个已经证明有限的循环；跳到条件标签的 continue 则要求
+            // 归纳更新支配循环体内全部控制流。其它外跳与回边保守回退。
             const bool internalForward = target != labelPositions.end() &&
                                          target->second > position && target->second < condIndex;
             const bool exitsLoop = target != labelPositions.end() &&
                                    target->second == condIndex + 3 &&
                                    ir[target->second].op == IROp::LABEL;
-            if (!internalForward && !exitsLoop) {
+            const bool continuesLoop =
+                target != labelPositions.end() && target->second == condIndex;
+            if (!internalForward && !exitsLoop && !continuesLoop) {
               bodySupported = false;
               break;
             }
+            hasContinue = hasContinue || continuesLoop;
+            firstControlIndex = std::min(firstControlIndex, position);
             lastControlIndex = position;
             break;
           }
@@ -2866,7 +2874,11 @@ void IRGenerator::optimizePass() {
             break;
           }
         }
-        if (!bodySupported || inductionWrites != 1 || inductionWriteIndex <= lastControlIndex) {
+        const bool incrementDominatesControl =
+            hasContinue && inductionWriteIndex < firstControlIndex;
+        const bool incrementFollowsControl = !hasContinue && inductionWriteIndex > lastControlIndex;
+        if (!bodySupported || inductionWrites != 1 ||
+            (!incrementDominatesControl && !incrementFollowsControl)) {
           continue;
         }
 
