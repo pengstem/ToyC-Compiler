@@ -676,6 +676,8 @@ if(TOYCC_BUILD_TESTS)
           --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_result_loop.c"
           --descending-case
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_descending_loop.c"
+          --reversed-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_reversed_loop.c"
           --must-keep-case
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_moving_bound_loop.c"
           --overflow-case

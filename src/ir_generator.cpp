@@ -2134,8 +2134,7 @@ void IRGenerator::optimizePass() {
           const IRInst& condition = ir[backedgeIndex - 1];
           if ((condition.op != IROp::LT && condition.op != IROp::LE && condition.op != IROp::GT &&
                condition.op != IROp::GE) ||
-              !condition.dest.isLocalVar() || !condition.src1.isLocalVar() ||
-              !ir[backedgeIndex].src1.isLocalVar() ||
+              !condition.dest.isLocalVar() || !ir[backedgeIndex].src1.isLocalVar() ||
               ir[backedgeIndex].src1.name != condition.dest.name) {
             return false;
           }
@@ -2149,18 +2148,58 @@ void IRGenerator::optimizePass() {
             return false;
           }
 
-          const bool increasing = condition.op == IROp::LT || condition.op == IROp::LE;
-          if ((condition.op == IROp::LE &&
-               (!condition.src2.isImm() || condition.src2.immVal == INT32_MAX)) ||
-              (condition.op == IROp::GE &&
-               (!condition.src2.isImm() || condition.src2.immVal == INT32_MIN))) {
+          const auto writtenInLoop = [&](const Operand& operand) {
+            if (!operand.isLocalVar()) {
+              return false;
+            }
+            for (std::size_t position = bodyLabelIndex + 1; position < conditionLabelIndex;
+                 ++position) {
+              const IRInst& candidate = ir[position];
+              if (candidate.dest.isLocalVar() && candidate.dest.name == operand.name &&
+                  candidate.op != IROp::RETURN && candidate.op != IROp::PARAM) {
+                return true;
+              }
+            }
+            return false;
+          };
+          IROp relation = condition.op;
+          Operand inductionOperand = condition.src1;
+          Operand boundOperand = condition.src2;
+          if (!writtenInLoop(inductionOperand) && writtenInLoop(boundOperand)) {
+            std::swap(inductionOperand, boundOperand);
+            switch (relation) {
+            case IROp::LT:
+              relation = IROp::GT;
+              break;
+            case IROp::LE:
+              relation = IROp::GE;
+              break;
+            case IROp::GT:
+              relation = IROp::LT;
+              break;
+            case IROp::GE:
+              relation = IROp::LE;
+              break;
+            default:
+              break;
+            }
+          }
+          if (!inductionOperand.isLocalVar() || !writtenInLoop(inductionOperand)) {
             return false;
           }
 
-          const std::string induction = condition.src1.name;
+          const bool increasing = relation == IROp::LT || relation == IROp::LE;
+          if ((relation == IROp::LE &&
+               (!boundOperand.isImm() || boundOperand.immVal == INT32_MAX)) ||
+              (relation == IROp::GE &&
+               (!boundOperand.isImm() || boundOperand.immVal == INT32_MIN))) {
+            return false;
+          }
+
+          const std::string induction = inductionOperand.name;
           const std::optional<std::string> bound =
-              condition.src2.isLocalVar() ? std::optional<std::string>{condition.src2.name}
-                                          : std::nullopt;
+              boundOperand.isLocalVar() ? std::optional<std::string>{boundOperand.name}
+                                        : std::nullopt;
           int inductionWrites = 0;
           std::size_t inductionWriteIndex = 0;
           std::size_t lastInternalControl = bodyLabelIndex;
@@ -2653,17 +2692,55 @@ void IRGenerator::optimizePass() {
         const IRInst& backedge = ir[condIndex + 2];
         if ((condition.op != IROp::LT && condition.op != IROp::LE && condition.op != IROp::GT &&
              condition.op != IROp::GE) ||
-            !condition.dest.isLocalVar() || !condition.src1.isLocalVar() ||
-            backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
+            !condition.dest.isLocalVar() || backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
             backedge.dest.name != bodyLabel || !backedge.src1.isLocalVar() ||
             backedge.src1.name != condition.dest.name) {
           continue;
         }
 
-        const std::string induction = condition.src1.name;
+        const auto writtenInBody = [&](const Operand& operand) {
+          if (!operand.isLocalVar()) {
+            return false;
+          }
+          for (std::size_t position = loopStart + 2; position < condIndex; ++position) {
+            const IRInst& candidate = ir[position];
+            if (candidate.dest.isLocalVar() && candidate.dest.name == operand.name &&
+                candidate.op != IROp::RETURN && candidate.op != IROp::PARAM) {
+              return true;
+            }
+          }
+          return false;
+        };
+        IROp relation = condition.op;
+        Operand inductionOperand = condition.src1;
+        Operand boundOperand = condition.src2;
+        if (!writtenInBody(inductionOperand) && writtenInBody(boundOperand)) {
+          std::swap(inductionOperand, boundOperand);
+          switch (relation) {
+          case IROp::LT:
+            relation = IROp::GT;
+            break;
+          case IROp::LE:
+            relation = IROp::GE;
+            break;
+          case IROp::GT:
+            relation = IROp::LT;
+            break;
+          case IROp::GE:
+            relation = IROp::LE;
+            break;
+          default:
+            break;
+          }
+        }
+        if (!inductionOperand.isLocalVar() || !writtenInBody(inductionOperand)) {
+          continue;
+        }
+
+        const std::string induction = inductionOperand.name;
         const std::optional<std::string> boundVariable =
-            condition.src2.isLocalVar() ? std::optional<std::string>{condition.src2.name}
-                                        : std::nullopt;
+            boundOperand.isLocalVar() ? std::optional<std::string>{boundOperand.name}
+                                      : std::nullopt;
         const auto findNearbyConstant = [&](const std::string& name) -> std::optional<int> {
           for (std::size_t position = loopStart; position > 0; --position) {
             const IRInst& candidate = ir[position - 1];
@@ -2683,24 +2760,24 @@ void IRGenerator::optimizePass() {
           return std::nullopt;
         };
         std::optional<int> bound;
-        if (condition.src2.isImm()) {
-          bound = condition.src2.immVal;
-        } else if (condition.src2.isLocalVar()) {
-          bound = findNearbyConstant(condition.src2.name);
+        if (boundOperand.isImm()) {
+          bound = boundOperand.immVal;
+        } else if (boundOperand.isLocalVar()) {
+          bound = findNearbyConstant(boundOperand.name);
         }
-        const bool increasing = condition.op == IROp::LT || condition.op == IROp::LE;
+        const bool increasing = relation == IROp::LT || relation == IROp::LE;
         const int inductionStep = increasing ? 1 : -1;
 
         // 严格比较配合单位步进对任意不变 int32 边界都必然终止：若进入循环，
         // 归纳变量会在溢出前恰好等于边界。<= INT32_MAX 与 >= INT32_MIN 则会在
         // 边界仍执行一次并溢出，只有已知安全边界时才能删除。
-        if ((condition.op == IROp::LE || condition.op == IROp::GE) && !bound) {
+        if ((relation == IROp::LE || relation == IROp::GE) && !bound) {
           continue;
         }
-        if (condition.op == IROp::LE && *bound == INT32_MAX) {
+        if (relation == IROp::LE && *bound == INT32_MAX) {
           continue;
         }
-        if (condition.op == IROp::GE && *bound == INT32_MIN) {
+        if (relation == IROp::GE && *bound == INT32_MIN) {
           continue;
         }
 

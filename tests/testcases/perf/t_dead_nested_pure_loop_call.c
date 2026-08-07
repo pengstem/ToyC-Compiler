@@ -2,9 +2,9 @@ int nested_loop(int outer_limit, int inner_limit) {
     int i = 0;
     int j = 0;
     int dead = 1;
-    while (i < outer_limit) {
+    while (outer_limit > i) {
         j = 0;
-        while (j < inner_limit) {
+        while (inner_limit > j) {
             dead = (dead * 13 + i * 7 + j * 5 + 19) % 997;
             dead = (dead * 17 + i * 3 + j * 2 + 23) % 991;
             j = j + 1;

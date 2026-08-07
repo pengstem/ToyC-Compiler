@@ -77,6 +77,7 @@ perf/t_copy_loop.c
 perf/t_cse_loop.c
 perf/t_dead_result_loop.c
 perf/t_dead_descending_loop.c
+perf/t_dead_reversed_loop.c
 perf/t_dead_pure_loop_call.c
 perf/t_dead_nested_pure_loop_call.c
 perf/t_overwritten_dead_store.c
