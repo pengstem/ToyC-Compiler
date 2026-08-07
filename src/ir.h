@@ -12,13 +12,13 @@ namespace toycc {
 // ============================================================
 
 enum class OperandType {
-  IMM,        // 立即数
-  LOCAL_VAR,  // 局部变量
+  IMM, // 立即数
+  LOCAL_VAR, // 局部变量
   GLOBAL_VAR, // 全局变量
-  LABEL,      // 跳转标签
-  FUNC,       // 函数名
-  PARAM,      // 函数参数引用
-  NONE        // 无操作数
+  LABEL, // 跳转标签
+  FUNC, // 函数名
+  PARAM, // 函数参数引用
+  NONE // 无操作数
 };
 
 struct Operand {
