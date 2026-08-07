@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify that constant-trip affine inner loops no longer have backedges."""
+"""Verify that a coupled constant-trip recurrence is replaced by affine algebra."""
 
 from __future__ import annotations
 
@@ -34,17 +34,18 @@ def main() -> int:
         if match:
             labels[match.group(1)] = index
 
-    backward_edges: list[str] = []
     branch = re.compile(r"\s*(?:b\w+|j)\s+.*?([.$A-Za-z_][\w.$]*)\s*$")
-    for index, line in enumerate(lines):
-        match = branch.fullmatch(line)
-        if match and match.group(1) in labels and labels[match.group(1)] < index:
-            backward_edges.append(line)
-    if len(backward_edges) > 1:
-        raise RuntimeError(
-            "expected the inner backedge to be removed, got "
-            f"{len(backward_edges)}:\n{assembly}"
-        )
+    backward_edges = [
+        line
+        for index, line in enumerate(lines)
+        if (match := branch.fullmatch(line))
+        and match.group(1) in labels
+        and labels[match.group(1)] < index
+    ]
+    if backward_edges:
+        raise RuntimeError(f"coupled recurrence still has a backedge:\n{assembly}")
+    if not re.search(r"^\s*mul\s", assembly, re.MULTILINE):
+        raise RuntimeError(f"expected runtime affine combination in summary:\n{assembly}")
     return 0
 
 

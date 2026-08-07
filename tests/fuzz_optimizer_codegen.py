@@ -121,6 +121,38 @@ def make_case(rng: random.Random, case_index: int) -> str:
             "  result = result + affine0 + affine1 + nj;",
         ]
     )
+    # Coupled affine state exercises matrix exponentiation and, in particular,
+    # sequential source assignments: each right-hand side observes all earlier
+    # writes in the same iteration. Keep coefficients/trips small so the host C
+    # reference stays within signed-int range while still covering negative and
+    # zero coefficients.
+    coupled_start = rng.randint(-2, 2)
+    coupled_trips = rng.randint(2, 6)
+    coupled_is_le = rng.choice((False, True))
+    coupled_bound = coupled_start + coupled_trips - (1 if coupled_is_le else 0)
+    coupled_relation = "<=" if coupled_is_le else "<"
+    coupled_a = rng.randint(-3, 5)
+    coupled_b = rng.randint(-3, 5)
+    coupled_total = rng.randint(-7, 9)
+    coeff_a = rng.randint(-1, 1)
+    coeff_b = rng.choice((-1, 1))
+    bias = rng.randint(-3, 3)
+    lines.extend(
+        [
+            f"  int ci = {coupled_start};",
+            f"  int coupled_a = result % 17 + {coupled_a};",
+            f"  int coupled_b = seed % 19 + {coupled_b};",
+            f"  int coupled_total = {coupled_total};",
+            f"  while (ci {coupled_relation} {coupled_bound}) {{",
+            f"    int coupled_next = coupled_a * {coeff_a} + coupled_b * {coeff_b} + {bias};",
+            "    coupled_a = coupled_b + ci;",
+            "    coupled_b = coupled_next - coupled_a;",
+            "    coupled_total = coupled_total + coupled_a - coupled_b;",
+            "    ci = ci + 1;",
+            "  }",
+            "  result = result + coupled_a + coupled_b + coupled_total + ci;",
+        ]
+    )
     lines.append("  result = result % 251;")
     lines.append("  if (result < 0) { result = result + 251; }")
     lines.extend(["  return result;", "}"])
