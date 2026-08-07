@@ -156,6 +156,7 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
   frame.localOffsets.clear();
   frame.regAlloc.clear();
   frame.leafRegAlloc.clear();
+  frame.constantRegAlloc.clear();
   frame.localBytes = 0;
   frame.outgoingArgumentBytes = 0;
 
@@ -270,6 +271,34 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
   std::unordered_map<std::string, std::uint64_t> useWeight;
   // 全局变量使用权重（仅当函数无函数调用时启用寄存器分配，避免跨调用同步）
   std::unordered_map<std::string, std::uint64_t> globalUseWeight;
+  // 热循环中需要寄存器物化的立即数。权重近似为动态执行次数乘以 `li`
+  // 展开的指令数；只在循环内记分，避免为冷常量付出保存寄存器的代价。
+  std::unordered_map<int, std::uint64_t> constantUseWeight;
+  const auto noteHotConstant = [&](int value, std::uint64_t weight) {
+    if (value == 0 || weight <= 1) {
+      return;
+    }
+    const std::uint64_t materializeCost = (value >= -2048 && value <= 2047) ? 1 : 2;
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    const std::uint64_t amount =
+        weight > maximum / materializeCost ? maximum : weight * materializeCost;
+    auto& score = constantUseWeight[value];
+    score = maximum - score < amount ? maximum : score + amount;
+  };
+  const auto noteMagicConstant = [&](int divisor, std::uint64_t weight) {
+    if (divisor == 0 || divisor == 1 || divisor == -1 || divisor == INT32_MIN) {
+      return false;
+    }
+    const int32_t positiveDivisor =
+        divisor < 0 ? static_cast<int32_t>(-static_cast<int64_t>(divisor)) : divisor;
+    uint32_t magic = 0;
+    int32_t shift = 0;
+    if (!computeSignedDivMagic(positiveDivisor, magic, shift)) {
+      return false;
+    }
+    noteHotConstant(static_cast<int32_t>(magic), weight);
+    return true;
+  };
   bool hasCall = false;
   for (std::size_t i = function.begin; i < function.end; ++i) {
     const auto& inst = ir_[i];
@@ -295,6 +324,84 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
     }
     if (inst.dest.isGlobalVar()) {
       addWeight(globalUseWeight, inst.dest.name, weight);
+    }
+
+    if (weight > 1) {
+      const bool arithmeticOrCompare =
+          inst.op == IROp::ADD || inst.op == IROp::SUB || inst.op == IROp::MUL ||
+          inst.op == IROp::DIV || inst.op == IROp::MOD || inst.op == IROp::LT ||
+          inst.op == IROp::GT || inst.op == IROp::LE || inst.op == IROp::GE ||
+          inst.op == IROp::EQ || inst.op == IROp::NE;
+      if (arithmeticOrCompare && inst.src1.isImm()) {
+        noteHotConstant(inst.src1.immVal, weight);
+      } else if ((inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) &&
+                 inst.src1.isImm() && (inst.src1.immVal < -2048 || inst.src1.immVal > 2047)) {
+        // `mv` 只比多指令 `li` 更便宜；12 位初始化本身已是一条指令。
+        noteHotConstant(inst.src1.immVal, weight);
+      }
+
+      if (inst.src2.isImm()) {
+        const int value = inst.src2.immVal;
+        const bool fits12 = value >= -2048 && value <= 2047;
+        switch (inst.op) {
+        case IROp::ADD:
+        case IROp::SUB:
+          if (!fits12) {
+            noteHotConstant(value, weight);
+          }
+          break;
+        case IROp::MUL: {
+          const int64_t magnitude = value < 0 ? -static_cast<int64_t>(value) : value;
+          const bool powerOfTwo = magnitude > 0 && (magnitude & (magnitude - 1)) == 0;
+          const bool shiftAdd = value == 3 || value == 5 || value == 7 || value == 9 ||
+                                value == 15 || value == -1 || powerOfTwo;
+          if (!shiftAdd) {
+            noteHotConstant(value, weight);
+          }
+          break;
+        }
+        case IROp::DIV: {
+          const bool positivePowerOfTwo = value > 0 && (value & (value - 1)) == 0;
+          if (!positivePowerOfTwo && value != -1 && !noteMagicConstant(value, weight)) {
+            noteHotConstant(value, weight);
+          }
+          break;
+        }
+        case IROp::MOD: {
+          const bool positivePowerOfTwo = value > 0 && (value & (value - 1)) == 0;
+          if (!positivePowerOfTwo && value != 1 && value != -1) {
+            if (noteMagicConstant(value, weight)) {
+              noteHotConstant(value, weight); // 余数序列还要乘回除数
+            } else {
+              noteHotConstant(value, weight);
+            }
+          }
+          break;
+        }
+        case IROp::GT:
+        case IROp::EQ:
+        case IROp::NE:
+          noteHotConstant(value, weight);
+          break;
+        case IROp::LT:
+        case IROp::LE:
+        case IROp::GE:
+          if (!fits12) {
+            noteHotConstant(value, weight);
+          }
+          break;
+        default:
+          break;
+        }
+      }
+
+      if (inst.op == IROp::PARAM && inst.dest.isImm()) {
+        noteHotConstant(inst.dest.immVal, weight);
+      }
+      if (inst.op == IROp::RETURN && inst.dest.isImm() &&
+          (inst.dest.immVal < -2048 || inst.dest.immVal > 2047)) {
+        noteHotConstant(inst.dest.immVal, weight);
+      }
     }
   }
   frame.hasCall = hasCall;
@@ -479,6 +586,55 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
     }
   }
 
+  // 把最热的循环常量放进变量/全局分配后仍空闲的寄存器。叶函数优先用
+  // caller-saved a 寄存器；含调用函数只能用跨调用保值的 s 寄存器。
+  // 限制为 6 个，避免极端函数为边际常量扩大过多保存现场。
+  {
+    std::vector<std::pair<int, std::uint64_t>> rankedConstants(constantUseWeight.begin(),
+                                                               constantUseWeight.end());
+    std::stable_sort(rankedConstants.begin(), rankedConstants.end(),
+                     [](const auto& lhs, const auto& rhs) {
+                       if (lhs.second != rhs.second) {
+                         return lhs.second > rhs.second;
+                       }
+                       return lhs.first < rhs.first;
+                     });
+    rankedConstants.erase(std::remove_if(rankedConstants.begin(), rankedConstants.end(),
+                                         [](const auto& entry) { return entry.second < 8; }),
+                          rankedConstants.end());
+
+    std::vector<std::string> spareRegisters;
+    if (!hasCall) {
+      bool usedArgRegs[8] = {false, false, false, false, false, false, false, false};
+      // 即使形参入口后会搬到 t 寄存器，也不能在搬运前用常量覆盖其 ABI 寄存器。
+      for (const auto& entry : incomingParamRegs) {
+        usedArgRegs[entry.second] = true;
+      }
+      for (const auto& entry : frame.leafRegAlloc) {
+        if (entry.second.size() == 2 && entry.second[0] == 'a') {
+          const int index = entry.second[1] - '0';
+          if (index >= 0 && index < 8) {
+            usedArgRegs[index] = true;
+          }
+        }
+      }
+      for (int r = 0; r < 8; ++r) {
+        if (!usedArgRegs[r]) {
+          spareRegisters.push_back("a" + std::to_string(r));
+        }
+      }
+    }
+    for (int r = nextReg; r <= 11; ++r) {
+      spareRegisters.push_back("s" + std::to_string(r));
+    }
+
+    const std::size_t hoistCount =
+        std::min({rankedConstants.size(), spareRegisters.size(), std::size_t{6}});
+    for (std::size_t index = 0; index < hoistCount; ++index) {
+      frame.constantRegAlloc[rankedConstants[index].first] = spareRegisters[index];
+    }
+  }
+
   // 已分配寄存器（s 或 t）的局部变量无需栈槽：紧凑重编号，只统计未分配寄存器的变量
   int stackSlotCount = 0;
   for (auto& entry : frame.localOffsets) {
@@ -517,11 +673,20 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
       }
     }
   }
+  for (const auto& entry : frame.constantRegAlloc) {
+    const std::string& reg = entry.second;
+    if (reg.size() >= 2 && reg[0] == 's') {
+      const int number = std::stoi(reg.substr(1));
+      if (number >= 2 && number <= 11) {
+        regUsed[static_cast<std::size_t>(number - 2)] = true;
+      }
+    }
+  }
 
   // 更新 usedCalleeSavedRegisters：只保存实际使用的 s 寄存器
   frame.usedCalleeSavedRegisters.clear();
   for (int r = 2; r <= 11; ++r) {
-    if (r < nextReg && regUsed[static_cast<std::size_t>(r - 2)]) {
+    if (regUsed[static_cast<std::size_t>(r - 2)]) {
       frame.usedCalleeSavedRegisters.push_back("s" + std::to_string(r));
     }
   }
@@ -601,6 +766,16 @@ void CodeGenerator::generateFunction(const FunctionRange& function, std::ostream
   body << function.name << ":\n";
 
   emitPrologue(frame_, body);
+
+  // 热循环常量只在函数入口物化一次。它们位于递归回跳标签之前，因此自尾递归
+  // 转成循环后也不会重复加载。
+  std::vector<std::pair<int, std::string>> hoistedConstants(frame_.constantRegAlloc.begin(),
+                                                            frame_.constantRegAlloc.end());
+  std::stable_sort(hoistedConstants.begin(), hoistedConstants.end(),
+                   [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
+  for (const auto& entry : hoistedConstants) {
+    emit(body, "li", entry.second + ", " + std::to_string(entry.first));
+  }
 
   // 全局变量寄存器副本：函数入口加载一次（位于 .L_body 之前，
   // 自递归尾调用跳回 .L_body 时不会重复加载，保留迭代间的值）
@@ -729,7 +904,7 @@ std::size_t CodeGenerator::generateInstruction(std::size_t index, std::size_t en
     if (argIndex < 8) {
       const std::string reg = "a" + std::to_string(argIndex);
       if (inst.dest.type == OperandType::IMM) {
-        emit(out, "li", reg + ", " + std::to_string(inst.dest.immVal));
+        emitLoadImmediate(inst.dest.immVal, reg, out);
       } else {
         loadOperand(inst.dest, reg, out);
       }
@@ -737,7 +912,7 @@ std::size_t CodeGenerator::generateInstruction(std::size_t index, std::size_t en
       // 溢出参数存入栈（调用者栈帧低地址区）
       const int stackOffset = (argIndex - 8) * kWordBytes;
       if (inst.dest.type == OperandType::IMM) {
-        emit(out, "li", "t0, " + std::to_string(inst.dest.immVal));
+        emitLoadImmediate(inst.dest.immVal, "t0", out);
       } else {
         loadOperand(inst.dest, "t0", out);
       }
@@ -1162,9 +1337,25 @@ void CodeGenerator::applyPeephole(const std::string& asmText, std::ostream& out)
   }
 }
 
+std::string CodeGenerator::regForConstant(int value) const {
+  const auto found = frame_.constantRegAlloc.find(value);
+  return found == frame_.constantRegAlloc.end() ? std::string() : found->second;
+}
+
+void CodeGenerator::emitLoadImmediate(int value, std::string_view reg, std::ostream& out) const {
+  const std::string constantReg = regForConstant(value);
+  if (!constantReg.empty()) {
+    if (reg != constantReg) {
+      emit(out, "mv", std::string(reg) + ", " + constantReg);
+    }
+    return;
+  }
+  emit(out, "li", std::string(reg) + ", " + std::to_string(value));
+}
+
 void CodeGenerator::loadOperand(const Operand& operand, std::string_view reg, std::ostream& out) {
   if (operand.type == OperandType::IMM) {
-    emit(out, "li", std::string(reg) + ", " + std::to_string(operand.immVal));
+    emitLoadImmediate(operand.immVal, reg, out);
     return;
   }
 
@@ -1253,8 +1444,12 @@ bool CodeGenerator::emitMagicDiv(int imm, const std::string& srcReg, const std::
     return false;
   }
   const int32_t magicSigned = static_cast<int32_t>(magic);
-  emit(out, "li", "t1, " + std::to_string(magicSigned));
-  emit(out, "mulh", "t2, " + srcReg + ", t1");
+  std::string magicReg = regForConstant(magicSigned);
+  if (magicReg.empty()) {
+    emit(out, "li", "t1, " + std::to_string(magicSigned));
+    magicReg = "t1";
+  }
+  emit(out, "mulh", "t2, " + srcReg + ", " + magicReg);
   if (magicSigned < 0) {
     emit(out, "add", "t2, t2, " + srcReg);
   }
@@ -1289,8 +1484,12 @@ bool CodeGenerator::emitMagicMod(int imm, const std::string& srcReg, const std::
   if (srcIsT0) {
     emit(out, "mv", "t3, t0");
   }
-  emit(out, "li", "t1, " + std::to_string(magicSigned));
-  emit(out, "mulh", "t2, " + srcReg + ", t1");
+  std::string magicReg = regForConstant(magicSigned);
+  if (magicReg.empty()) {
+    emit(out, "li", "t1, " + std::to_string(magicSigned));
+    magicReg = "t1";
+  }
+  emit(out, "mulh", "t2, " + srcReg + ", " + magicReg);
   if (magicSigned < 0) {
     emit(out, "add", "t2, t2, " + srcReg);
   }
@@ -1302,8 +1501,12 @@ bool CodeGenerator::emitMagicMod(int imm, const std::string& srcReg, const std::
   if (imm < 0) {
     emit(out, "sub", "t2, x0, t2");
   }
-  emit(out, "li", "t1, " + std::to_string(imm));
-  emit(out, "mul", "t2, t2, t1");
+  std::string divisorReg = regForConstant(imm);
+  if (divisorReg.empty()) {
+    emit(out, "li", "t1, " + std::to_string(imm));
+    divisorReg = "t1";
+  }
+  emit(out, "mul", "t2, t2, " + divisorReg);
   emit(out, "sub", destReg + ", " + (srcIsT0 ? std::string("t3") : srcReg) + ", t2");
   return true;
 }
@@ -1345,9 +1548,12 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
       if (inst.src1.immVal == 0) {
         emit(out, "sub", destReg + ", x0, " + rhsReg);
       } else {
-        const std::string scratch = (destReg == "t0") ? "t2" : "t0";
-        emit(out, "li", scratch + ", " + std::to_string(inst.src1.immVal));
-        emit(out, "sub", destReg + ", " + scratch + ", " + rhsReg);
+        std::string lhsReg = regForConstant(inst.src1.immVal);
+        if (lhsReg.empty()) {
+          lhsReg = (destReg == "t0") ? "t2" : "t0";
+          emit(out, "li", lhsReg + ", " + std::to_string(inst.src1.immVal));
+        }
+        emit(out, "sub", destReg + ", " + lhsReg + ", " + rhsReg);
       }
       if (!destInReg) {
         storeOperand(destReg, inst.dest, out);
@@ -1378,6 +1584,12 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
   bool src2InReg = false;
   if (src2IsSmallImm) {
     imm = inst.src2.immVal;
+  } else if (inst.src2.isImm()) {
+    const std::string reg = regForConstant(inst.src2.immVal);
+    if (!reg.empty() && reg != destReg) {
+      src2Reg = reg;
+      src2InReg = true;
+    }
   } else if (inst.src2.isLocalVar()) {
     const std::string reg = regForVar(inst.src2.name);
     if (!reg.empty()) {
@@ -1396,6 +1608,14 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
   std::string src1Reg = destReg;
   if (inst.src1.isLocalVar()) {
     const std::string reg = regForVar(inst.src1.name);
+    if (!reg.empty()) {
+      src1Reg = reg;
+    } else {
+      loadOperand(inst.src1, destReg, out);
+      src1Reg = destReg;
+    }
+  } else if (inst.src1.isImm()) {
+    const std::string reg = regForConstant(inst.src1.immVal);
     if (!reg.empty()) {
       src1Reg = reg;
     } else {
@@ -1443,8 +1663,12 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
         emit(out, "slli", destReg + ", " + src1Reg + ", " + std::to_string(shift));
         emit(out, "sub", destReg + ", x0, " + destReg);
       } else {
-        emit(out, "li", "t1, " + std::to_string(imm));
-        emit(out, "mul", destReg + ", " + src1Reg + ", t1");
+        std::string multiplierReg = regForConstant(imm);
+        if (multiplierReg.empty()) {
+          emit(out, "li", "t1, " + std::to_string(imm));
+          multiplierReg = "t1";
+        }
+        emit(out, "mul", destReg + ", " + src1Reg + ", " + multiplierReg);
       }
       break;
     case IROp::DIV:
@@ -1467,8 +1691,12 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
       } else if (imm != 0 && imm != 1 && emitMagicDiv(imm, src1Reg, destReg, out)) {
         // 已生成 magic 序列
       } else {
-        emit(out, "li", "t1, " + std::to_string(imm));
-        emit(out, "div", destReg + ", " + src1Reg + ", t1");
+        std::string divisorReg = regForConstant(imm);
+        if (divisorReg.empty()) {
+          emit(out, "li", "t1, " + std::to_string(imm));
+          divisorReg = "t1";
+        }
+        emit(out, "div", destReg + ", " + src1Reg + ", " + divisorReg);
       }
       break;
     case IROp::MOD:
@@ -1495,8 +1723,12 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
       } else if (imm != 0 && emitMagicMod(imm, src1Reg, destReg, out)) {
         // 已生成 magic 序列
       } else {
-        emit(out, "li", "t1, " + std::to_string(imm));
-        emit(out, "rem", destReg + ", " + src1Reg + ", t1");
+        std::string divisorReg = regForConstant(imm);
+        if (divisorReg.empty()) {
+          emit(out, "li", "t1, " + std::to_string(imm));
+          divisorReg = "t1";
+        }
+        emit(out, "rem", destReg + ", " + src1Reg + ", " + divisorReg);
       }
       break;
     default:
@@ -1573,6 +1805,12 @@ void CodeGenerator::emitCompareInto(const IRInst& inst, std::string_view destReg
   bool src2InReg = false;
   if (src2IsSmallImm) {
     imm = inst.src2.immVal;
+  } else if (inst.src2.isImm()) {
+    const std::string reg = regForConstant(inst.src2.immVal);
+    if (!reg.empty() && reg != dest) {
+      src2Reg = reg;
+      src2InReg = true;
+    }
   } else if (inst.src2.isLocalVar()) {
     const std::string reg = regForVar(inst.src2.name);
     if (!reg.empty()) {
@@ -1596,6 +1834,14 @@ void CodeGenerator::emitCompareInto(const IRInst& inst, std::string_view destReg
       loadOperand(inst.src1, dest, out);
       src1Reg = dest;
     }
+  } else if (inst.src1.isImm()) {
+    const std::string reg = regForConstant(inst.src1.immVal);
+    if (!reg.empty()) {
+      src1Reg = reg;
+    } else {
+      loadOperand(inst.src1, dest, out);
+      src1Reg = dest;
+    }
   } else {
     loadOperand(inst.src1, dest, out);
     src1Reg = dest;
@@ -1607,8 +1853,12 @@ void CodeGenerator::emitCompareInto(const IRInst& inst, std::string_view destReg
       emit(out, "slti", dest + ", " + src1Reg + ", " + std::to_string(imm));
       break;
     case IROp::GT:
-      emit(out, "li", "t1, " + std::to_string(imm));
-      emit(out, "slt", dest + ", t1, " + src1Reg);
+      if (const std::string reg = regForConstant(imm); !reg.empty()) {
+        emit(out, "slt", dest + ", " + reg + ", " + src1Reg);
+      } else {
+        emit(out, "li", "t1, " + std::to_string(imm));
+        emit(out, "slt", dest + ", t1, " + src1Reg);
+      }
       break;
     case IROp::LE:
       emit(out, "slti", dest + ", " + src1Reg + ", " + std::to_string(imm + 1));
@@ -1618,13 +1868,21 @@ void CodeGenerator::emitCompareInto(const IRInst& inst, std::string_view destReg
       emit(out, "xori", dest + ", " + dest + ", 1");
       break;
     case IROp::EQ:
-      emit(out, "li", "t1, " + std::to_string(imm));
-      emit(out, "sub", dest + ", " + src1Reg + ", t1");
+      if (const std::string reg = regForConstant(imm); !reg.empty()) {
+        emit(out, "sub", dest + ", " + src1Reg + ", " + reg);
+      } else {
+        emit(out, "li", "t1, " + std::to_string(imm));
+        emit(out, "sub", dest + ", " + src1Reg + ", t1");
+      }
       emit(out, "seqz", dest + ", " + dest);
       break;
     case IROp::NE:
-      emit(out, "li", "t1, " + std::to_string(imm));
-      emit(out, "sub", dest + ", " + src1Reg + ", t1");
+      if (const std::string reg = regForConstant(imm); !reg.empty()) {
+        emit(out, "sub", dest + ", " + src1Reg + ", " + reg);
+      } else {
+        emit(out, "li", "t1, " + std::to_string(imm));
+        emit(out, "sub", dest + ", " + src1Reg + ", t1");
+      }
       emit(out, "snez", dest + ", " + dest);
       break;
     default:

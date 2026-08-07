@@ -430,6 +430,19 @@ if(TOYCC_BUILD_TESTS)
         TIMEOUT "${TOYCC_TEST_TIMEOUT}"
       )
 
+      add_test(
+        NAME toycc.perf.hot-constant-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_hot_constant_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_hot_constants.c"
+      )
+      set_tests_properties(toycc.perf.hot-constant-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
       foreach(TOYCC_CLOSED_FORM_CASE IN ITEMS
           "t_copy_loop.c;15"
           "t_cse_loop.c;149")

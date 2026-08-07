@@ -36,6 +36,8 @@ private:
     std::unordered_map<std::string, std::string> leafRegAlloc;
     std::unordered_map<std::string, int> globalRegAlloc;   // 全局变量 → s寄存器编号 (2-11)
     std::unordered_map<std::string, std::string> tempRegs; // 临时变量 → t寄存器 (t4-t6)
+    // 热循环常量 → 空闲寄存器。函数入口只物化一次，循环体直接复用。
+    std::unordered_map<int, std::string> constantRegAlloc;
     std::vector<std::string> usedCalleeSavedRegisters;
     std::string functionName;
 
@@ -95,6 +97,8 @@ private:
 
   void loadOperand(const Operand& operand, std::string_view reg, std::ostream& out);
   void storeOperand(std::string_view reg, const Operand& operand, std::ostream& out);
+  std::string regForConstant(int value) const;
+  void emitLoadImmediate(int value, std::string_view reg, std::ostream& out) const;
   void emitBinaryOp(const IRInst& inst, std::ostream& out);
   // 比较指令：若结果临时仅被紧随其后的 BEQZ/BNEZ 使用，融合为条件分支（不落栈）
   std::size_t emitCompareOrFuse(std::size_t index, std::size_t end, std::ostream& out);
