@@ -537,6 +537,28 @@ if(TOYCC_BUILD_TESTS)
       )
 
       add_test(
+        NAME toycc.perf.bounded-helper-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_bounded_helper_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_bounded_helper_summary.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/bounded_helper_moving_bound_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/bounded_helper_negative_outer_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/bounded_helper_recurrence_safety.c"
+          --must-keep-nested-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/bounded_helper_stale_remainder_safety.c"
+      )
+      set_tests_properties(toycc.perf.bounded-helper-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
         NAME toycc.perf.periodic-affine-large-period-codegen
         COMMAND
           "${Python3_EXECUTABLE}"

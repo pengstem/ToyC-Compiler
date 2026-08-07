@@ -42,10 +42,36 @@ def opaque_function() -> str:
     return "\n".join(lines)
 
 
+def bounded_bucket_function(modulus: int, coefficient: int, bias: int) -> str:
+    return "\n".join(
+        [
+            "int bounded_bucket(int value) {",
+            f"  int bound = value % {modulus};",
+            "  int index = 0;",
+            "  int total = 1;",
+            "  while (index < bound) {",
+            f"    total = total + index * {coefficient} + {bias};",
+            "    index = index + 1;",
+            "  }",
+            "  return total;",
+            "}",
+        ]
+    )
+
+
 def make_case(rng: random.Random, case_index: int) -> str:
     parameter_count = rng.randint(9, 24)
     parameters = [f"p{i}" for i in range(parameter_count)]
-    lines = [opaque_function(), "", f"int work({', '.join('int ' + p for p in parameters)}) {{"]
+    bounded_modulus = rng.randint(2, 17)
+    bounded_coefficient = rng.randint(1, 5)
+    bounded_bias = rng.randint(-4, 6)
+    lines = [
+        opaque_function(),
+        "",
+        bounded_bucket_function(bounded_modulus, bounded_coefficient, bounded_bias),
+        "",
+        f"int work({', '.join('int ' + p for p in parameters)}) {{",
+    ]
 
     variable_count = rng.randint(8, 14)
     for index in range(variable_count):
@@ -110,6 +136,21 @@ def make_case(rng: random.Random, case_index: int) -> str:
     lines.append(f"  int seed = opaque({case_index % 31 + 1});")
     arguments = [f"(seed + {index * 3 + 1}) % 997" for index in range(parameter_count)]
     lines.append(f"  int result = work({', '.join(arguments)});")
+    # A helper-local loop has a runtime bound, but the caller proves its input
+    # nonnegative and periodic. Differentially cover the inner closed form and
+    # the subsequent periodic outer-loop summary as one optimization cascade.
+    bounded_trips = rng.randint(2, 35)
+    lines.extend(
+        [
+            "  int bounded_i = 0;",
+            "  int bounded_total = result;",
+            f"  while (bounded_i < {bounded_trips}) {{",
+            "    bounded_total = bounded_total + bounded_bucket(bounded_i);",
+            "    bounded_i = bounded_i + 1;",
+            "  }",
+            "  result = result + bounded_total + bounded_i;",
+        ]
+    )
     # Constant-trip nested affine loops exercise the runtime-initial-value
     # summary. Include zero-trip and negative-induction starts across cases.
     outer_bound = rng.randint(1, 6)
