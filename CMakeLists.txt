@@ -529,6 +529,8 @@ if(TOYCC_BUILD_TESTS)
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_dead_loop_codegen.py"
           --compiler "$<TARGET_FILE:toycc>"
           --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_result_loop.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_moving_bound_loop.c"
       )
       set_tests_properties(toycc.perf.dead-loop-codegen PROPERTIES
         LABELS "toycc;codegen;performance"

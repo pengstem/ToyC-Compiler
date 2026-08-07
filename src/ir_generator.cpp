@@ -2101,49 +2101,114 @@ void IRGenerator::optimizePass() {
     }
   }
 
-  // Pass 4.5: 删除结果完全不可观察的纯计数循环。
-  // DCE 会先清掉循环体中的死算术，但归纳变量与回边本身互相活跃，普通
-  // 指令级活跃性无法删掉它们。这里仅处理无内部控制流、调用、内存写入或
-  // 全局写入的反转循环；若体内所有被定义的局部值在循环后均不再使用，
-  // 整个循环可按 C 的 as-if 规则删除。
+  // Pass 4.5: 删除结果完全不可观察的有限局部循环。
+  //
+  // `if/else` 中的死状态会反过来保持条件、分支和归纳变量活跃，使普通 DCE
+  // 无法拆掉整个控制流环。这里接受直线循环体或只有前向边的局部 CFG，但同时
+  // 要求常量迭代次数、末尾严格 +1 的归纳变量、无调用/全局状态，并证明循环
+  // 写入的所有局部量在退出后均不再使用。
   {
     bool removedLoop = true;
     while (removedLoop) {
       removedLoop = false;
+      std::unordered_map<std::string, std::size_t> labelPositions;
       std::unordered_map<std::string, int> labelReferences;
-      for (const auto& inst : ir) {
+      for (std::size_t position = 0; position < ir.size(); ++position) {
+        const IRInst& inst = ir[position];
+        if (inst.op == IROp::LABEL && inst.dest.isLabel()) {
+          labelPositions[inst.dest.name] = position;
+        }
         if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
             inst.dest.isLabel()) {
           ++labelReferences[inst.dest.name];
         }
       }
 
-      for (std::size_t index = 0; index + 1 < ir.size() && !removedLoop; ++index) {
-        if (ir[index].op != IROp::BRANCH || !ir[index].dest.isLabel() ||
-            ir[index + 1].op != IROp::LABEL || !ir[index + 1].dest.isLabel()) {
+      for (std::size_t loopStart = 0; loopStart + 1 < ir.size() && !removedLoop; ++loopStart) {
+        if (ir[loopStart].op != IROp::BRANCH || !ir[loopStart].dest.isLabel() ||
+            ir[loopStart + 1].op != IROp::LABEL || !ir[loopStart + 1].dest.isLabel()) {
           continue;
         }
-        const std::string condLabel = ir[index].dest.name;
-        const std::string bodyLabel = ir[index + 1].dest.name;
+        const std::string condLabel = ir[loopStart].dest.name;
+        const std::string bodyLabel = ir[loopStart + 1].dest.name;
+        // continue 或额外入口会增加引用计数；当前证明不覆盖这些控制流。
         if (labelReferences[condLabel] != 1 || labelReferences[bodyLabel] != 1) {
           continue;
         }
 
-        std::size_t condIndex = index + 2;
-        while (condIndex < ir.size() &&
-               !(ir[condIndex].op == IROp::LABEL && ir[condIndex].dest.isLabel() &&
-                 ir[condIndex].dest.name == condLabel)) {
-          ++condIndex;
+        const auto condFound = labelPositions.find(condLabel);
+        if (condFound == labelPositions.end() || condFound->second <= loopStart + 1) {
+          continue;
         }
-        if (condIndex + 2 >= ir.size() || ir[condIndex + 2].op != IROp::BNEZ ||
-            !ir[condIndex + 2].dest.isLabel() || ir[condIndex + 2].dest.name != bodyLabel) {
+        const std::size_t condIndex = condFound->second;
+        if (condIndex + 2 >= ir.size()) {
+          continue;
+        }
+        const IRInst& condition = ir[condIndex + 1];
+        const IRInst& backedge = ir[condIndex + 2];
+        if ((condition.op != IROp::LT && condition.op != IROp::LE) ||
+            !condition.dest.isLocalVar() || !condition.src1.isLocalVar() ||
+            backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
+            backedge.dest.name != bodyLabel || !backedge.src1.isLocalVar() ||
+            backedge.src1.name != condition.dest.name) {
           continue;
         }
 
-        bool pureStraightBody = condIndex > index + 2;
+        const std::string induction = condition.src1.name;
+        const std::optional<std::string> boundVariable =
+            condition.src2.isLocalVar() ? std::optional<std::string>{condition.src2.name}
+                                        : std::nullopt;
+        const auto findNearbyConstant = [&](const std::string& name) -> std::optional<int> {
+          for (std::size_t position = loopStart; position > 0; --position) {
+            const IRInst& candidate = ir[position - 1];
+            if (candidate.dest.isLocalVar() && candidate.dest.name == name) {
+              if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                  candidate.src1.isImm()) {
+                return candidate.src1.immVal;
+              }
+              return std::nullopt;
+            }
+            if (candidate.op == IROp::LABEL || candidate.op == IROp::BRANCH ||
+                candidate.op == IROp::BEQZ || candidate.op == IROp::BNEZ ||
+                candidate.op == IROp::CALL || candidate.op == IROp::FUNC_BEGIN) {
+              break;
+            }
+          }
+          return std::nullopt;
+        };
+        const auto initial = findNearbyConstant(induction);
+        std::optional<int> upper;
+        if (condition.src2.isImm()) {
+          upper = condition.src2.immVal;
+        } else if (condition.src2.isLocalVar()) {
+          upper = findNearbyConstant(condition.src2.name);
+        }
+        if (!initial || !upper ||
+            (condition.op == IROp::LE && *upper == INT32_MAX && *initial <= *upper)) {
+          continue;
+        }
+        std::int64_t trips = static_cast<std::int64_t>(*upper) - *initial;
+        if (condition.op == IROp::LE) {
+          ++trips;
+        }
+        trips = std::max<std::int64_t>(0, trips);
+        const std::int64_t finalInduction = static_cast<std::int64_t>(*initial) + trips;
+        if (trips > INT32_MAX || finalInduction > INT32_MAX) {
+          continue;
+        }
+
+        bool bodySupported = true;
         std::unordered_set<std::string> definitions;
-        for (std::size_t body = index + 2; body < condIndex && pureStraightBody; ++body) {
-          const auto& inst = ir[body];
+        int inductionWrites = 0;
+        std::size_t inductionWriteIndex = 0;
+        std::size_t lastControlIndex = loopStart + 1;
+        for (std::size_t position = loopStart + 2; position < condIndex && bodySupported;
+             ++position) {
+          const IRInst& inst = ir[position];
+          if (inst.dest.isGlobalVar() || inst.src1.isGlobalVar() || inst.src2.isGlobalVar()) {
+            bodySupported = false;
+            break;
+          }
           switch (inst.op) {
           case IROp::LOCAL_VAR_DECL:
           case IROp::ASSIGN:
@@ -2159,25 +2224,84 @@ void IRGenerator::optimizePass() {
           case IROp::GE:
           case IROp::EQ:
           case IROp::NE:
+            if (!inst.dest.isLocalVar()) {
+              bodySupported = false;
+              break;
+            }
+            definitions.insert(inst.dest.name);
+            // 迭代次数证明依赖循环界保持不变；即便界值最终不可观察，修改它也
+            // 可能改变循环是否终止，不能因为结果为死值就删除。
+            if (boundVariable && inst.dest.name == *boundVariable) {
+              bodySupported = false;
+              break;
+            }
+            if (inst.dest.name == induction) {
+              ++inductionWrites;
+              inductionWriteIndex = position;
+              const bool incrementsByOne = inst.op == IROp::ADD && inst.src1.isLocalVar() &&
+                                           inst.src1.name == induction && inst.src2.isImm() &&
+                                           inst.src2.immVal == 1;
+              if (!incrementsByOne) {
+                bodySupported = false;
+              }
+            }
             break;
+          case IROp::LABEL:
+            if (!inst.dest.isLabel()) {
+              bodySupported = false;
+            }
+            lastControlIndex = position;
+            break;
+          case IROp::BRANCH:
+          case IROp::BEQZ:
+          case IROp::BNEZ: {
+            if (!inst.dest.isLabel()) {
+              bodySupported = false;
+              break;
+            }
+            const auto target = labelPositions.find(inst.dest.name);
+            // 仅允许循环体内部的前向边；内部回边可能不终止，跳出/continue
+            // 则需要额外的路径证明，均保守回退。
+            if (target == labelPositions.end() || target->second <= position ||
+                target->second >= condIndex) {
+              bodySupported = false;
+              break;
+            }
+            lastControlIndex = position;
+            break;
+          }
           default:
-            pureStraightBody = false;
-            continue;
+            bodySupported = false;
+            break;
           }
-          if (!inst.dest.isLocalVar()) {
-            pureStraightBody = false;
-            continue;
-          }
-          definitions.insert(inst.dest.name);
         }
-        if (!pureStraightBody || definitions.empty()) {
+        if (!bodySupported || inductionWrites != 1 || inductionWriteIndex <= lastControlIndex) {
+          continue;
+        }
+
+        // 循环区域不能有来自外部的入口；否则直接删除会悬空外部跳转。
+        bool externalEntry = false;
+        for (std::size_t position = 0; position < ir.size() && !externalEntry; ++position) {
+          if (position >= loopStart && position <= condIndex + 2) {
+            continue;
+          }
+          const IRInst& inst = ir[position];
+          if ((inst.op != IROp::BRANCH && inst.op != IROp::BEQZ && inst.op != IROp::BNEZ) ||
+              !inst.dest.isLabel()) {
+            continue;
+          }
+          const auto target = labelPositions.find(inst.dest.name);
+          externalEntry = target != labelPositions.end() && target->second > loopStart &&
+                          target->second <= condIndex + 2;
+        }
+        if (externalEntry) {
           continue;
         }
 
         std::size_t loopEnd = condIndex + 3;
         bool liveAfter = false;
-        for (std::size_t after = loopEnd; after < ir.size() && !liveAfter; ++after) {
-          const auto& inst = ir[after];
+        for (std::size_t position = loopEnd; position < ir.size() && !liveAfter; ++position) {
+          const IRInst& inst = ir[position];
           if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
             break;
           }
@@ -2194,7 +2318,7 @@ void IRGenerator::optimizePass() {
             labelReferences[ir[loopEnd].dest.name] == 0) {
           ++loopEnd;
         }
-        ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(index),
+        ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(loopStart),
                  ir.begin() + static_cast<std::ptrdiff_t>(loopEnd));
         removedLoop = true;
       }
