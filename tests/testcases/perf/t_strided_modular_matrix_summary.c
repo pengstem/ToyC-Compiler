@@ -1,6 +1,10 @@
 // A constant-trip modular recurrence whose induction advances by more than one.
 // The final update lands exactly on the bound, so termination and int32 safety
 // are both provable without assuming signed wraparound.
+int global_a = 13;
+int global_b = 14;
+int global_c = 15;
+
 int main() {
   int a = 1;
   int b = 2;
@@ -60,5 +64,17 @@ int main() {
     c = next_c;
     l = l - 3;
   }
-  return (first + second + third + a + b + c + l) % 251;
+  int fourth = (a + b + c + l) % 251;
+
+  int m = 0;
+  while (m < 10000000) {
+    int next_a = (global_a * 7 + global_b * 11 + global_c * 13) % 10007;
+    int next_b = (global_a * 17 + global_b * 19 + global_c * 23) % 10007;
+    int next_c = (global_a * 29 + global_b * 31 + global_c * 37) % 10007;
+    global_a = next_a;
+    global_b = next_b;
+    global_c = next_c;
+    m = m + 1;
+  }
+  return (first + second + third + fourth + global_a + global_b + global_c + m) % 251;
 }

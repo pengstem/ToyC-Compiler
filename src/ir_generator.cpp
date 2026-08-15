@@ -6485,23 +6485,28 @@ void IRGenerator::optimizePass() {
           }
           const IRInst& condition = ir[condIndex + 1];
           const IRInst& backedge = ir[condIndex + 2];
-          if ((condition.op != IROp::LT && condition.op != IROp::LE &&
-               condition.op != IROp::GT && condition.op != IROp::GE) ||
-              !condition.dest.isLocalVar() ||
-              backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
-              backedge.dest.name != bodyLabel || !backedge.src1.isLocalVar() ||
-              backedge.src1.name != condition.dest.name) {
+          if ((condition.op != IROp::LT && condition.op != IROp::LE && condition.op != IROp::GT &&
+               condition.op != IROp::GE) ||
+              !condition.dest.isLocalVar() || backedge.op != IROp::BNEZ ||
+              !backedge.dest.isLabel() || backedge.dest.name != bodyLabel ||
+              !backedge.src1.isLocalVar() || backedge.src1.name != condition.dest.name) {
             continue;
           }
 
+          const auto isScalarVariable = [](const Operand& operand) {
+            return operand.isLocalVar() || operand.isGlobalVar();
+          };
+          const auto sameVariable = [&](const Operand& lhs, const Operand& rhs) {
+            return lhs.type == rhs.type && isScalarVariable(lhs) && lhs.name == rhs.name;
+          };
           const auto writtenInBody = [&](const Operand& operand) {
-            if (!operand.isLocalVar()) {
+            if (!isScalarVariable(operand)) {
               return false;
             }
             for (std::size_t position = loopStart + 2; position < condIndex; ++position) {
               const IRInst& candidate = ir[position];
-              if (candidate.dest.isLocalVar() && candidate.dest.name == operand.name &&
-                  candidate.op != IROp::RETURN && candidate.op != IROp::PARAM) {
+              if (sameVariable(candidate.dest, operand) && candidate.op != IROp::RETURN &&
+                  candidate.op != IROp::PARAM) {
                 return true;
               }
             }
@@ -6529,16 +6534,17 @@ void IRGenerator::optimizePass() {
               break;
             }
           }
-          if (!inductionOperand.isLocalVar() || !writtenInBody(inductionOperand)) {
+          if (!isScalarVariable(inductionOperand) || !writtenInBody(inductionOperand)) {
             continue;
           }
 
           const std::string induction = inductionOperand.name;
-          const auto findNearbyConstant = [&](const std::string& name) -> std::optional<int> {
+          const auto findNearbyConstant = [&](const Operand& operand) -> std::optional<int> {
             for (std::size_t position = loopStart; position > 0; --position) {
               const IRInst& candidate = ir[position - 1];
-              if (candidate.dest.isLocalVar() && candidate.dest.name == name) {
-                if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+              if (sameVariable(candidate.dest, operand)) {
+                if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL ||
+                     candidate.op == IROp::GLOBAL_VAR_DECL) &&
                     candidate.src1.isImm()) {
                   return candidate.src1.immVal;
                 }
@@ -6552,11 +6558,45 @@ void IRGenerator::optimizePass() {
             }
             return std::nullopt;
           };
-          const auto findUniqueConstant = [&](const std::string& name) -> std::optional<int> {
+          const auto findUniqueConstant = [&](const Operand& operand) -> std::optional<int> {
             std::size_t functionBegin = loopStart;
             while (functionBegin > 0 && ir[functionBegin - 1].op != IROp::FUNC_BEGIN) {
               --functionBegin;
             }
+
+            // 全局状态只有在 main 的循环入口可证明时才使用声明初值。此前任何
+            // 调用都可能改写全局；若同一全局在此前控制流中出现过写入，则也不
+            // 能把线性 IR 中看到的常量当作必经值。紧邻循环的直线常量赋值已由
+            // findNearbyConstant 处理；这里仅安全回退到从未写过的声明初值。
+            if (operand.isGlobalVar()) {
+              if (functionBegin == 0 || ir[functionBegin - 1].op != IROp::FUNC_BEGIN ||
+                  !ir[functionBegin - 1].dest.isFunc() ||
+                  ir[functionBegin - 1].dest.name != "main") {
+                return std::nullopt;
+              }
+              for (std::size_t position = functionBegin; position < loopStart; ++position) {
+                const IRInst& candidate = ir[position];
+                if (candidate.op == IROp::CALL) {
+                  return std::nullopt;
+                }
+                if (sameVariable(candidate.dest, operand)) {
+                  return std::nullopt;
+                }
+              }
+              std::optional<int> constant;
+              for (std::size_t position = 0; position + 1 < functionBegin; ++position) {
+                const IRInst& candidate = ir[position];
+                if (candidate.op == IROp::GLOBAL_VAR_DECL &&
+                    sameVariable(candidate.dest, operand) && candidate.src1.isImm()) {
+                  if (constant) {
+                    return std::nullopt;
+                  }
+                  constant = candidate.src1.immVal;
+                }
+              }
+              return constant;
+            }
+
             int definitions = 0;
             std::optional<int> constant;
             for (std::size_t position = functionBegin; position < ir.size(); ++position) {
@@ -6564,8 +6604,8 @@ void IRGenerator::optimizePass() {
               if (candidate.op == IROp::FUNC_END) {
                 break;
               }
-              if (!candidate.dest.isLocalVar() || candidate.dest.name != name ||
-                  candidate.op == IROp::RETURN || candidate.op == IROp::PARAM ||
+              if (!sameVariable(candidate.dest, operand) || candidate.op == IROp::RETURN ||
+                  candidate.op == IROp::PARAM ||
                   (candidate.op == IROp::LOCAL_VAR_DECL && candidate.src1.isNone())) {
                 continue;
               }
@@ -6580,14 +6620,22 @@ void IRGenerator::optimizePass() {
             return definitions == 1 ? constant : std::nullopt;
           };
 
-          const auto initial = findNearbyConstant(induction);
+          auto initial = findNearbyConstant(inductionOperand);
+          if (!initial && inductionOperand.isGlobalVar()) {
+            initial = findUniqueConstant(inductionOperand);
+          }
           std::optional<int> upper;
           if (boundOperand.isImm()) {
             upper = boundOperand.immVal;
           } else if (boundOperand.isLocalVar()) {
-            upper = findNearbyConstant(boundOperand.name);
+            upper = findNearbyConstant(boundOperand);
             if (!upper) {
-              upper = findUniqueConstant(boundOperand.name);
+              upper = findUniqueConstant(boundOperand);
+            }
+          } else if (boundOperand.isGlobalVar()) {
+            upper = findNearbyConstant(boundOperand);
+            if (!upper) {
+              upper = findUniqueConstant(boundOperand);
             }
           }
           if (!initial || !upper) {
@@ -6595,13 +6643,15 @@ void IRGenerator::optimizePass() {
           }
 
           std::vector<std::string> variables;
+          std::vector<Operand> variableOperands;
           std::unordered_map<std::string, std::size_t> variableIndex;
           const auto addVariable = [&](const Operand& operand) {
-            if (!operand.isLocalVar() || variableIndex.count(operand.name) != 0) {
+            if (!isScalarVariable(operand) || variableIndex.count(operand.name) != 0) {
               return;
             }
             variableIndex[operand.name] = variables.size();
             variables.push_back(operand.name);
+            variableOperands.push_back(operand);
           };
           std::unordered_set<std::string> written;
           bool bodySupported = condIndex > loopStart + 2;
@@ -6617,8 +6667,9 @@ void IRGenerator::optimizePass() {
               bodySupported = false;
               break;
             }
-            if (!inst.dest.isLocalVar() || (!inst.src1.isImm() && !inst.src1.isLocalVar()) ||
-                (!inst.src2.isNone() && !inst.src2.isImm() && !inst.src2.isLocalVar())) {
+            if (!isScalarVariable(inst.dest) ||
+                (!inst.src1.isImm() && !isScalarVariable(inst.src1)) ||
+                (!inst.src2.isNone() && !inst.src2.isImm() && !isScalarVariable(inst.src2))) {
               bodySupported = false;
               break;
             }
@@ -6630,7 +6681,7 @@ void IRGenerator::optimizePass() {
           addVariable(inductionOperand);
           if (!bodySupported || variables.empty() ||
               variables.size() > kMaxCoupledAffineVariables || written.count(induction) == 0 ||
-              (boundOperand.isLocalVar() && written.count(boundOperand.name) != 0)) {
+              (isScalarVariable(boundOperand) && written.count(boundOperand.name) != 0)) {
             continue;
           }
 
@@ -6650,7 +6701,7 @@ void IRGenerator::optimizePass() {
               row[constantColumn] = static_cast<std::uint32_t>(operand.immVal);
               return row;
             }
-            if (!operand.isLocalVar()) {
+            if (!isScalarVariable(operand)) {
               return std::nullopt;
             }
             const auto found = variableIndex.find(operand.name);
@@ -6659,20 +6710,18 @@ void IRGenerator::optimizePass() {
             }
             return transform[found->second];
           };
-          const auto upperForOperand = [&](const Operand& operand)
-              -> std::optional<std::uint64_t> {
+          const auto upperForOperand = [&](const Operand& operand) -> std::optional<std::uint64_t> {
             if (operand.isImm()) {
               if (operand.immVal < 0) {
                 return std::nullopt;
               }
               return static_cast<std::uint64_t>(operand.immVal);
             }
-            if (!operand.isLocalVar()) {
+            if (!isScalarVariable(operand)) {
               return std::nullopt;
             }
             const auto found = variableIndex.find(operand.name);
-            return found == variableIndex.end() ? std::nullopt
-                                                : nonnegativeUpper[found->second];
+            return found == variableIndex.end() ? std::nullopt : nonnegativeUpper[found->second];
           };
           const auto sameOperand = [](const Operand& lhs, const Operand& rhs) {
             if (lhs.type != rhs.type) {
@@ -6680,9 +6729,9 @@ void IRGenerator::optimizePass() {
             }
             return lhs.isImm() ? lhs.immVal == rhs.immVal : lhs.name == rhs.name;
           };
-          const auto applyPositiveModulus =
-              [&](std::size_t destination, const AffineRow& dividend, std::uint32_t modulus,
-                  std::optional<std::uint64_t> currentUpper) {
+          const auto applyPositiveModulus = [&](std::size_t destination, const AffineRow& dividend,
+                                                std::uint32_t modulus,
+                                                std::optional<std::uint64_t> currentUpper) {
             if (loopModulus && *loopModulus != modulus) {
               return false;
             }
@@ -6708,8 +6757,7 @@ void IRGenerator::optimizePass() {
                 }
                 const std::uint64_t term = static_cast<std::uint64_t>(coefficient) *
                                            static_cast<std::uint64_t>(modulus - 1);
-                nonnegativeAndBounded =
-                    term <= INT32_MAX && expandedUpper <= INT32_MAX - term;
+                nonnegativeAndBounded = term <= INT32_MAX && expandedUpper <= INT32_MAX - term;
                 if (nonnegativeAndBounded) {
                   expandedUpper += term;
                 }
@@ -6872,21 +6920,17 @@ void IRGenerator::optimizePass() {
           const bool loopRuns = relation == IROp::LT   ? startValue < boundValue
                                 : relation == IROp::LE ? startValue <= boundValue
                                 : relation == IROp::GT ? startValue > boundValue
-                                                      : startValue >= boundValue;
+                                                       : startValue >= boundValue;
           std::uint64_t trips = 0;
           if (loopRuns) {
             if (increasingRelation) {
-              const std::uint64_t distance =
-                  static_cast<std::uint64_t>(boundValue - startValue);
+              const std::uint64_t distance = static_cast<std::uint64_t>(boundValue - startValue);
               const std::uint64_t step = static_cast<std::uint64_t>(inductionStep);
-              trips = relation == IROp::LT ? (distance + step - 1) / step
-                                           : distance / step + 1;
+              trips = relation == IROp::LT ? (distance + step - 1) / step : distance / step + 1;
             } else {
-              const std::uint64_t distance =
-                  static_cast<std::uint64_t>(startValue - boundValue);
+              const std::uint64_t distance = static_cast<std::uint64_t>(startValue - boundValue);
               const std::uint64_t step = static_cast<std::uint64_t>(-inductionStep);
-              trips = relation == IROp::GT ? (distance + step - 1) / step
-                                           : distance / step + 1;
+              trips = relation == IROp::GT ? (distance + step - 1) / step : distance / step + 1;
             }
           }
           const std::int64_t finalInduction =
@@ -6897,6 +6941,11 @@ void IRGenerator::optimizePass() {
 
           std::size_t loopEnd = condIndex + 3;
           const auto usedAfterLoop = [&](const std::string& name) {
+            const auto variable = variableIndex.find(name);
+            if (variable != variableIndex.end() &&
+                variableOperands[variable->second].isGlobalVar()) {
+              return true;
+            }
             for (std::size_t position = loopEnd; position < ir.size(); ++position) {
               const IRInst& inst = ir[position];
               if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
@@ -6970,9 +7019,9 @@ void IRGenerator::optimizePass() {
             bool modularSummarySafe = true;
             std::vector<std::optional<std::uint32_t>> initialValues(variables.size());
             for (const std::size_t column : modularInputColumns) {
-              std::optional<int> value = findNearbyConstant(variables[column]);
+              std::optional<int> value = findNearbyConstant(variableOperands[column]);
               if (!value) {
-                value = findUniqueConstant(variables[column]);
+                value = findUniqueConstant(variableOperands[column]);
               }
               if (!value || *value < 0 || static_cast<std::uint32_t>(*value) >= modulus ||
                   normalizedModulus[column] != loopModulus) {
@@ -7057,7 +7106,7 @@ void IRGenerator::optimizePass() {
               if (!modularSummarySafe) {
                 break;
               }
-              replacement.emplace_back(IROp::ASSIGN, Operand::localVar(name),
+              replacement.emplace_back(IROp::ASSIGN, variableOperands[rowIndex],
                                        Operand::imm(static_cast<std::int32_t>(finalValue)),
                                        Operand::none());
             }
@@ -7065,7 +7114,7 @@ void IRGenerator::optimizePass() {
               continue;
             }
             if (usedAfterLoop(induction)) {
-              replacement.emplace_back(IROp::ASSIGN, Operand::localVar(induction),
+              replacement.emplace_back(IROp::ASSIGN, inductionOperand,
                                        Operand::imm(static_cast<int>(finalInduction)),
                                        Operand::none());
             }
@@ -7099,7 +7148,7 @@ void IRGenerator::optimizePass() {
           }
 
           std::vector<IRInst> replacement;
-          std::vector<std::pair<std::string, std::string>> finalMoves;
+          std::vector<std::pair<Operand, std::string>> finalMoves;
           bool writeFinalInduction = false;
           for (std::size_t rowIndex = 0; rowIndex < variables.size(); ++rowIndex) {
             const std::string& name = variables[rowIndex];
@@ -7132,7 +7181,7 @@ void IRGenerator::optimizePass() {
               if (coefficient == 0) {
                 continue;
               }
-              Operand term = Operand::localVar(variables[column]);
+              Operand term = variableOperands[column];
               if (coefficient != 1) {
                 const std::string productName = newTemp();
                 replacement.emplace_back(IROp::MUL, Operand::localVar(productName), term,
@@ -7158,14 +7207,14 @@ void IRGenerator::optimizePass() {
                                        Operand::localVar(finalName),
                                        Operand::imm(static_cast<std::int32_t>(constant)));
             }
-            finalMoves.push_back({name, finalName});
+            finalMoves.push_back({variableOperands[rowIndex], finalName});
           }
           for (const auto& move : finalMoves) {
-            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(move.first),
-                                     Operand::localVar(move.second), Operand::none());
+            replacement.emplace_back(IROp::ASSIGN, move.first, Operand::localVar(move.second),
+                                     Operand::none());
           }
           if (writeFinalInduction) {
-            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(induction),
+            replacement.emplace_back(IROp::ASSIGN, inductionOperand,
                                      Operand::imm(static_cast<int>(finalInduction)),
                                      Operand::none());
           }
