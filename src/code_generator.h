@@ -34,8 +34,8 @@ private:
     std::unordered_map<std::string, int> regAlloc; // 局部变量 → s寄存器编号 (2-11)
     // 无调用叶函数可安全使用 caller-saved 参数寄存器，无需在序言/尾声保存。
     std::unordered_map<std::string, std::string> leafRegAlloc;
-    std::unordered_map<std::string, int> globalRegAlloc;   // 全局变量 → s寄存器编号 (2-11)
-    std::unordered_map<std::string, std::string> tempRegs; // 临时变量 → t寄存器 (t4-t6)
+    std::unordered_map<std::string, std::string> globalRegAlloc; // 全局变量 → a1-a7/s2-s11
+    std::unordered_map<std::string, std::string> tempRegs;       // 临时变量 → t寄存器 (t4-t6)
     // 热循环常量 → 空闲寄存器。函数入口只物化一次，循环体直接复用。
     std::unordered_map<int, std::string> constantRegAlloc;
     std::vector<std::string> usedCalleeSavedRegisters;
@@ -118,6 +118,8 @@ private:
   bool isDestInReg(const Operand& dest) const;
   // 统一查询变量绑定的寄存器（s2-s11 或 t4-t6），未绑定返回空串
   std::string regForVar(const std::string& name) const;
+  // 查询局部/全局操作数的寄存器副本，立即数或未分配值返回空串。
+  std::string regForOperand(const Operand& operand) const;
   bool varHasReg(const std::string& name) const;
 
   std::string asmLabel(const std::string& label) const;

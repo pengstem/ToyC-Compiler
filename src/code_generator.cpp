@@ -707,8 +707,9 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
   }
 
   // 全局变量寄存器分配：仅当函数无函数调用时（调用者可能修改全局变量，寄存器中的
-  // 副本会失效），把高频全局变量放入剩余的 s 寄存器，函数入口加载、出口存回，
-  // 循环内对全局的访问从 la+lw/sw（6 条指令）降为寄存器直用
+  // 副本会失效）。叶函数除剩余 s 寄存器外还可安全使用未分配的 a1-a7；a0
+  // 留给返回值，否则在公共退出块存回全局变量时会把返回值误写回。标量矩阵类
+  // 循环常有十几个全局状态，这 7 个额外寄存器可消除每轮反复的 la+lw/sw。
   if (!hasCall) {
     std::vector<std::string> globalOrder;
     for (const auto& entry : globalUseWeight) {
@@ -718,13 +719,28 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
                      [&](const std::string& a, const std::string& b) {
                        return globalUseWeight[a] > globalUseWeight[b];
                      });
-    for (const auto& name : globalOrder) {
-      for (int reg = 2; reg <= 11; ++reg) {
-        if (!occupiedSRegisters[static_cast<std::size_t>(reg)]) {
-          frame.globalRegAlloc[name] = reg;
-          occupiedSRegisters[static_cast<std::size_t>(reg)] = true;
-          break;
-        }
+    std::unordered_set<std::string> occupiedRegisters;
+    for (const auto& entry : assignedRegisters) {
+      occupiedRegisters.insert(entry.second);
+    }
+    std::vector<std::string> globalRegisters;
+    for (int reg = 1; reg < 8; ++reg) {
+      const std::string name = "a" + std::to_string(reg);
+      if (occupiedRegisters.count(name) == 0) {
+        globalRegisters.push_back(name);
+      }
+    }
+    for (int reg = 2; reg <= 11; ++reg) {
+      if (!occupiedSRegisters[static_cast<std::size_t>(reg)]) {
+        globalRegisters.push_back("s" + std::to_string(reg));
+      }
+    }
+    const std::size_t count = std::min(globalOrder.size(), globalRegisters.size());
+    for (std::size_t index = 0; index < count; ++index) {
+      frame.globalRegAlloc[globalOrder[index]] = globalRegisters[index];
+      const std::string& reg = globalRegisters[index];
+      if (!reg.empty() && reg[0] == 's') {
+        occupiedSRegisters[static_cast<std::size_t>(std::stoi(reg.substr(1)))] = true;
       }
     }
   }
@@ -788,6 +804,15 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
           }
         }
       }
+      for (const auto& entry : frame.globalRegAlloc) {
+        const std::string& reg = entry.second;
+        if (reg.size() == 2 && reg[0] == 'a') {
+          const int index = reg[1] - '0';
+          if (index >= 0 && index < 8) {
+            usedArgRegs[index] = true;
+          }
+        }
+      }
       for (int r = 0; r < 8; ++r) {
         if (!usedArgRegs[r]) {
           spareRegisters.push_back("a" + std::to_string(r));
@@ -836,10 +861,10 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
       }
       if (op->isGlobalVar()) {
         auto it = frame.globalRegAlloc.find(op->name);
-        if (it != frame.globalRegAlloc.end()) {
-          const int idx = it->second - 2;
-          if (idx >= 0 && idx < 10) {
-            regUsed[static_cast<std::size_t>(idx)] = true;
+        if (it != frame.globalRegAlloc.end() && !it->second.empty() && it->second[0] == 's') {
+          const int number = std::stoi(it->second.substr(1));
+          if (number >= 2 && number <= 11) {
+            regUsed[static_cast<std::size_t>(number - 2)] = true;
           }
         }
       }
@@ -952,9 +977,8 @@ void CodeGenerator::generateFunction(const FunctionRange& function, std::ostream
   // 全局变量寄存器副本：函数入口加载一次（位于 .L_body 之前，
   // 自递归尾调用跳回 .L_body 时不会重复加载，保留迭代间的值）
   for (const auto& entry : frame_.globalRegAlloc) {
-    const std::string sreg = "s" + std::to_string(entry.second);
     emit(body, "la", "t2, " + globalSymbol(entry.first));
-    emit(body, "lw", sreg + ", 0(t2)");
+    emit(body, "lw", entry.second + ", 0(t2)");
   }
 
   // 自递归尾调用跳回点：位于参数装载之前（复用当前栈帧，等价于循环）
@@ -990,9 +1014,8 @@ void CodeGenerator::generateFunction(const FunctionRange& function, std::ostream
 
   // 全局变量寄存器副本存回（位于 epilogue 恢复寄存器之前）
   for (const auto& entry : frame_.globalRegAlloc) {
-    const std::string sreg = "s" + std::to_string(entry.second);
     emit(body, "la", "t2, " + globalSymbol(entry.first));
-    emit(body, "sw", sreg + ", 0(t2)");
+    emit(body, "sw", entry.second + ", 0(t2)");
   }
 
   emitEpilogue(frame_, body);
@@ -1119,8 +1142,7 @@ std::size_t CodeGenerator::generateInstruction(std::size_t index, std::size_t en
     } else if (inst.src1.isGlobalVar()) {
       auto it = frame_.globalRegAlloc.find(inst.src1.name);
       if (it != frame_.globalRegAlloc.end()) {
-        std::string reg = "s" + std::to_string(it->second);
-        out << "    beqz " << reg << ", " << asmLabel(inst.dest.name) << "\n";
+        out << "    beqz " << it->second << ", " << asmLabel(inst.dest.name) << "\n";
         break;
       }
     }
@@ -1138,8 +1160,7 @@ std::size_t CodeGenerator::generateInstruction(std::size_t index, std::size_t en
     } else if (inst.src1.isGlobalVar()) {
       auto it = frame_.globalRegAlloc.find(inst.src1.name);
       if (it != frame_.globalRegAlloc.end()) {
-        std::string reg = "s" + std::to_string(it->second);
-        out << "    bnez " << reg << ", " << asmLabel(inst.dest.name) << "\n";
+        out << "    bnez " << it->second << ", " << asmLabel(inst.dest.name) << "\n";
         break;
       }
     }
@@ -1554,9 +1575,8 @@ void CodeGenerator::loadOperand(const Operand& operand, std::string_view reg, st
     // 若全局变量分配了寄存器，直接从寄存器复制
     auto it = frame_.globalRegAlloc.find(operand.name);
     if (it != frame_.globalRegAlloc.end()) {
-      std::string sreg = "s" + std::to_string(it->second);
-      if (std::string(reg) != sreg) {
-        emit(out, "mv", std::string(reg) + ", " + sreg);
+      if (std::string(reg) != it->second) {
+        emit(out, "mv", std::string(reg) + ", " + it->second);
       }
       return;
     }
@@ -1596,9 +1616,8 @@ void CodeGenerator::storeOperand(std::string_view reg, const Operand& operand, s
     // 若全局变量分配了寄存器，直接存到寄存器
     auto it = frame_.globalRegAlloc.find(operand.name);
     if (it != frame_.globalRegAlloc.end()) {
-      std::string sreg = "s" + std::to_string(it->second);
-      if (std::string(reg) != sreg) {
-        emit(out, "mv", sreg + ", " + std::string(reg));
+      if (std::string(reg) != it->second) {
+        emit(out, "mv", it->second + ", " + std::string(reg));
       }
       return;
     }
@@ -1700,7 +1719,7 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
   } else if (inst.dest.isGlobalVar()) {
     auto it = frame_.globalRegAlloc.find(inst.dest.name);
     if (it != frame_.globalRegAlloc.end()) {
-      destReg = "s" + std::to_string(it->second);
+      destReg = it->second;
       destInReg = true;
     }
   }
@@ -1718,8 +1737,9 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
   // RISC-V 没有“立即数减寄存器”指令。若目标与右操作数共用寄存器，通用
   // 调度会先把右值 mv 到 t1，再用 li 覆盖目标，共需 3 条。改用空闲 scratch
   // 保存立即数即可原地完成，热循环中的 `x = 1 - x` 每轮少 1 条指令。
-  if (inst.op == IROp::SUB && inst.src1.isImm() && inst.src2.isLocalVar()) {
-    const std::string rhsReg = regForVar(inst.src2.name);
+  if (inst.op == IROp::SUB && inst.src1.isImm() &&
+      (inst.src2.isLocalVar() || inst.src2.isGlobalVar())) {
+    const std::string rhsReg = regForOperand(inst.src2);
     if (!rhsReg.empty() && rhsReg == destReg) {
       if (inst.src1.immVal == 0) {
         emit(out, "sub", destReg + ", x0, " + rhsReg);
@@ -1741,9 +1761,10 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
   // 两个源都已在寄存器时可直接使用三地址指令。RISC-V 在写 rd 前读取
   // rs1/rs2，因此 rd 与任一源相同都安全；通用路径把 `d = a op d` 的 d
   // 先搬到 t1，会在宽表达式图和矩阵内层产生大量无意义 mv。
-  if (inst.src1.isLocalVar() && inst.src2.isLocalVar()) {
-    const std::string lhsReg = regForVar(inst.src1.name);
-    const std::string rhsReg = regForVar(inst.src2.name);
+  if ((inst.src1.isLocalVar() || inst.src1.isGlobalVar()) &&
+      (inst.src2.isLocalVar() || inst.src2.isGlobalVar())) {
+    const std::string lhsReg = regForOperand(inst.src1);
+    const std::string rhsReg = regForOperand(inst.src2);
     if (!lhsReg.empty() && !rhsReg.empty()) {
       switch (inst.op) {
       case IROp::ADD:
@@ -1785,8 +1806,8 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
       src2Reg = reg;
       src2InReg = true;
     }
-  } else if (inst.src2.isLocalVar()) {
-    const std::string reg = regForVar(inst.src2.name);
+  } else if (inst.src2.isLocalVar() || inst.src2.isGlobalVar()) {
+    const std::string reg = regForOperand(inst.src2);
     if (!reg.empty()) {
       // 若 src2 的寄存器就是 destReg，加载 src1 会覆盖 src2，需用 t1
       if (reg != destReg) {
@@ -1801,8 +1822,8 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
 
   // 确定 src1 的寄存器：若已在寄存器中，直接用该寄存器运算，避免 mv 到 destReg
   std::string src1Reg = destReg;
-  if (inst.src1.isLocalVar()) {
-    const std::string reg = regForVar(inst.src1.name);
+  if (inst.src1.isLocalVar() || inst.src1.isGlobalVar()) {
+    const std::string reg = regForOperand(inst.src1);
     if (!reg.empty()) {
       src1Reg = reg;
     } else {
@@ -1975,7 +1996,7 @@ void CodeGenerator::emitCompareOp(const IRInst& inst, std::ostream& out) {
   } else if (inst.dest.isGlobalVar()) {
     auto it = frame_.globalRegAlloc.find(inst.dest.name);
     if (it != frame_.globalRegAlloc.end()) {
-      destReg = "s" + std::to_string(it->second);
+      destReg = it->second;
       destInReg = true;
     }
   }
@@ -2006,8 +2027,8 @@ void CodeGenerator::emitCompareInto(const IRInst& inst, std::string_view destReg
       src2Reg = reg;
       src2InReg = true;
     }
-  } else if (inst.src2.isLocalVar()) {
-    const std::string reg = regForVar(inst.src2.name);
+  } else if (inst.src2.isLocalVar() || inst.src2.isGlobalVar()) {
+    const std::string reg = regForOperand(inst.src2);
     if (!reg.empty()) {
       if (reg != dest) {
         src2Reg = reg;
@@ -2021,8 +2042,8 @@ void CodeGenerator::emitCompareInto(const IRInst& inst, std::string_view destReg
 
   // 确定 src1 的寄存器：若已在寄存器中，直接用该寄存器做比较，避免 mv 到 destReg
   std::string src1Reg = dest;
-  if (inst.src1.isLocalVar()) {
-    const std::string reg = regForVar(inst.src1.name);
+  if (inst.src1.isLocalVar() || inst.src1.isGlobalVar()) {
+    const std::string reg = regForOperand(inst.src1);
     if (!reg.empty()) {
       src1Reg = reg;
     } else {
@@ -2414,7 +2435,7 @@ std::string CodeGenerator::destRegOrT0(const Operand& dest) const {
   if (dest.isGlobalVar()) {
     auto it = frame_.globalRegAlloc.find(dest.name);
     if (it != frame_.globalRegAlloc.end()) {
-      return "s" + std::to_string(it->second);
+      return it->second;
     }
   }
   return "t0";
@@ -2442,6 +2463,19 @@ std::string CodeGenerator::regForVar(const std::string& name) const {
   auto tit = frame_.tempRegs.find(name);
   if (tit != frame_.tempRegs.end()) {
     return tit->second;
+  }
+  return std::string();
+}
+
+std::string CodeGenerator::regForOperand(const Operand& operand) const {
+  if (operand.isLocalVar()) {
+    return regForVar(operand.name);
+  }
+  if (operand.isGlobalVar()) {
+    const auto found = frame_.globalRegAlloc.find(operand.name);
+    if (found != frame_.globalRegAlloc.end()) {
+      return found->second;
+    }
   }
   return std::string();
 }
