@@ -316,7 +316,7 @@ void testIR_shortCircuitAnd() {
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*comp);
+  auto ir = irGen.generate(*comp, IRStage::RAW);
   if (irContains(ir, "BEQZ") && irContains(ir, "ASSIGN") && irContains(ir, "BRANCH")) {
     testPass();
   } else {
@@ -333,7 +333,7 @@ void testIR_shortCircuitOr() {
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*comp);
+  auto ir = irGen.generate(*comp, IRStage::RAW);
   if (irContains(ir, "BNEZ") && irContains(ir, "ASSIGN")) {
     testPass();
   } else {
@@ -350,7 +350,7 @@ void testIR_ifStatement() {
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*comp);
+  auto ir = irGen.generate(*comp, IRStage::RAW);
   if (irContains(ir, "BEQZ") && irContains(ir, "LABEL") && irContains(ir, "RETURN #100")) {
     testPass();
   } else {
@@ -367,9 +367,9 @@ void testIR_whileLoop() {
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*comp);
-  // 循环反转后条件判断变为 BNEZ（位于循环体末尾），但 LABEL/BRANCH 仍在
-  if (irContains(ir, "BNEZ") && irContains(ir, "BRANCH") && irContains(ir, "LABEL")) {
+  auto ir = irGen.generate(*comp, IRStage::RAW);
+  // 原始 IR 在循环入口用 BEQZ 退出，且保留 LABEL/BRANCH 结构。
+  if (irContains(ir, "BEQZ") && irContains(ir, "BRANCH") && irContains(ir, "LABEL")) {
     testPass();
   } else {
     testFail("while IR structure mismatch:\n" + irToString(ir));
@@ -825,7 +825,7 @@ void testIR_ifElse() {
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*comp);
+  auto ir = irGen.generate(*comp, IRStage::RAW);
   if (irContains(ir, "BEQZ") && irContains(ir, "BRANCH") && irContains(ir, "RETURN #100") &&
       irContains(ir, "RETURN #200")) {
     testPass();
@@ -844,7 +844,7 @@ void testIR_nestedIf() {
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*comp);
+  auto ir = irGen.generate(*comp, IRStage::RAW);
   if (irContains(ir, "BEQZ") && irContains(ir, "RETURN #42")) {
     testPass();
   } else {
@@ -863,7 +863,7 @@ void testIR_multipleIfElse() {
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*comp);
+  auto ir = irGen.generate(*comp, IRStage::RAW);
   if (irContains(ir, "RETURN #1") && irContains(ir, "RETURN #2") && irContains(ir, "RETURN #3")) {
     testPass();
   } else {
@@ -881,9 +881,9 @@ void testIR_continueInWhile() {
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*comp);
-  // continue 跳转到循环测试点（反转后位于循环体末尾），以 LABEL/BNEZ 形式存在
-  if (irContains(ir, "BRANCH") && irContains(ir, "LABEL") && irContains(ir, "BNEZ")) {
+  auto ir = irGen.generate(*comp, IRStage::RAW);
+  // continue 跳转到循环测试点；原始 IR 入口条件用 BEQZ 表示。
+  if (irContains(ir, "BRANCH") && irContains(ir, "LABEL") && irContains(ir, "BEQZ")) {
     testPass();
   } else {
     testFail("continue IR mismatch:\n" + irToString(ir));
@@ -926,14 +926,33 @@ void testIR_nestedWhile() {
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*comp);
-  // 两个 while 各需要 BNEZ（循环反转后条件判断位于循环体末尾）
+  auto ir = irGen.generate(*comp, IRStage::RAW);
+  // 原始 IR 中两个 while 各需要一个入口 BEQZ。
   auto irStr = irToString(ir);
-  size_t first = irStr.find("BNEZ");
-  if (first != std::string::npos && irStr.find("BNEZ", first + 1) != std::string::npos) {
+  size_t first = irStr.find("BEQZ");
+  if (first != std::string::npos && irStr.find("BEQZ", first + 1) != std::string::npos) {
     testPass();
   } else {
-    testFail("nested while should have 2 BNEZ:\n" + irStr);
+    testFail("nested while should have 2 BEQZ:\n" + irStr);
+  }
+}
+
+void testIR_constantBranchOptimized() {
+  testHeader("IR: optimized constant branches remove unreachable arms");
+  auto comp = makeCompUnit();
+  comp->globalDecls.push_back(
+      makeFuncDef(Type::INT, "main", {},
+                  makeBlock({makeIf(makeInt(0), makeReturn(makeInt(1))),
+                             makeIf(makeInt(1), makeReturn(makeInt(2))), makeReturn(makeInt(3))})));
+  SemanticAnalyzer sema;
+  sema.analyze(*comp);
+  IRGenerator irGen(sema.getSymbolTable());
+  auto ir = irGen.generate(*comp, IRStage::OPTIMIZED);
+  if (irContains(ir, "RETURN #2") && !irContains(ir, "RETURN #1") && !irContains(ir, "RETURN #3") &&
+      !irContains(ir, "BEQZ") && !irContains(ir, "BNEZ")) {
+    testPass();
+  } else {
+    testFail("constant branch cleanup mismatch:\n" + irToString(ir));
   }
 }
 
@@ -1122,7 +1141,7 @@ void testIR_shortCircuitNested() {
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*comp);
+  auto ir = irGen.generate(*comp, IRStage::RAW);
   auto irStr = irToString(ir);
   size_t first = irStr.find("BNEZ");
   if (first != std::string::npos && irStr.find("BNEZ", first + 1) != std::string::npos &&
@@ -1323,7 +1342,7 @@ void testIntegration_ifElse() {
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*comp);
+  auto ir = irGen.generate(*comp, IRStage::RAW);
 
   CodeGenerator cg;
   std::ostringstream out;
@@ -1346,7 +1365,7 @@ void testIntegration_shortCircuit() {
   SemanticAnalyzer sema;
   sema.analyze(*comp);
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*comp);
+  auto ir = irGen.generate(*comp, IRStage::RAW);
 
   CodeGenerator cg;
   std::ostringstream out;
@@ -1444,6 +1463,7 @@ int main() {
   testIR_continueInWhile();
   testIR_whileIf();
   testIR_nestedWhile();
+  testIR_constantBranchOptimized();
 
   std::cout << "\n--- IR 生成: 函数调用 ---\n";
   testIR_functionCall();

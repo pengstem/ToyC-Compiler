@@ -1442,10 +1442,8 @@ void IRGenerator::optimizePass() {
         };
         for (std::size_t idx = blocks[k].first; idx <= blocks[k].second; ++idx) {
           IRInst& inst = ir[idx];
-          if (inst.op != IROp::BEQZ && inst.op != IROp::BNEZ) {
-            resolveOperand(inst.src1);
-            resolveOperand(inst.src2);
-          }
+          resolveOperand(inst.src1);
+          resolveOperand(inst.src2);
           if (inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
             resolveOperand(inst.dest);
           }
@@ -1610,6 +1608,89 @@ void IRGenerator::optimizePass() {
           inst.src2 = Operand::none();
           changed = true;
         }
+      }
+    }
+
+    // Pass 0c1: 常量分支折叠与不可达直线区间删除。
+    //
+    // 常量传播会把 if/while 条件送成立即数，但若仍保留 BEQZ/BNEZ，后续
+    // DCE 会把两条路径都视为可能执行。这里只把确定跳转改成 BRANCH、确定
+    // 不跳转直接删除；随后从无条件跳转/RETURN 起，删除到下一个确有分支
+    // 引用的标签为止。引用来自不可达区时至多导致保守保留，不会误删入口。
+    {
+      std::vector<IRInst> folded;
+      folded.reserve(ir.size());
+      bool controlChanged = false;
+      for (const IRInst& inst : ir) {
+        if ((inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) && inst.src1.isImm()) {
+          const bool taken = inst.op == IROp::BEQZ ? inst.src1.immVal == 0 : inst.src1.immVal != 0;
+          if (taken) {
+            folded.emplace_back(IROp::BRANCH, inst.dest, Operand::none(), Operand::none());
+          }
+          controlChanged = true;
+          continue;
+        }
+        folded.push_back(inst);
+      }
+
+      std::unordered_set<std::string> referencedLabels;
+      for (const IRInst& inst : folded) {
+        if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+            inst.dest.isLabel()) {
+          referencedLabels.insert(inst.dest.name);
+        }
+      }
+
+      std::vector<IRInst> reachable;
+      reachable.reserve(folded.size());
+      bool isReachable = true;
+      for (const IRInst& inst : folded) {
+        if (inst.op == IROp::FUNC_BEGIN) {
+          isReachable = true;
+          reachable.push_back(inst);
+          continue;
+        }
+        if (inst.op == IROp::FUNC_END) {
+          isReachable = true;
+          reachable.push_back(inst);
+          continue;
+        }
+        if (inst.op == IROp::LABEL) {
+          if (inst.dest.isLabel() && referencedLabels.count(inst.dest.name) != 0) {
+            isReachable = true;
+          }
+          if (isReachable) {
+            reachable.push_back(inst);
+          } else {
+            controlChanged = true;
+          }
+          continue;
+        }
+        if (!isReachable) {
+          controlChanged = true;
+          continue;
+        }
+        reachable.push_back(inst);
+        if (inst.op == IROp::BRANCH || inst.op == IROp::RETURN) {
+          isReachable = false;
+        }
+      }
+
+      std::vector<IRInst> cleaned;
+      cleaned.reserve(reachable.size());
+      for (std::size_t index = 0; index < reachable.size(); ++index) {
+        const IRInst& inst = reachable[index];
+        if (inst.op == IROp::BRANCH && inst.dest.isLabel() && index + 1 < reachable.size() &&
+            reachable[index + 1].op == IROp::LABEL && reachable[index + 1].dest.isLabel() &&
+            reachable[index + 1].dest.name == inst.dest.name) {
+          controlChanged = true;
+          continue;
+        }
+        cleaned.push_back(inst);
+      }
+      if (controlChanged) {
+        ir = std::move(cleaned);
+        changed = true;
       }
     }
 
@@ -8571,7 +8652,22 @@ void IRGenerator::optimizePass() {
             break;
           }
         }
-        if (condIdx < ir.size() && bnezIdx < ir.size() && condIdx > i + 2) {
+        // generate() may call optimizePass() again after constant-call
+        // specialization.  Both unroll forms leave their first synthetic exit
+        // label as the next label after the backedge; do not treat that already
+        // expanded loop as a fresh candidate on the next call.
+        bool alreadyUnrolled = false;
+        for (std::size_t k = bnezIdx + 1; k < ir.size(); ++k) {
+          if (ir[k].op == IROp::FUNC_END || ir[k].op == IROp::FUNC_BEGIN) {
+            break;
+          }
+          if (ir[k].op != IROp::LABEL) {
+            continue;
+          }
+          alreadyUnrolled = ir[k].dest.isLabel() && ir[k].dest.name.rfind("L_unroll_exit_", 0) == 0;
+          break;
+        }
+        if (!alreadyUnrolled && condIdx < ir.size() && bnezIdx < ir.size() && condIdx > i + 2) {
           // 条件必须是 LT/LE 且 src1 为局部变量
           const IRInst& cond = ir[condIdx + 1];
           const bool isLT = cond.op == IROp::LT;
