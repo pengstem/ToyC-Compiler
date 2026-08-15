@@ -700,6 +700,22 @@ if(TOYCC_BUILD_TESTS)
       )
 
       add_test(
+        NAME toycc.perf.invariant-empty-path-guard-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_invariant_empty_path_guard.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_invariant_empty_path_guard.c"
+          --live-induction-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/invariant_empty_path_live_induction_safety.c"
+      )
+      set_tests_properties(toycc.perf.invariant-empty-path-guard-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
         NAME toycc.perf.bounded-helper-summary-codegen
         COMMAND
           "${Python3_EXECUTABLE}"

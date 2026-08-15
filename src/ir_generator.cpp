@@ -3513,6 +3513,168 @@ void IRGenerator::optimizePass() {
       }
     }
 
+    // Pass 5.4: 把循环不变的“空路径”保护条件提升到循环入口。
+    //
+    // 短路条件常生成如下内层循环：保护值在外层计算；为零时，循环体只给一个
+    // 布尔临时量赋 0，随后跳到归纳变量自增。若归纳变量在循环后无用，反复执行
+    // 这条空路径没有可观察效果，可在进入循环前一次判断并直接跳到出口。保护值
+    // 为真时删除体内第一条冗余判断，原有其余短路控制流保持不变。
+    {
+      for (int hoistRound = 0; hoistRound < 8; ++hoistRound) {
+        std::unordered_map<std::string, std::size_t> labelPositions;
+        std::unordered_map<std::string, int> labelReferences;
+        for (std::size_t index = 0; index < ir.size(); ++index) {
+          const IRInst& inst = ir[index];
+          if (inst.op == IROp::LABEL && inst.dest.isLabel()) {
+            labelPositions[inst.dest.name] = index;
+          }
+          if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+              inst.dest.isLabel()) {
+            ++labelReferences[inst.dest.name];
+          }
+        }
+
+        bool hoisted = false;
+        for (std::size_t loopStart = ir.size(); loopStart-- > 0 && !hoisted;) {
+          if (ir[loopStart].op != IROp::BRANCH || !ir[loopStart].dest.isLabel() ||
+              loopStart + 2 >= ir.size() || ir[loopStart + 1].op != IROp::LABEL ||
+              !ir[loopStart + 1].dest.isLabel()) {
+            continue;
+          }
+          const std::string condLabel = ir[loopStart].dest.name;
+          const std::string bodyLabel = ir[loopStart + 1].dest.name;
+          if (labelReferences[condLabel] != 1 || labelReferences[bodyLabel] != 1) {
+            continue;
+          }
+          const auto condFound = labelPositions.find(condLabel);
+          if (condFound == labelPositions.end() || condFound->second <= loopStart + 3) {
+            continue;
+          }
+          const std::size_t condIndex = condFound->second;
+          if (condIndex + 3 >= ir.size() || ir[condIndex + 2].op != IROp::BNEZ ||
+              !ir[condIndex + 2].dest.isLabel() || ir[condIndex + 2].dest.name != bodyLabel ||
+              ir[condIndex + 3].op != IROp::LABEL || !ir[condIndex + 3].dest.isLabel()) {
+            continue;
+          }
+          const std::string exitLabel = ir[condIndex + 3].dest.name;
+
+          const std::size_t guardIndex = loopStart + 2;
+          const IRInst& guard = ir[guardIndex];
+          if (guard.op != IROp::BEQZ || !guard.dest.isLabel() || !guard.src1.isLocalVar()) {
+            continue;
+          }
+          const auto falseFound = labelPositions.find(guard.dest.name);
+          if (falseFound == labelPositions.end() || falseFound->second <= guardIndex ||
+              falseFound->second >= condIndex) {
+            continue;
+          }
+
+          // 保护值必须是循环不变量；局部值不会被调用按引用修改。
+          bool guardWritten = false;
+          for (std::size_t position = loopStart + 2; position < condIndex; ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.dest.isLocalVar() && inst.dest.name == guard.src1.name &&
+                inst.op != IROp::RETURN && inst.op != IROp::PARAM) {
+              guardWritten = true;
+              break;
+            }
+          }
+          if (guardWritten) {
+            continue;
+          }
+
+          // 从保护条件的 false 标签开始只接受：布尔临时量置零、若干标签，随后
+          // 以该临时量 BEQZ 跳到归纳变量自增点。任何调用、全局写或用户状态写
+          // 都会使匹配失败。
+          const std::size_t falseLabelIndex = falseFound->second;
+          if (falseLabelIndex + 1 >= condIndex) {
+            continue;
+          }
+          const IRInst& zero = ir[falseLabelIndex + 1];
+          if (zero.op != IROp::ASSIGN || !zero.dest.isLocalVar() ||
+              !isCompilerTemp(zero.dest.name) || !zero.src1.isImm() || zero.src1.immVal != 0) {
+            continue;
+          }
+          std::optional<std::size_t> emptyBranchIndex;
+          for (std::size_t position = falseLabelIndex + 2; position < condIndex; ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.op == IROp::LABEL) {
+              continue;
+            }
+            if (inst.op == IROp::BEQZ && inst.dest.isLabel() && inst.src1.isLocalVar() &&
+                inst.src1.name == zero.dest.name) {
+              emptyBranchIndex = position;
+            }
+            break;
+          }
+          if (!emptyBranchIndex) {
+            continue;
+          }
+          const std::string incrementLabel = ir[*emptyBranchIndex].dest.name;
+          const auto incrementFound = labelPositions.find(incrementLabel);
+          if (incrementFound == labelPositions.end() ||
+              incrementFound->second <= *emptyBranchIndex || incrementFound->second >= condIndex) {
+            continue;
+          }
+          const std::size_t incrementLabelIndex = incrementFound->second;
+
+          std::size_t incrementIndex = incrementLabelIndex + 1;
+          while (incrementIndex < condIndex && ir[incrementIndex].op == IROp::LABEL) {
+            ++incrementIndex;
+          }
+          if (incrementIndex >= condIndex) {
+            continue;
+          }
+          const IRInst& increment = ir[incrementIndex];
+          if (increment.op != IROp::ADD || !increment.dest.isLocalVar() ||
+              !increment.src1.isLocalVar() || increment.src1.name != increment.dest.name ||
+              !increment.src2.isImm() || increment.src2.immVal != 1) {
+            continue;
+          }
+          const std::string induction = increment.dest.name;
+          bool onlyIncrementToCondition = true;
+          for (std::size_t position = incrementIndex + 1; position < condIndex; ++position) {
+            if (ir[position].op != IROp::LABEL) {
+              onlyIncrementToCondition = false;
+              break;
+            }
+          }
+          if (!onlyIncrementToCondition) {
+            continue;
+          }
+
+          // 跳过空循环会改变归纳变量的终值；只有循环后不再读取它时才安全。
+          bool inductionUsedAfter = false;
+          for (std::size_t position = condIndex + 3; position < ir.size(); ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
+              break;
+            }
+            if ((inst.src1.isLocalVar() && inst.src1.name == induction) ||
+                (inst.src2.isLocalVar() && inst.src2.name == induction) ||
+                ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) && inst.dest.isLocalVar() &&
+                 inst.dest.name == induction)) {
+              inductionUsedAfter = true;
+              break;
+            }
+          }
+          if (inductionUsedAfter) {
+            continue;
+          }
+
+          IRInst entryGuard = guard;
+          entryGuard.dest = Operand::label(exitLabel);
+          ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(guardIndex));
+          ir.insert(ir.begin() + static_cast<std::ptrdiff_t>(loopStart), entryGuard);
+          hoisted = true;
+          changed = true;
+        }
+        if (!hoisted) {
+          break;
+        }
+      }
+    }
+
     // Pass 5.45: 汇总上界来自外层非负余数的短内层累加循环。
     //
     // 内联 helper 常形成 `bound = outer % k; while (j < bound) sum += a*j+b`。
