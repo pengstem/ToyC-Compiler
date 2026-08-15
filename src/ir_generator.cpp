@@ -2779,6 +2779,221 @@ void IRGenerator::optimizePass() {
       }
     }
 
+    // Pass 2.76: 外提必执行循环中的纯循环不变调用。
+    //
+    // 递归 helper 通常因内联预算保留为 CALL；若参数在循环内不变，重复调用只会
+    // 产生相同结果。这里用无全局读写/STORE/未知调用的闭包证明函数纯度（允许纯
+    // 自递归或互递归），并且只处理首轮条件可由入口常量证明为真的规范 while。
+    // 因而即使被调函数不终止，把调用移到循环入口前也不会引入原程序未执行的
+    // 行为；零次循环、可变参数或循环体内重定义结果的情况均保守保留。
+    {
+      struct HoistFunctionEffects {
+        bool locallyPure = true;
+        std::unordered_set<std::string> callees;
+      };
+      std::unordered_map<std::string, HoistFunctionEffects> functionEffects;
+      std::string functionName;
+      for (const IRInst& inst : ir) {
+        if (inst.op == IROp::FUNC_BEGIN && inst.dest.isFunc()) {
+          functionName = inst.dest.name;
+          functionEffects.try_emplace(functionName);
+          continue;
+        }
+        if (inst.op == IROp::FUNC_END) {
+          functionName.clear();
+          continue;
+        }
+        if (functionName.empty()) {
+          continue;
+        }
+        HoistFunctionEffects& effects = functionEffects[functionName];
+        if (inst.dest.isGlobalVar() || inst.src1.isGlobalVar() || inst.src2.isGlobalVar() ||
+            inst.op == IROp::STORE) {
+          effects.locallyPure = false;
+        }
+        if (inst.op == IROp::CALL) {
+          if (inst.src1.isFunc()) {
+            effects.callees.insert(inst.src1.name);
+          } else {
+            effects.locallyPure = false;
+          }
+        }
+      }
+      std::unordered_set<std::string> pureFunctions;
+      for (const auto& [name, effects] : functionEffects) {
+        if (effects.locallyPure) {
+          pureFunctions.insert(name);
+        }
+      }
+      bool purityChanged = true;
+      while (purityChanged) {
+        purityChanged = false;
+        for (auto iterator = pureFunctions.begin(); iterator != pureFunctions.end();) {
+          const HoistFunctionEffects& effects = functionEffects.at(*iterator);
+          const bool closed = std::all_of(
+              effects.callees.begin(), effects.callees.end(),
+              [&](const std::string& callee) { return pureFunctions.count(callee) != 0; });
+          if (!closed) {
+            iterator = pureFunctions.erase(iterator);
+            purityChanged = true;
+          } else {
+            ++iterator;
+          }
+        }
+      }
+
+      for (int hoistRound = 0; hoistRound < 8; ++hoistRound) {
+        std::unordered_map<std::string, std::size_t> labelPositions;
+        for (std::size_t index = 0; index < ir.size(); ++index) {
+          if (ir[index].op == IROp::LABEL && ir[index].dest.isLabel()) {
+            labelPositions[ir[index].dest.name] = index;
+          }
+        }
+        bool hoisted = false;
+        for (std::size_t conditionLabelIndex = 0; conditionLabelIndex + 2 < ir.size() && !hoisted;
+             ++conditionLabelIndex) {
+          if (ir[conditionLabelIndex].op != IROp::LABEL ||
+              !ir[conditionLabelIndex].dest.isLabel()) {
+            continue;
+          }
+          std::size_t conditionBranchIndex = conditionLabelIndex + 1;
+          while (conditionBranchIndex < ir.size() && isPureCondInst(ir[conditionBranchIndex])) {
+            ++conditionBranchIndex;
+          }
+          if (conditionBranchIndex >= ir.size() || ir[conditionBranchIndex].op != IROp::BEQZ ||
+              !ir[conditionBranchIndex].dest.isLabel() ||
+              conditionBranchIndex == conditionLabelIndex + 1) {
+            continue;
+          }
+          const IRInst& comparison = ir[conditionBranchIndex - 1];
+          if ((comparison.op != IROp::LT && comparison.op != IROp::LE &&
+               comparison.op != IROp::GT && comparison.op != IROp::GE &&
+               comparison.op != IROp::EQ && comparison.op != IROp::NE) ||
+              !comparison.dest.isLocalVar() || !ir[conditionBranchIndex].src1.isLocalVar() ||
+              comparison.dest.name != ir[conditionBranchIndex].src1.name) {
+            continue;
+          }
+          const auto endLabel = labelPositions.find(ir[conditionBranchIndex].dest.name);
+          if (endLabel == labelPositions.end() || endLabel->second <= conditionBranchIndex + 1) {
+            continue;
+          }
+          std::size_t backedgeIndex = endLabel->second;
+          while (backedgeIndex > conditionBranchIndex + 1) {
+            --backedgeIndex;
+            if (ir[backedgeIndex].op == IROp::BRANCH && ir[backedgeIndex].dest.isLabel() &&
+                ir[backedgeIndex].dest.name == ir[conditionLabelIndex].dest.name) {
+              break;
+            }
+          }
+          if (backedgeIndex <= conditionBranchIndex + 1 || ir[backedgeIndex].op != IROp::BRANCH) {
+            continue;
+          }
+
+          const auto findEntryConstant = [&](const Operand& operand) -> std::optional<int> {
+            if (operand.isImm()) {
+              return operand.immVal;
+            }
+            if (!operand.isLocalVar()) {
+              return std::nullopt;
+            }
+            for (std::size_t position = conditionLabelIndex; position > 0; --position) {
+              const IRInst& candidate = ir[position - 1];
+              if (candidate.dest.isLocalVar() && candidate.dest.name == operand.name) {
+                if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                    candidate.src1.isImm()) {
+                  return candidate.src1.immVal;
+                }
+                return std::nullopt;
+              }
+              if (candidate.op == IROp::LABEL || candidate.op == IROp::BRANCH ||
+                  candidate.op == IROp::BEQZ || candidate.op == IROp::BNEZ ||
+                  candidate.op == IROp::CALL || candidate.op == IROp::FUNC_BEGIN) {
+                break;
+              }
+            }
+            return std::nullopt;
+          };
+          const auto lhs = findEntryConstant(comparison.src1);
+          const auto rhs = findEntryConstant(comparison.src2);
+          if (!lhs || !rhs) {
+            continue;
+          }
+          const bool firstIterationRuns = comparison.op == IROp::LT   ? *lhs < *rhs
+                                          : comparison.op == IROp::LE ? *lhs <= *rhs
+                                          : comparison.op == IROp::GT ? *lhs > *rhs
+                                          : comparison.op == IROp::GE ? *lhs >= *rhs
+                                          : comparison.op == IROp::EQ ? *lhs == *rhs
+                                                                      : *lhs != *rhs;
+          if (!firstIterationRuns) {
+            continue;
+          }
+
+          std::unordered_set<std::string> writtenInLoop;
+          for (std::size_t position = conditionLabelIndex + 1; position < backedgeIndex;
+               ++position) {
+            if (ir[position].dest.isLocalVar() && ir[position].op != IROp::RETURN &&
+                ir[position].op != IROp::PARAM) {
+              writtenInLoop.insert(ir[position].dest.name);
+            }
+          }
+          for (std::size_t callIndex = conditionBranchIndex + 1;
+               callIndex < backedgeIndex && !hoisted; ++callIndex) {
+            const IRInst& call = ir[callIndex];
+            if (call.op != IROp::CALL || !call.src1.isFunc() ||
+                pureFunctions.count(call.src1.name) == 0) {
+              continue;
+            }
+            std::size_t parameterStart = callIndex;
+            while (parameterStart > conditionBranchIndex + 1 &&
+                   ir[parameterStart - 1].op == IROp::PARAM) {
+              --parameterStart;
+            }
+            std::size_t loopEntryIndex = conditionBranchIndex + 1;
+            if (loopEntryIndex < parameterStart && ir[loopEntryIndex].op == IROp::LABEL) {
+              ++loopEntryIndex;
+            }
+            // 只从循环体的直线入口外提，避免 CALL 原本位于体内 if 分支时
+            // 被错误地变为每次进入循环都执行。
+            if (loopEntryIndex != parameterStart || !call.dest.isLocalVar()) {
+              continue;
+            }
+            bool invariantArguments = true;
+            for (std::size_t position = parameterStart; position < callIndex; ++position) {
+              const Operand& argument = ir[position].dest;
+              if ((!argument.isImm() && !argument.isLocalVar()) ||
+                  (argument.isLocalVar() && writtenInLoop.count(argument.name) != 0)) {
+                invariantArguments = false;
+                break;
+              }
+            }
+            if (!invariantArguments ||
+                (call.dest.isLocalVar() &&
+                 std::count_if(ir.begin() + static_cast<std::ptrdiff_t>(conditionBranchIndex + 1),
+                               ir.begin() + static_cast<std::ptrdiff_t>(backedgeIndex),
+                               [&](const IRInst& candidate) {
+                                 return candidate.dest.isLocalVar() &&
+                                        candidate.dest.name == call.dest.name &&
+                                        candidate.op != IROp::RETURN && candidate.op != IROp::PARAM;
+                               }) != 1)) {
+              continue;
+            }
+            std::vector<IRInst> invariantCall(
+                ir.begin() + static_cast<std::ptrdiff_t>(parameterStart),
+                ir.begin() + static_cast<std::ptrdiff_t>(callIndex + 1));
+            ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(parameterStart),
+                     ir.begin() + static_cast<std::ptrdiff_t>(callIndex + 1));
+            ir.insert(ir.begin() + static_cast<std::ptrdiff_t>(conditionLabelIndex),
+                      invariantCall.begin(), invariantCall.end());
+            hoisted = true;
+            changed = true;
+          }
+        }
+        if (!hoisted) {
+          break;
+        }
+      }
+    }
+
     // Pass 3: 循环反转（loop inversion）
     // 将 "LABEL c; <cond>; BEQZ t,e; LABEL b; <body>; BRANCH c; LABEL e" 转换为
     // "BRANCH c; LABEL b; <body>; LABEL c; <cond>; BNEZ t,b; LABEL e"

@@ -750,6 +750,36 @@ if(TOYCC_BUILD_TESTS)
       )
 
       add_test(
+        NAME toycc.perf.normalized-remainder-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_normalized_remainder_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_normalized_remainder_codegen.c"
+      )
+      set_tests_properties(toycc.perf.normalized-remainder-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.invariant-pure-call-hoist-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_invariant_call_hoist.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_invariant_pure_call_hoist.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/invariant_call_global_read_safety.c"
+      )
+      set_tests_properties(toycc.perf.invariant-pure-call-hoist-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
         NAME toycc.perf.invariant-empty-path-guard-codegen
         COMMAND
           "${Python3_EXECUTABLE}"

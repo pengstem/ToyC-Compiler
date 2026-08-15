@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <string>
@@ -27,6 +28,83 @@ int alignTo(int value, int alignment) {
 
 bool fitsSigned12(int value) {
   return value >= -2048 && value <= 2047;
+}
+
+struct RawRemainderPattern {
+  Operand source;
+  Operand destination;
+  int modulus = 0;
+  std::size_t length = 0;
+};
+
+struct NormalizedRemainderPattern {
+  Operand source;
+  Operand destination;
+  Operand intermediate;
+  int modulus = 0;
+  std::size_t length = 0;
+};
+
+bool sameOperand(const Operand& lhs, const Operand& rhs) {
+  if (lhs.type != rhs.type) {
+    return false;
+  }
+  if (lhs.isImm()) {
+    return lhs.immVal == rhs.immVal;
+  }
+  return lhs.name == rhs.name;
+}
+
+std::optional<RawRemainderPattern> matchRawRemainder(const std::vector<IRInst>& ir,
+                                                     std::size_t index, std::size_t end) {
+  if (index >= end) {
+    return std::nullopt;
+  }
+  const IRInst& first = ir[index];
+  if (first.op == IROp::MOD && first.src2.isImm() && first.src2.immVal > 1 &&
+      (first.dest.isLocalVar() || first.dest.isGlobalVar())) {
+    return RawRemainderPattern{first.src1, first.dest, first.src2.immVal, 1};
+  }
+  if (index + 2 >= end || first.op != IROp::DIV || !first.dest.isLocalVar() ||
+      !first.src2.isImm() || first.src2.immVal <= 1) {
+    return std::nullopt;
+  }
+  const IRInst& product = ir[index + 1];
+  const IRInst& remainder = ir[index + 2];
+  const bool productMatches =
+      product.op == IROp::MUL && product.dest.isLocalVar() &&
+      ((sameOperand(product.src1, first.dest) && sameOperand(product.src2, first.src2)) ||
+       (sameOperand(product.src2, first.dest) && sameOperand(product.src1, first.src2)));
+  if (!productMatches || remainder.op != IROp::SUB ||
+      (!remainder.dest.isLocalVar() && !remainder.dest.isGlobalVar()) ||
+      !sameOperand(remainder.src1, first.src1) || !sameOperand(remainder.src2, product.dest)) {
+    return std::nullopt;
+  }
+  return RawRemainderPattern{first.src1, remainder.dest, first.src2.immVal, 3};
+}
+
+std::optional<NormalizedRemainderPattern>
+matchNormalizedRemainder(const std::vector<IRInst>& ir, std::size_t index, std::size_t end) {
+  const auto first = matchRawRemainder(ir, index, end);
+  if (!first) {
+    return std::nullopt;
+  }
+  const std::size_t addIndex = index + first->length;
+  if (addIndex >= end) {
+    return std::nullopt;
+  }
+  const IRInst& add = ir[addIndex];
+  if (add.op != IROp::ADD || !add.dest.isLocalVar() || !sameOperand(add.dest, first->destination) ||
+      !sameOperand(add.src1, first->destination) || !add.src2.isImm() ||
+      add.src2.immVal != first->modulus) {
+    return std::nullopt;
+  }
+  const auto second = matchRawRemainder(ir, addIndex + 1, end);
+  if (!second || second->modulus != first->modulus || !sameOperand(second->source, add.dest)) {
+    return std::nullopt;
+  }
+  return NormalizedRemainderPattern{first->source, second->destination, add.dest, first->modulus,
+                                    first->length + 1 + second->length};
 }
 
 // Hacker's Delight magc：计算正数除数 d（2 <= d <= 2^31-1，非 2 的幂）的
@@ -1042,6 +1120,55 @@ std::size_t CodeGenerator::generateInstruction(std::size_t index, std::size_t en
                                                std::ostream& out) {
   currentInstIndex_ = index;
   const IRInst& inst = ir_[index];
+
+  // `((x % m) + m) % m` 是前端为数学非负模生成的规范形式。若 x 已知非负，
+  // 第一次余数已经位于 [0,m)，后两条运算完全冗余；若 m 是 2 的幂，则对任意
+  // int32 x，规范结果都等于保留低 log2(m) 位，可直接用两条移位完成。这里在
+  // 后端窗口内融合，兼容 Pass 0d 已把普通 MOD 展开成 DIV/MUL/SUB 的两种 IR。
+  if (const auto normalized = matchNormalizedRemainder(ir_, index, end)) {
+    bool intermediateLive = false;
+    if (!sameOperand(normalized->intermediate, normalized->destination) &&
+        normalized->intermediate.isLocalVar()) {
+      for (std::size_t position = index + normalized->length; position < end; ++position) {
+        const IRInst& candidate = ir_[position];
+        const bool used =
+            (candidate.src1.isLocalVar() && candidate.src1.name == normalized->intermediate.name) ||
+            (candidate.src2.isLocalVar() && candidate.src2.name == normalized->intermediate.name) ||
+            ((candidate.op == IROp::RETURN || candidate.op == IROp::PARAM) &&
+             candidate.dest.isLocalVar() && candidate.dest.name == normalized->intermediate.name);
+        if (used) {
+          intermediateLive = true;
+          break;
+        }
+        if (candidate.dest.isLocalVar() && candidate.dest.name == normalized->intermediate.name) {
+          break;
+        }
+      }
+    }
+    const bool powerOfTwo = (normalized->modulus & (normalized->modulus - 1)) == 0;
+    const bool sourceNonnegative =
+        (normalized->source.isImm() && normalized->source.immVal >= 0) ||
+        (normalized->source.isLocalVar() && isNonNegative(normalized->source.name, index));
+    if (!intermediateLive && (powerOfTwo || sourceNonnegative)) {
+      if (powerOfTwo) {
+        const int valueBits = __builtin_ctz(static_cast<unsigned>(normalized->modulus));
+        const int clearBits = 32 - valueBits;
+        const std::string destination = destRegOrT0(normalized->destination);
+        loadOperand(normalized->source, destination, out);
+        emit(out, "slli", destination + ", " + destination + ", " + std::to_string(clearBits));
+        emit(out, "srli", destination + ", " + destination + ", " + std::to_string(clearBits));
+        if (!isDestInReg(normalized->destination)) {
+          storeOperand(destination, normalized->destination, out);
+        }
+      } else {
+        emitBinaryOp(IRInst(IROp::MOD, normalized->destination, normalized->source,
+                            Operand::imm(normalized->modulus)),
+                     out);
+      }
+      return normalized->length;
+    }
+  }
+
   switch (inst.op) {
   case IROp::LOCAL_VAR_DECL: {
     if (inst.dest.type == OperandType::LOCAL_VAR) {
@@ -1682,7 +1809,7 @@ void CodeGenerator::storeOperand(std::string_view reg, const Operand& operand, s
 }
 
 bool CodeGenerator::emitMagicDiv(int imm, const std::string& srcReg, const std::string& destReg,
-                                 std::ostream& out) const {
+                                 std::ostream& out, bool sourceNonnegative) const {
   if (imm == INT32_MIN) {
     return false;
   }
@@ -1705,8 +1832,10 @@ bool CodeGenerator::emitMagicDiv(int imm, const std::string& srcReg, const std::
   if (shift > 0) {
     emit(out, "srai", "t2, t2, " + std::to_string(shift));
   }
-  emit(out, "srai", "t0, " + srcReg + ", 31");
-  emit(out, "sub", "t2, t2, t0");
+  if (!sourceNonnegative) {
+    emit(out, "srai", "t0, " + srcReg + ", 31");
+    emit(out, "sub", "t2, t2, t0");
+  }
   if (imm < 0) {
     emit(out, "sub", "t2, x0, t2");
   }
@@ -1717,7 +1846,7 @@ bool CodeGenerator::emitMagicDiv(int imm, const std::string& srcReg, const std::
 }
 
 bool CodeGenerator::emitMagicMod(int imm, const std::string& srcReg, const std::string& destReg,
-                                 std::ostream& out) const {
+                                 std::ostream& out, bool sourceNonnegative) const {
   if (imm == INT32_MIN) {
     return false;
   }
@@ -1745,8 +1874,10 @@ bool CodeGenerator::emitMagicMod(int imm, const std::string& srcReg, const std::
   if (shift > 0) {
     emit(out, "srai", "t2, t2, " + std::to_string(shift));
   }
-  emit(out, "srai", "t0, " + srcReg + ", 31");
-  emit(out, "sub", "t2, t2, t0");
+  if (!sourceNonnegative) {
+    emit(out, "srai", "t0, " + srcReg + ", 31");
+    emit(out, "sub", "t2, t2, t0");
+  }
   if (imm < 0) {
     emit(out, "sub", "t2, x0, t2");
   }
@@ -1896,6 +2027,9 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
     loadOperand(inst.src1, destReg, out);
     src1Reg = destReg;
   }
+  const bool src1Nonnegative =
+      (inst.src1.isImm() && inst.src1.immVal >= 0) ||
+      (inst.src1.isLocalVar() && isNonNegative(inst.src1.name, currentInstIndex_));
 
   // 执行运算，结果直接落在 destReg
   if (src2IsSmallImm) {
@@ -1958,7 +2092,8 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
         emit(out, "srai", destReg + ", t1, " + std::to_string(shift));
       } else if (imm == -1) {
         emit(out, "sub", destReg + ", x0, " + src1Reg);
-      } else if (imm != 0 && imm != 1 && emitMagicDiv(imm, src1Reg, destReg, out)) {
+      } else if (imm != 0 && imm != 1 &&
+                 emitMagicDiv(imm, src1Reg, destReg, out, src1Nonnegative)) {
         // 已生成 magic 序列
       } else {
         std::string divisorReg = regForConstant(imm);
@@ -1990,7 +2125,7 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
         emit(out, "li", destReg + ", 0");
       } else if (imm == -1) {
         emit(out, "li", destReg + ", 0");
-      } else if (imm != 0 && emitMagicMod(imm, src1Reg, destReg, out)) {
+      } else if (imm != 0 && emitMagicMod(imm, src1Reg, destReg, out, src1Nonnegative)) {
         // 已生成 magic 序列
       } else {
         std::string divisorReg = regForConstant(imm);
@@ -2016,13 +2151,15 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
       emit(out, "mul", destReg + ", " + src1Reg + ", " + src2Reg);
       break;
     case IROp::DIV:
-      if (inst.src2.isImm() && emitMagicDiv(inst.src2.immVal, src1Reg, destReg, out)) {
+      if (inst.src2.isImm() &&
+          emitMagicDiv(inst.src2.immVal, src1Reg, destReg, out, src1Nonnegative)) {
         break;
       }
       emit(out, "div", destReg + ", " + src1Reg + ", " + src2Reg);
       break;
     case IROp::MOD:
-      if (inst.src2.isImm() && emitMagicMod(inst.src2.immVal, src1Reg, destReg, out)) {
+      if (inst.src2.isImm() &&
+          emitMagicMod(inst.src2.immVal, src1Reg, destReg, out, src1Nonnegative)) {
         break;
       }
       emit(out, "rem", destReg + ", " + src1Reg + ", " + src2Reg);
@@ -2269,6 +2406,40 @@ void CodeGenerator::analyzeNonNegativeVars(const FunctionRange& function) {
     nonNegativeRanges_[name].push_back(NonNegRange{begin, end});
   };
 
+  std::unordered_set<std::size_t> normalizedRemainderFinals;
+  for (std::size_t index = function.begin; index < function.end; ++index) {
+    const auto normalized = matchNormalizedRemainder(ir_, index, function.end);
+    if (normalized) {
+      normalizedRemainderFinals.insert(index + normalized->length - 1);
+    }
+  }
+
+  // 循环携带的随机数/模状态会在基本块入口丢失普通直线传播信息。若一个变量
+  // 的每个真实定义都是非负常量或正模规范链的最终结果，则它在整个函数内恒
+  // 非负；这使下一轮入口处的 `% small_constant` 也能安全删除第二次规范化。
+  std::unordered_map<std::string, bool> alwaysNonnegative;
+  std::unordered_set<std::string> hasDefinition;
+  for (std::size_t index = function.begin; index < function.end; ++index) {
+    const IRInst& inst = ir_[index];
+    if (!inst.dest.isLocalVar() || (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) ||
+        inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
+      continue;
+    }
+    const std::string& name = inst.dest.name;
+    hasDefinition.insert(name);
+    alwaysNonnegative.try_emplace(name, true);
+    const bool nonnegativeConstant = (inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) &&
+                                     inst.src1.isImm() && inst.src1.immVal >= 0;
+    if (!nonnegativeConstant && normalizedRemainderFinals.count(index) == 0) {
+      alwaysNonnegative[name] = false;
+    }
+  }
+  for (const auto& [name, proven] : alwaysNonnegative) {
+    if (proven && hasDefinition.count(name) != 0) {
+      addRange(name, function.begin, function.end);
+    }
+  }
+
   // 第一遍：识别循环计数变量种子，记录其循环体范围
   for (std::size_t i = function.begin; i + 1 < function.end; ++i) {
     if (ir_[i].op != IROp::BRANCH || !ir_[i].dest.isLabel()) {
@@ -2386,8 +2557,10 @@ void CodeGenerator::analyzeNonNegativeVars(const FunctionRange& function) {
       return false;
     };
     bool isNonNegDef = false;
-    if ((inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) && inst.src1.isImm() &&
-        inst.src1.immVal >= 0) {
+    if (normalizedRemainderFinals.count(idx) != 0 && inst.dest.isLocalVar()) {
+      isNonNegDef = true;
+    } else if ((inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) && inst.src1.isImm() &&
+               inst.src1.immVal >= 0) {
       isNonNegDef = true;
     } else if (inst.op == IROp::ASSIGN && inst.src1.isLocalVar() && srcNonNeg(inst.src1, idx)) {
       isNonNegDef = true;

@@ -114,9 +114,9 @@ private:
 
   // 常量除数 magic 除法/取模序列；成功生成指令返回 true
   bool emitMagicDiv(int imm, const std::string& srcReg, const std::string& destReg,
-                    std::ostream& out) const;
+                    std::ostream& out, bool sourceNonnegative = false) const;
   bool emitMagicMod(int imm, const std::string& srcReg, const std::string& destReg,
-                    std::ostream& out) const;
+                    std::ostream& out, bool sourceNonnegative = false) const;
 
   // 若 dest 局部变量分配了寄存器则返回该寄存器名，否则返回 "t0"
   std::string destRegOrT0(const Operand& dest) const;
