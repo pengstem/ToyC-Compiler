@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <numeric>
 #include <optional>
 #include <unordered_set>
 
@@ -7157,6 +7158,524 @@ void IRGenerator::optimizePass() {
             changed = true;
             break;
           }
+        }
+        if (!summarized) {
+          break;
+        }
+      }
+    }
+
+    // Pass 5.575: 汇总分支驱动的有限状态循环。
+    //
+    // 图遍历/状态机常把一个有界状态直接用于分支，同时只观察另一个增长状态
+    // 的小模数（例如 `distance % 2`）。完整整数状态不会重复，但控制状态会在
+    // 很小的有限空间内成环。这里仅解释单个、常数次数、无调用且只有前向内部
+    // 分支的循环体；所有跨迭代状态都必须参与控制键，且增长状态的周期增量必须
+    // 是其控制模数的倍数。找到周期后按周期增量闭式跳过，绝不按源迭代次数展开。
+    {
+      struct VectorHash {
+        std::size_t operator()(const std::vector<std::int32_t>& values) const noexcept {
+          std::size_t hash = 1469598103934665603ull;
+          for (const std::int32_t value : values) {
+            hash ^= static_cast<std::uint32_t>(value);
+            hash *= 1099511628211ull;
+          }
+          return hash;
+        }
+      };
+      struct FiniteStateVar {
+        std::string key;
+        Operand operand;
+        int modulus = 0; // 0 表示完整值参与控制键。
+      };
+
+      const auto variableKey = [](const Operand& operand) -> std::optional<std::string> {
+        if (operand.isLocalVar()) {
+          return "L:" + operand.name;
+        }
+        if (operand.isGlobalVar()) {
+          return "G:" + operand.name;
+        }
+        return std::nullopt;
+      };
+      const auto mergeModulus = [](int lhs, int rhs) {
+        if (lhs == 0 || rhs == 0) {
+          return 0;
+        }
+        const int divisor = std::gcd(lhs, rhs);
+        const std::int64_t multiple = static_cast<std::int64_t>(lhs / divisor) * rhs;
+        return multiple > INT32_MAX ? 0 : static_cast<int>(multiple);
+      };
+
+      for (int summaryRound = 0; summaryRound < 8; ++summaryRound) {
+        std::unordered_map<std::string, std::size_t> labelPositions;
+        std::unordered_map<std::string, int> labelReferences;
+        for (std::size_t index = 0; index < ir.size(); ++index) {
+          const IRInst& inst = ir[index];
+          if (inst.op == IROp::LABEL && inst.dest.isLabel()) {
+            labelPositions[inst.dest.name] = index;
+          }
+          if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+              inst.dest.isLabel()) {
+            ++labelReferences[inst.dest.name];
+          }
+        }
+
+        bool summarized = false;
+        for (std::size_t loopStart = ir.size(); loopStart-- > 0 && !summarized;) {
+          if (ir[loopStart].op != IROp::BRANCH || !ir[loopStart].dest.isLabel() ||
+              loopStart + 1 >= ir.size() || ir[loopStart + 1].op != IROp::LABEL ||
+              !ir[loopStart + 1].dest.isLabel()) {
+            continue;
+          }
+          const std::string condLabel = ir[loopStart].dest.name;
+          const std::string bodyLabel = ir[loopStart + 1].dest.name;
+          if (labelReferences[condLabel] != 1 || labelReferences[bodyLabel] != 1) {
+            continue;
+          }
+          const auto condFound = labelPositions.find(condLabel);
+          if (condFound == labelPositions.end() || condFound->second <= loopStart + 2) {
+            continue;
+          }
+          const std::size_t condIndex = condFound->second;
+          if (condIndex + 2 >= ir.size()) {
+            continue;
+          }
+          const IRInst& condition = ir[condIndex + 1];
+          const IRInst& backedge = ir[condIndex + 2];
+          if ((condition.op != IROp::LT && condition.op != IROp::LE) ||
+              !condition.dest.isLocalVar() || !condition.src1.isLocalVar() ||
+              backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
+              backedge.dest.name != bodyLabel || !backedge.src1.isLocalVar() ||
+              backedge.src1.name != condition.dest.name) {
+            continue;
+          }
+          const std::string induction = condition.src1.name;
+
+          std::size_t functionBegin = loopStart;
+          while (functionBegin > 0 && ir[functionBegin].op != IROp::FUNC_BEGIN) {
+            --functionBegin;
+          }
+          std::size_t functionEnd = condIndex + 3;
+          while (functionEnd < ir.size() && ir[functionEnd].op != IROp::FUNC_END) {
+            ++functionEnd;
+          }
+          const auto findInitial = [&](const Operand& operand) -> std::optional<std::int32_t> {
+            const auto key = variableKey(operand);
+            if (!key) {
+              return std::nullopt;
+            }
+            for (std::size_t position = loopStart; position > 0; --position) {
+              const IRInst& candidate = ir[position - 1];
+              if (variableKey(candidate.dest) == key && candidate.op != IROp::RETURN &&
+                  candidate.op != IROp::PARAM) {
+                if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL ||
+                     candidate.op == IROp::GLOBAL_VAR_DECL) &&
+                    candidate.src1.isImm()) {
+                  return candidate.src1.immVal;
+                }
+                return std::nullopt;
+              }
+              if (operand.isLocalVar() && candidate.op == IROp::FUNC_BEGIN) {
+                break;
+              }
+            }
+            return std::nullopt;
+          };
+
+          const auto initialInduction = findInitial(Operand::localVar(induction));
+          std::optional<std::int32_t> upper;
+          if (condition.src2.isImm()) {
+            upper = condition.src2.immVal;
+          } else {
+            upper = findInitial(condition.src2);
+          }
+          if (!initialInduction || !upper || (condition.op == IROp::LE && *upper == INT32_MAX)) {
+            continue;
+          }
+          const std::int64_t trips =
+              std::max<std::int64_t>(0, static_cast<std::int64_t>(*upper) - *initialInduction +
+                                            (condition.op == IROp::LE ? 1 : 0));
+          if (trips < 16 || trips > INT32_MAX ||
+              static_cast<std::int64_t>(*initialInduction) + trips > INT32_MAX) {
+            continue;
+          }
+
+          std::unordered_set<std::string> iterationLocals;
+          for (std::size_t position = loopStart + 2; position < condIndex; ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone() && inst.dest.isLocalVar()) {
+              iterationLocals.insert(*variableKey(inst.dest));
+            }
+          }
+          std::unordered_map<std::string, Operand> stateOperands;
+          int inductionWrites = 0;
+          bool shapeSupported = true;
+          for (std::size_t position = loopStart + 2; position < condIndex; ++position) {
+            const IRInst& inst = ir[position];
+            if ((inst.op == IROp::CALL || inst.op == IROp::PARAM || inst.op == IROp::RETURN ||
+                 inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) ||
+                (inst.op == IROp::DIV) ||
+                (inst.op == IROp::MOD && (!inst.src2.isImm() || inst.src2.immVal <= 1))) {
+              shapeSupported = false;
+              break;
+            }
+            if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+                inst.dest.isLabel()) {
+              const auto target = labelPositions.find(inst.dest.name);
+              if (target == labelPositions.end() || target->second <= position ||
+                  target->second >= condIndex) {
+                shapeSupported = false;
+                break;
+              }
+            }
+            const auto destination = variableKey(inst.dest);
+            if (!destination || inst.op == IROp::LABEL || inst.op == IROp::BRANCH ||
+                inst.op == IROp::BEQZ || inst.op == IROp::BNEZ ||
+                (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone())) {
+              continue;
+            }
+            if (inst.dest.isLocalVar() && inst.dest.name == induction) {
+              ++inductionWrites;
+              const bool unitIncrement = inst.op == IROp::ADD && inst.src1.isLocalVar() &&
+                                         inst.src1.name == induction && inst.src2.isImm() &&
+                                         inst.src2.immVal == 1;
+              shapeSupported = shapeSupported && unitIncrement;
+              continue;
+            }
+            if ((inst.dest.isGlobalVar() ||
+                 (inst.dest.isLocalVar() && !isCompilerTemp(inst.dest.name))) &&
+                iterationLocals.count(*destination) == 0) {
+              stateOperands[*destination] = inst.dest;
+            }
+          }
+          if (!shapeSupported || inductionWrites != 1 || stateOperands.empty() ||
+              stateOperands.size() > 8) {
+            continue;
+          }
+
+          using Dependencies = std::unordered_map<std::string, int>;
+          std::unordered_map<std::string, Dependencies> dependencyValues;
+          for (const auto& [key, operand] : stateOperands) {
+            (void) operand;
+            dependencyValues[key][key] = 0;
+          }
+          Dependencies controlDependencies;
+          const auto dependenciesOf = [&](const Operand& operand) {
+            Dependencies result;
+            const auto key = variableKey(operand);
+            if (!key) {
+              return result;
+            }
+            const auto found = dependencyValues.find(*key);
+            if (found != dependencyValues.end()) {
+              return found->second;
+            }
+            const auto state = stateOperands.find(*key);
+            if (state != stateOperands.end()) {
+              result[*key] = 0;
+            }
+            return result;
+          };
+          const auto mergeDependencies = [&](Dependencies& destination,
+                                             const Dependencies& source) {
+            for (const auto& [name, modulus] : source) {
+              const auto found = destination.find(name);
+              if (found == destination.end()) {
+                destination[name] = modulus;
+              } else {
+                found->second = mergeModulus(found->second, modulus);
+              }
+            }
+          };
+          for (std::size_t position = loopStart + 2; position < condIndex; ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) {
+              mergeDependencies(controlDependencies, dependenciesOf(inst.src1));
+              continue;
+            }
+            const auto destination = variableKey(inst.dest);
+            if (!destination || inst.op == IROp::LABEL || inst.op == IROp::BRANCH ||
+                (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone())) {
+              continue;
+            }
+            Dependencies dependencies = dependenciesOf(inst.src1);
+            mergeDependencies(dependencies, dependenciesOf(inst.src2));
+            if (inst.op == IROp::MOD && inst.src2.isImm()) {
+              for (auto& [name, modulus] : dependencies) {
+                (void) name;
+                modulus = modulus == 0 ? inst.src2.immVal : mergeModulus(modulus, inst.src2.immVal);
+              }
+            }
+            dependencyValues[*destination] = std::move(dependencies);
+          }
+          // 不允许“不可见累加器”：否则相同控制键下的下一步仍可能依赖其完整值。
+          if (controlDependencies.size() != stateOperands.size()) {
+            continue;
+          }
+
+          std::vector<FiniteStateVar> states;
+          states.reserve(stateOperands.size());
+          bool initialKnown = true;
+          std::vector<std::int32_t> initialValues;
+          for (const auto& [key, operand] : stateOperands) {
+            const auto control = controlDependencies.find(key);
+            const auto initial = findInitial(operand);
+            if (control == controlDependencies.end() || !initial) {
+              initialKnown = false;
+              break;
+            }
+            states.push_back(FiniteStateVar{key, operand, control->second});
+            initialValues.push_back(*initial);
+          }
+          if (!initialKnown) {
+            continue;
+          }
+          std::sort(states.begin(), states.end(),
+                    [](const FiniteStateVar& lhs, const FiniteStateVar& rhs) {
+                      return lhs.key < rhs.key;
+                    });
+          initialValues.clear();
+          for (const FiniteStateVar& state : states) {
+            initialValues.push_back(*findInitial(state.operand));
+          }
+
+          std::unordered_map<std::string, std::size_t> bodyLabels;
+          for (std::size_t position = loopStart + 2; position < condIndex; ++position) {
+            if (ir[position].op == IROp::LABEL && ir[position].dest.isLabel()) {
+              bodyLabels[ir[position].dest.name] = position;
+            }
+          }
+          const auto evaluateBinary = [](IROp op, std::int32_t lhs,
+                                         std::int32_t rhs) -> std::optional<std::int32_t> {
+            std::int64_t wide = 0;
+            switch (op) {
+            case IROp::ADD:
+              wide = static_cast<std::int64_t>(lhs) + rhs;
+              break;
+            case IROp::SUB:
+              wide = static_cast<std::int64_t>(lhs) - rhs;
+              break;
+            case IROp::MUL:
+              wide = static_cast<std::int64_t>(lhs) * rhs;
+              break;
+            case IROp::DIV:
+              if (rhs == 0 || (lhs == INT32_MIN && rhs == -1))
+                return std::nullopt;
+              return lhs / rhs;
+            case IROp::MOD:
+              if (rhs == 0 || (lhs == INT32_MIN && rhs == -1))
+                return std::nullopt;
+              return lhs % rhs;
+            case IROp::LT:
+              return lhs < rhs;
+            case IROp::GT:
+              return lhs > rhs;
+            case IROp::LE:
+              return lhs <= rhs;
+            case IROp::GE:
+              return lhs >= rhs;
+            case IROp::EQ:
+              return lhs == rhs;
+            case IROp::NE:
+              return lhs != rhs;
+            default:
+              return std::nullopt;
+            }
+            if (wide < INT32_MIN || wide > INT32_MAX)
+              return std::nullopt;
+            return static_cast<std::int32_t>(wide);
+          };
+          const auto executeIteration =
+              [&](const std::vector<std::int32_t>& input,
+                  std::int32_t inductionValue) -> std::optional<std::vector<std::int32_t>> {
+            std::unordered_map<std::string, std::int32_t> values;
+            for (std::size_t index = 0; index < states.size(); ++index) {
+              values[states[index].key] = input[index];
+            }
+            values["L:" + induction] = inductionValue;
+            const auto valueOf = [&](const Operand& operand) -> std::optional<std::int32_t> {
+              if (operand.isImm())
+                return operand.immVal;
+              const auto key = variableKey(operand);
+              if (!key)
+                return std::nullopt;
+              const auto found = values.find(*key);
+              if (found != values.end())
+                return found->second;
+              return findInitial(operand);
+            };
+
+            std::size_t position = loopStart + 2;
+            std::size_t executed = 0;
+            while (position < condIndex && executed++ < (condIndex - loopStart) * 4) {
+              const IRInst& inst = ir[position];
+              if (inst.op == IROp::LABEL) {
+                ++position;
+                continue;
+              }
+              if (inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) {
+                bool take = inst.op == IROp::BRANCH;
+                if (!take) {
+                  const auto conditionValue = valueOf(inst.src1);
+                  if (!conditionValue)
+                    return std::nullopt;
+                  take = inst.op == IROp::BEQZ ? *conditionValue == 0 : *conditionValue != 0;
+                }
+                if (take) {
+                  const auto target = bodyLabels.find(inst.dest.name);
+                  if (target == bodyLabels.end() || target->second <= position)
+                    return std::nullopt;
+                  position = target->second + 1;
+                } else {
+                  ++position;
+                }
+                continue;
+              }
+              const auto destination = variableKey(inst.dest);
+              if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+                if (destination)
+                  values.erase(*destination);
+                ++position;
+                continue;
+              }
+              if (!destination)
+                return std::nullopt;
+              const auto lhs = valueOf(inst.src1);
+              if (!lhs)
+                return std::nullopt;
+              std::optional<std::int32_t> result;
+              if (inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) {
+                result = *lhs;
+              } else if (inst.op == IROp::NOT) {
+                result = *lhs == 0;
+              } else {
+                const auto rhs = valueOf(inst.src2);
+                if (!rhs)
+                  return std::nullopt;
+                result = evaluateBinary(inst.op, *lhs, *rhs);
+              }
+              if (!result)
+                return std::nullopt;
+              values[*destination] = *result;
+              ++position;
+            }
+            if (position != condIndex)
+              return std::nullopt;
+            std::vector<std::int32_t> result;
+            result.reserve(states.size());
+            for (const FiniteStateVar& state : states) {
+              const auto found = values.find(state.key);
+              if (found == values.end())
+                return std::nullopt;
+              result.push_back(found->second);
+            }
+            return result;
+          };
+          const auto controlKey = [&](const std::vector<std::int32_t>& values) {
+            std::vector<std::int32_t> key;
+            key.reserve(values.size());
+            for (std::size_t index = 0; index < values.size(); ++index) {
+              const int modulus = states[index].modulus;
+              key.push_back(modulus == 0 ? values[index] : values[index] % modulus);
+            }
+            return key;
+          };
+
+          constexpr std::uint64_t kMaximumControlStates = 65536;
+          std::unordered_map<std::vector<std::int32_t>, std::uint64_t, VectorHash> seen;
+          std::vector<std::vector<std::int32_t>> snapshots;
+          snapshots.push_back(initialValues);
+          seen.emplace(controlKey(initialValues), 0);
+          std::uint64_t simulated = 0;
+          std::uint64_t cycleStart = 0;
+          std::uint64_t cycleEnd = 0;
+          bool foundCycle = false;
+          while (simulated < static_cast<std::uint64_t>(trips) &&
+                 simulated < kMaximumControlStates) {
+            const auto next = executeIteration(
+                snapshots.back(), static_cast<std::int32_t>(*initialInduction + simulated));
+            if (!next)
+              break;
+            ++simulated;
+            snapshots.push_back(*next);
+            const auto [found, inserted] = seen.emplace(controlKey(*next), simulated);
+            if (!inserted) {
+              cycleStart = found->second;
+              cycleEnd = simulated;
+              foundCycle = true;
+              break;
+            }
+          }
+          if (!foundCycle || cycleEnd <= cycleStart ||
+              simulated >= static_cast<std::uint64_t>(trips)) {
+            continue;
+          }
+          const std::uint64_t cycleLength = cycleEnd - cycleStart;
+          const std::uint64_t remaining = static_cast<std::uint64_t>(trips) - cycleStart;
+          const std::uint64_t completeCycles = remaining / cycleLength;
+          const std::uint64_t tail = remaining % cycleLength;
+          std::vector<std::int32_t> finalValues(states.size());
+          bool cycleSafe = true;
+          for (std::size_t index = 0; index < states.size(); ++index) {
+            const std::int64_t delta = static_cast<std::int64_t>(snapshots[cycleEnd][index]) -
+                                       snapshots[cycleStart][index];
+            if ((states[index].modulus == 0 && delta != 0) ||
+                (states[index].modulus != 0 && delta % states[index].modulus != 0)) {
+              cycleSafe = false;
+              break;
+            }
+            const std::int64_t value =
+                static_cast<std::int64_t>(snapshots[cycleStart + tail][index]) +
+                delta * static_cast<std::int64_t>(completeCycles);
+            if (value < INT32_MIN || value > INT32_MAX) {
+              cycleSafe = false;
+              break;
+            }
+            finalValues[index] = static_cast<std::int32_t>(value);
+          }
+          if (!cycleSafe) {
+            continue;
+          }
+
+          const std::size_t loopEnd = condIndex + 3;
+          const auto usedAfterLoop = [&](const Operand& operand) {
+            const auto key = variableKey(operand);
+            for (std::size_t position = loopEnd; position < functionEnd; ++position) {
+              const IRInst& inst = ir[position];
+              if (variableKey(inst.src1) == key || variableKey(inst.src2) == key ||
+                  ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) &&
+                   variableKey(inst.dest) == key)) {
+                return true;
+              }
+            }
+            return false;
+          };
+          std::vector<IRInst> replacement;
+          for (std::size_t index = 0; index < states.size(); ++index) {
+            if (usedAfterLoop(states[index].operand)) {
+              replacement.emplace_back(IROp::ASSIGN, states[index].operand,
+                                       Operand::imm(finalValues[index]), Operand::none());
+            }
+          }
+          if (usedAfterLoop(Operand::localVar(induction))) {
+            replacement.emplace_back(
+                IROp::ASSIGN, Operand::localVar(induction),
+                Operand::imm(static_cast<std::int32_t>(*initialInduction + trips)),
+                Operand::none());
+          }
+
+          std::size_t eraseEnd = loopEnd;
+          if (eraseEnd < ir.size() && ir[eraseEnd].op == IROp::LABEL &&
+              ir[eraseEnd].dest.isLabel() && labelReferences[ir[eraseEnd].dest.name] == 0) {
+            ++eraseEnd;
+          }
+          ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(loopStart),
+                   ir.begin() + static_cast<std::ptrdiff_t>(eraseEnd));
+          ir.insert(ir.begin() + static_cast<std::ptrdiff_t>(loopStart), replacement.begin(),
+                    replacement.end());
+          summarized = true;
+          changed = true;
         }
         if (!summarized) {
           break;

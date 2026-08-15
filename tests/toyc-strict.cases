@@ -100,6 +100,7 @@ perf/t_invariant_offset_remainder_summary.c
 perf/t_invariant_empty_path_guard.c
 perf/t_bounded_helper_summary.c
 perf/t_modular_state_cycle_summary.c
+perf/t_branched_finite_state_summary.c
 perf/t_periodic_affine_branch_large_period.c
 perf/t_threshold_affine_branch.c
 perf/t_loop_weighted_regalloc.c
@@ -146,6 +147,7 @@ regression/modular_state_induction_safety.c
 regression/modular_state_large_modulus_safety.c
 regression/modular_state_cross_state_safety.c
 regression/modular_state_short_cycle_safety.c
+regression/finite_state_hidden_accumulator_safety.c
 regression/modular_matrix_overflow_safety.c
 regression/global_matrix_call_entry_safety.c
 regression/polynomial_geometric_safety.c
