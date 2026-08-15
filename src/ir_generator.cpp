@@ -676,6 +676,9 @@ void IRGenerator::inlinePass() {
   // 对热调用点使用更高但仍有上限的预算；循环外仍保持保守阈值，避免无谓膨胀。
   constexpr std::size_t kBaseLoopInlineLimit = 96;
   constexpr std::size_t kLoopInlineLimit = 160;
+  // 单一调用点的非递归 helper 内联后不会复制代码，却能把 main 中的常量
+  // 实参送进其循环条件，继而触发循环摘要和其它跨调用优化。
+  constexpr std::size_t kSingleCallInlineLimit = 512;
 
   // 多轮迭代：内联可能引入新的可内联调用（如 f(g(x))）。
   // 每轮重新收集函数区间，因为前一轮的内联替换会使旧下标失效。
@@ -709,6 +712,13 @@ void IRGenerator::inlinePass() {
     }
     if (funcs.empty())
       break;
+
+    std::unordered_map<std::string, std::size_t> callCounts;
+    for (const IRInst& inst : ir) {
+      if (inst.op == IROp::CALL && inst.src1.isFunc() && funcs.count(inst.src1.name) != 0) {
+        ++callCounts[inst.src1.name];
+      }
+    }
 
     // 由回边构造自然循环的线性区间。while 在反转前后分别以 BRANCH/BNEZ
     // 跳向前方 LABEL，调用点落在 [target, backedge] 内即为热调用。
@@ -812,8 +822,26 @@ void IRGenerator::inlinePass() {
       if (reach[callee].count(callee) || reach[callee].count(curFunc))
         continue;
       const bool hotCall = isLoopCall(ci);
-      const std::size_t inlineLimit = hotCall ? kLoopInlineLimit : kInlineLimit;
+      const bool singleCall = callCounts[callee] == 1;
+      std::size_t inlineLimit = singleCall ? kSingleCallInlineLimit : kInlineLimit;
+      if (hotCall) {
+        inlineLimit = std::max(inlineLimit, kLoopInlineLimit);
+      }
       const std::size_t calleeBodySize = bodySize(f);
+      bool hasUnconditionalBackedge = false;
+      for (std::size_t k = f.begin + 1; k < f.end; ++k) {
+        if (ir[k].op != IROp::BRANCH || !ir[k].dest.isLabel()) {
+          continue;
+        }
+        const auto target = labelPositions.find(ir[k].dest.name);
+        if (target != labelPositions.end() && target->second < k) {
+          hasUnconditionalBackedge = true;
+          break;
+        }
+      }
+      if (singleCall && calleeBodySize > kInlineLimit && hasUnconditionalBackedge) {
+        continue;
+      }
       if (calleeBodySize > inlineLimit)
         continue;
 
