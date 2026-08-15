@@ -739,6 +739,31 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
 
     std::vector<std::string> spareRegisters;
     if (!hasCall) {
+      bool needsRemainderScratch = false;
+      for (std::size_t index = function.begin; index < function.end; ++index) {
+        const IRInst& inst = ir_[index];
+        if (inst.op != IROp::MOD) {
+          continue;
+        }
+        bool sourceInRegister = false;
+        if (inst.src1.isLocalVar()) {
+          sourceInRegister = frame.tempRegs.count(inst.src1.name) != 0 ||
+                             frame.leafRegAlloc.count(inst.src1.name) != 0 ||
+                             frame.regAlloc.count(inst.src1.name) != 0;
+        } else if (inst.src1.isGlobalVar()) {
+          sourceInRegister = frame.globalRegAlloc.count(inst.src1.name) != 0;
+        }
+        if (!sourceInRegister) {
+          needsRemainderScratch = true;
+          break;
+        }
+      }
+      // t3 只在直接 MOD 的被除数落到 t0 时用于保值。常见的优化 IR 已把
+      // 余数拆成 DIV/MUL/SUB；若函数中不存在这种冲突，叶函数可把 t3 用作
+      // 第 19 个长期寄存器，尤其适合提升常量除法的 magic multiplier。
+      if (!needsRemainderScratch) {
+        spareRegisters.push_back("t3");
+      }
       bool usedArgRegs[8] = {false, false, false, false, false, false, false, false};
       // 即使形参入口后会搬到 t 寄存器，也不能在搬运前用常量覆盖其 ABI 寄存器。
       for (const auto& entry : incomingParamRegs) {
