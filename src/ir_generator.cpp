@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cctype>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <optional>
 #include <unordered_set>
@@ -5775,6 +5776,453 @@ void IRGenerator::optimizePass() {
           if (usedAfterLoop(induction)) {
             replacement.emplace_back(IROp::ASSIGN, Operand::localVar(induction),
                                      Operand::imm(static_cast<int>(finalInduction)),
+                                     Operand::none());
+          }
+
+          std::size_t eraseEnd = loopEnd;
+          if (eraseEnd < ir.size() && ir[eraseEnd].op == IROp::LABEL &&
+              ir[eraseEnd].dest.isLabel() && labelReferences[ir[eraseEnd].dest.name] == 0) {
+            ++eraseEnd;
+          }
+          ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(loopStart),
+                   ir.begin() + static_cast<std::ptrdiff_t>(eraseEnd));
+          ir.insert(ir.begin() + static_cast<std::ptrdiff_t>(loopStart), replacement.begin(),
+                    replacement.end());
+          summarized = true;
+          changed = true;
+        }
+        if (!summarized) {
+          break;
+        }
+      }
+    }
+
+    // Pass 5.565: 汇总带非负循环不变偏移的余数累加。
+    //
+    // 对 `sum += (base + i) % m`，若 i 是常量边界的非负单步归纳变量，base
+    // 在循环内不变且可证明非负，则余数每 m 轮重复。令 n 为迭代次数、r=base%m：
+    //
+    //   delta = floor(n/m) * m*(m-1)/2
+    //         + (n%m)*r + (n%m)*(n%m-1)/2
+    //         - m*max(0, r+(n%m)-m)
+    //
+    // 最后一项用比较结果 0/1 乘回候选值实现，不引入控制流。循环不变条件保护的
+    // 同一累加也可复用 delta；负数跨零时 C 余数不具周期性，因此必须通过证明门槛。
+    {
+      struct GuardedAccumulator {
+        std::string name;
+        Operand guard;
+        std::string label;
+      };
+
+      const auto sameOperand = [](const Operand& lhs, const Operand& rhs) {
+        if (lhs.type != rhs.type) {
+          return false;
+        }
+        if (lhs.isImm()) {
+          return lhs.immVal == rhs.immVal;
+        }
+        return lhs.name == rhs.name;
+      };
+
+      for (int summaryRound = 0; summaryRound < 8; ++summaryRound) {
+        std::unordered_map<std::string, std::size_t> labelPositions;
+        std::unordered_map<std::string, int> labelReferences;
+        for (std::size_t index = 0; index < ir.size(); ++index) {
+          const IRInst& inst = ir[index];
+          if (inst.op == IROp::LABEL && inst.dest.isLabel()) {
+            labelPositions[inst.dest.name] = index;
+          }
+          if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+              inst.dest.isLabel()) {
+            ++labelReferences[inst.dest.name];
+          }
+        }
+
+        bool summarized = false;
+        for (std::size_t loopStart = ir.size(); loopStart-- > 0 && !summarized;) {
+          if (ir[loopStart].op != IROp::BRANCH || !ir[loopStart].dest.isLabel() ||
+              loopStart + 1 >= ir.size() || ir[loopStart + 1].op != IROp::LABEL ||
+              !ir[loopStart + 1].dest.isLabel()) {
+            continue;
+          }
+          const std::string condLabel = ir[loopStart].dest.name;
+          const std::string bodyLabel = ir[loopStart + 1].dest.name;
+          if (labelReferences[condLabel] != 1 || labelReferences[bodyLabel] != 1) {
+            continue;
+          }
+          const auto condFound = labelPositions.find(condLabel);
+          if (condFound == labelPositions.end() || condFound->second <= loopStart + 2) {
+            continue;
+          }
+          const std::size_t condIndex = condFound->second;
+          if (condIndex + 2 >= ir.size()) {
+            continue;
+          }
+          const IRInst& condition = ir[condIndex + 1];
+          const IRInst& backedge = ir[condIndex + 2];
+          if ((condition.op != IROp::LT && condition.op != IROp::LE) ||
+              !condition.dest.isLocalVar() || !condition.src1.isLocalVar() ||
+              backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
+              backedge.dest.name != bodyLabel || !backedge.src1.isLocalVar() ||
+              backedge.src1.name != condition.dest.name) {
+            continue;
+          }
+          const std::string induction = condition.src1.name;
+
+          std::size_t functionBegin = loopStart;
+          while (functionBegin > 0 && ir[functionBegin].op != IROp::FUNC_BEGIN) {
+            --functionBegin;
+          }
+          std::size_t functionEnd = condIndex + 3;
+          while (functionEnd < ir.size() && ir[functionEnd].op != IROp::FUNC_END) {
+            ++functionEnd;
+          }
+
+          const auto findNearbyConstant = [&](const std::string& name) -> std::optional<int> {
+            for (std::size_t position = loopStart; position > functionBegin; --position) {
+              const IRInst& candidate = ir[position - 1];
+              if (candidate.dest.isLocalVar() && candidate.dest.name == name) {
+                if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                    candidate.src1.isImm()) {
+                  return candidate.src1.immVal;
+                }
+                return std::nullopt;
+              }
+              if (candidate.op == IROp::LABEL || candidate.op == IROp::BRANCH ||
+                  candidate.op == IROp::BEQZ || candidate.op == IROp::BNEZ ||
+                  candidate.op == IROp::CALL) {
+                break;
+              }
+            }
+            return std::nullopt;
+          };
+          const auto findUniqueConstant = [&](const std::string& name) -> std::optional<int> {
+            int definitions = 0;
+            std::optional<int> value;
+            for (std::size_t position = functionBegin; position < functionEnd; ++position) {
+              const IRInst& candidate = ir[position];
+              if (!candidate.dest.isLocalVar() || candidate.dest.name != name ||
+                  candidate.op == IROp::RETURN || candidate.op == IROp::PARAM ||
+                  (candidate.op == IROp::LOCAL_VAR_DECL && candidate.src1.isNone())) {
+                continue;
+              }
+              ++definitions;
+              if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                  candidate.src1.isImm()) {
+                value = candidate.src1.immVal;
+              } else {
+                value.reset();
+              }
+            }
+            return definitions == 1 ? value : std::nullopt;
+          };
+
+          const auto initial = findNearbyConstant(induction);
+          std::optional<int> upper;
+          if (condition.src2.isImm()) {
+            upper = condition.src2.immVal;
+          } else if (condition.src2.isLocalVar()) {
+            upper = findNearbyConstant(condition.src2.name);
+            if (!upper) {
+              upper = findUniqueConstant(condition.src2.name);
+            }
+          }
+          if (!initial || !upper || *initial < 0 ||
+              (condition.op == IROp::LE && *upper == INT32_MAX)) {
+            continue;
+          }
+          std::int64_t trips = static_cast<std::int64_t>(*upper) - *initial;
+          if (condition.op == IROp::LE) {
+            ++trips;
+          }
+          trips = std::max<std::int64_t>(0, trips);
+          if (trips < 2 || trips > INT32_MAX) {
+            continue;
+          }
+
+          std::unordered_set<std::string> written;
+          for (std::size_t position = loopStart + 2; position < condIndex; ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.dest.isLocalVar() && inst.op != IROp::RETURN && inst.op != IROp::PARAM) {
+              written.insert(inst.dest.name);
+            }
+          }
+          if (condition.src2.isLocalVar() && written.count(condition.src2.name) != 0) {
+            continue;
+          }
+
+          // 证明某局部变量在本函数中所有定义都保持非负。自增定义可以依赖自身，
+          // 但必须另有一个不依赖自身的非负根定义，避免循环论证未初始化值。
+          std::unordered_map<std::string, int> nonNegativeMemo;
+          std::function<bool(const std::string&)> proveNonNegative;
+          proveNonNegative = [&](const std::string& name) {
+            const auto memo = nonNegativeMemo.find(name);
+            if (memo != nonNegativeMemo.end()) {
+              return memo->second == 2;
+            }
+            nonNegativeMemo[name] = 1;
+            bool sawDefinition = false;
+            bool sawGroundDefinition = false;
+            for (std::size_t position = functionBegin; position < functionEnd; ++position) {
+              const IRInst& inst = ir[position];
+              if (!inst.dest.isLocalVar() || inst.dest.name != name || inst.op == IROp::RETURN ||
+                  inst.op == IROp::PARAM ||
+                  (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone())) {
+                continue;
+              }
+              sawDefinition = true;
+              const auto operandProof = [&](const Operand& operand) {
+                if (operand.isImm()) {
+                  return std::pair<bool, bool>{operand.immVal >= 0, false};
+                }
+                if (!operand.isLocalVar()) {
+                  return std::pair<bool, bool>{false, false};
+                }
+                if (operand.name == name) {
+                  return std::pair<bool, bool>{true, true};
+                }
+                return std::pair<bool, bool>{proveNonNegative(operand.name), false};
+              };
+              const auto lhs = operandProof(inst.src1);
+              const auto rhs = operandProof(inst.src2);
+              bool safe = false;
+              bool selfDependent = lhs.second || rhs.second;
+              if (inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) {
+                safe = lhs.first;
+                selfDependent = lhs.second;
+              } else if (inst.op == IROp::ADD || inst.op == IROp::MUL) {
+                safe = lhs.first && rhs.first;
+              } else if ((inst.op == IROp::DIV || inst.op == IROp::MOD) && lhs.first &&
+                         inst.src2.isImm() && inst.src2.immVal > 0) {
+                safe = true;
+              } else if (inst.op == IROp::NOT || inst.op == IROp::LT || inst.op == IROp::GT ||
+                         inst.op == IROp::LE || inst.op == IROp::GE || inst.op == IROp::EQ ||
+                         inst.op == IROp::NE) {
+                safe = true;
+                selfDependent = false;
+              }
+              if (!safe) {
+                nonNegativeMemo[name] = 3;
+                return false;
+              }
+              if (!selfDependent) {
+                sawGroundDefinition = true;
+              }
+            }
+            const bool proven = sawDefinition && sawGroundDefinition;
+            nonNegativeMemo[name] = proven ? 2 : 3;
+            return proven;
+          };
+
+          std::optional<std::size_t> chainBegin;
+          Operand invariantBase;
+          std::string remainderName;
+          int modulus = 0;
+          for (std::size_t position = loopStart + 2; position + 3 < condIndex; ++position) {
+            const IRInst& add = ir[position];
+            const IRInst& quotient = ir[position + 1];
+            const IRInst& product = ir[position + 2];
+            const IRInst& remainder = ir[position + 3];
+            if (add.op != IROp::ADD || !add.dest.isLocalVar()) {
+              continue;
+            }
+            if (add.src1.isLocalVar() && add.src1.name == induction) {
+              invariantBase = add.src2;
+            } else if (add.src2.isLocalVar() && add.src2.name == induction) {
+              invariantBase = add.src1;
+            } else {
+              continue;
+            }
+            if ((!invariantBase.isLocalVar() && !invariantBase.isImm()) ||
+                (invariantBase.isLocalVar() && written.count(invariantBase.name) != 0) ||
+                (invariantBase.isImm() && invariantBase.immVal < 0) ||
+                (invariantBase.isLocalVar() && !proveNonNegative(invariantBase.name))) {
+              continue;
+            }
+            if (quotient.op != IROp::DIV || !quotient.dest.isLocalVar() ||
+                !sameOperand(quotient.src1, add.dest) || !quotient.src2.isImm() ||
+                quotient.src2.immVal <= 1 || product.op != IROp::MUL ||
+                !product.dest.isLocalVar() || !product.src2.isImm() ||
+                product.src2.immVal != quotient.src2.immVal ||
+                !sameOperand(product.src1, quotient.dest) || remainder.op != IROp::SUB ||
+                !remainder.dest.isLocalVar() || !sameOperand(remainder.src1, add.dest) ||
+                !sameOperand(remainder.src2, product.dest)) {
+              continue;
+            }
+            chainBegin = position;
+            remainderName = remainder.dest.name;
+            modulus = quotient.src2.immVal;
+            break;
+          }
+          if (!chainBegin || modulus <= 1) {
+            continue;
+          }
+
+          std::vector<std::string> directAccumulators;
+          std::vector<GuardedAccumulator> guardedAccumulators;
+          std::unordered_set<std::size_t> allowed = {*chainBegin, *chainBegin + 1, *chainBegin + 2,
+                                                     *chainBegin + 3};
+          bool inductionIncremented = false;
+          for (std::size_t position = loopStart + 2; position < condIndex;) {
+            const IRInst& inst = ir[position];
+            if (allowed.count(position) != 0 ||
+                (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone())) {
+              ++position;
+              continue;
+            }
+            if (inst.op == IROp::ADD && inst.dest.isLocalVar() && inst.dest.name == induction &&
+                inst.src1.isLocalVar() && inst.src1.name == induction && inst.src2.isImm() &&
+                inst.src2.immVal == 1) {
+              inductionIncremented = !inductionIncremented;
+              if (!inductionIncremented) {
+                break;
+              }
+              ++position;
+              continue;
+            }
+            const bool directAccumulator =
+                inst.op == IROp::ADD && inst.dest.isLocalVar() && inst.src1.isLocalVar() &&
+                inst.src1.name == inst.dest.name && inst.src2.isLocalVar() &&
+                inst.src2.name == remainderName;
+            if (directAccumulator) {
+              directAccumulators.push_back(inst.dest.name);
+              ++position;
+              continue;
+            }
+            if (inst.op == IROp::BEQZ && inst.dest.isLabel() && inst.src1.isLocalVar() &&
+                position + 2 < condIndex) {
+              const IRInst& update = ir[position + 1];
+              const IRInst& join = ir[position + 2];
+              const bool guardedAccumulator =
+                  update.op == IROp::ADD && update.dest.isLocalVar() && update.src1.isLocalVar() &&
+                  update.src1.name == update.dest.name && update.src2.isLocalVar() &&
+                  update.src2.name == remainderName && join.op == IROp::LABEL &&
+                  join.dest.isLabel() && join.dest.name == inst.dest.name &&
+                  labelReferences[inst.dest.name] == 1 && written.count(inst.src1.name) == 0;
+              if (guardedAccumulator) {
+                guardedAccumulators.push_back({update.dest.name, inst.src1, inst.dest.name});
+                position += 3;
+                continue;
+              }
+            }
+            break;
+          }
+          if (!inductionIncremented ||
+              (directAccumulators.empty() && guardedAccumulators.empty())) {
+            continue;
+          }
+
+          // 确认循环体没有未识别的状态变化。
+          std::size_t recognized =
+              4 + 1 + directAccumulators.size() + guardedAccumulators.size() * 3;
+          for (std::size_t position = loopStart + 2; position < condIndex; ++position) {
+            if (ir[position].op == IROp::LOCAL_VAR_DECL && ir[position].src1.isNone()) {
+              ++recognized;
+            }
+          }
+          if (recognized != condIndex - (loopStart + 2)) {
+            continue;
+          }
+
+          const std::size_t loopEnd = condIndex + 3;
+          const auto usedAfterLoop = [&](const std::string& name) {
+            for (std::size_t position = loopEnd; position < functionEnd; ++position) {
+              const IRInst& inst = ir[position];
+              if ((inst.src1.isLocalVar() && inst.src1.name == name) ||
+                  (inst.src2.isLocalVar() && inst.src2.name == name) ||
+                  ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) && inst.dest.isLocalVar() &&
+                   inst.dest.name == name)) {
+                return true;
+              }
+            }
+            return false;
+          };
+          if (usedAfterLoop(ir[*chainBegin].dest.name) ||
+              usedAfterLoop(ir[*chainBegin + 1].dest.name) ||
+              usedAfterLoop(ir[*chainBegin + 2].dest.name) || usedAfterLoop(remainderName)) {
+            continue;
+          }
+
+          const std::int64_t completePeriods = trips / modulus;
+          const int residual = static_cast<int>(trips % modulus);
+          const std::int64_t constantDelta =
+              completePeriods * modulus * (static_cast<std::int64_t>(modulus) - 1) / 2 +
+              static_cast<std::int64_t>(residual) * (residual - 1) / 2;
+          const std::int64_t maximumDelta = trips * (static_cast<std::int64_t>(modulus) - 1);
+          if (constantDelta < 0 || constantDelta > INT32_MAX || maximumDelta > INT32_MAX) {
+            continue;
+          }
+
+          std::vector<IRInst> replacement;
+          Operand base = invariantBase;
+          if (*initial != 0) {
+            if (base.isImm()) {
+              const std::int64_t shifted = static_cast<std::int64_t>(base.immVal) + *initial;
+              if (shifted > INT32_MAX) {
+                continue;
+              }
+              base = Operand::imm(static_cast<int>(shifted));
+            } else {
+              const std::string shifted = newTemp();
+              replacement.emplace_back(IROp::ADD, Operand::localVar(shifted), base,
+                                       Operand::imm(*initial));
+              base = Operand::localVar(shifted);
+            }
+          }
+
+          Operand delta = Operand::imm(static_cast<int>(constantDelta));
+          if (residual != 0) {
+            const std::string remainder = newTemp();
+            replacement.emplace_back(IROp::MOD, Operand::localVar(remainder), base,
+                                     Operand::imm(modulus));
+            Operand partial = Operand::localVar(remainder);
+            if (residual != 1) {
+              const std::string scaled = newTemp();
+              replacement.emplace_back(IROp::MUL, Operand::localVar(scaled), partial,
+                                       Operand::imm(residual));
+              partial = Operand::localVar(scaled);
+            }
+            if (constantDelta != 0) {
+              const std::string withConstant = newTemp();
+              replacement.emplace_back(IROp::ADD, Operand::localVar(withConstant), partial,
+                                       Operand::imm(static_cast<int>(constantDelta)));
+              partial = Operand::localVar(withConstant);
+            }
+            const std::string wrapCandidate = newTemp();
+            replacement.emplace_back(IROp::ADD, Operand::localVar(wrapCandidate),
+                                     Operand::localVar(remainder),
+                                     Operand::imm(residual - modulus));
+            const std::string wraps = newTemp();
+            replacement.emplace_back(IROp::GT, Operand::localVar(wraps),
+                                     Operand::localVar(wrapCandidate), Operand::imm(0));
+            const std::string wrappedCount = newTemp();
+            replacement.emplace_back(IROp::MUL, Operand::localVar(wrappedCount),
+                                     Operand::localVar(wrapCandidate), Operand::localVar(wraps));
+            const std::string correction = newTemp();
+            replacement.emplace_back(IROp::MUL, Operand::localVar(correction),
+                                     Operand::localVar(wrappedCount), Operand::imm(modulus));
+            const std::string finalDelta = newTemp();
+            replacement.emplace_back(IROp::SUB, Operand::localVar(finalDelta), partial,
+                                     Operand::localVar(correction));
+            delta = Operand::localVar(finalDelta);
+          }
+
+          for (const std::string& accumulator : directAccumulators) {
+            replacement.emplace_back(IROp::ADD, Operand::localVar(accumulator),
+                                     Operand::localVar(accumulator), delta);
+          }
+          for (const GuardedAccumulator& accumulator : guardedAccumulators) {
+            replacement.emplace_back(IROp::BEQZ, Operand::label(accumulator.label),
+                                     accumulator.guard, Operand::none());
+            replacement.emplace_back(IROp::ADD, Operand::localVar(accumulator.name),
+                                     Operand::localVar(accumulator.name), delta);
+            replacement.emplace_back(IROp::LABEL, Operand::label(accumulator.label),
+                                     Operand::none(), Operand::none());
+          }
+          if (usedAfterLoop(induction)) {
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(induction),
+                                     Operand::imm(static_cast<int>(*initial + trips)),
                                      Operand::none());
           }
 
