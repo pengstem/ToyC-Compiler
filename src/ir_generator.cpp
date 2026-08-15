@@ -1442,8 +1442,12 @@ void IRGenerator::optimizePass() {
         };
         for (std::size_t idx = blocks[k].first; idx <= blocks[k].second; ++idx) {
           IRInst& inst = ir[idx];
-          resolveOperand(inst.src1);
-          resolveOperand(inst.src2);
+          // 分支条件参与 CFG 后继选择；当前格值分析同时合并两条边，不能
+          // 据此把条件临时量改成立即数，否则循环/汇合处可能选错路径。
+          if (inst.op != IROp::BEQZ && inst.op != IROp::BNEZ) {
+            resolveOperand(inst.src1);
+            resolveOperand(inst.src2);
+          }
           if (inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
             resolveOperand(inst.dest);
           }
