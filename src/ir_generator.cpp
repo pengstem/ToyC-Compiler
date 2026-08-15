@@ -842,6 +842,39 @@ void IRGenerator::inlinePass() {
       if (singleCall && calleeBodySize > kInlineLimit && hasUnconditionalBackedge) {
         continue;
       }
+      const auto callResultIsUsed = [&]() {
+        if (!ir[ci].dest.isLocalVar()) {
+          return true;
+        }
+        std::string value = ir[ci].dest.name;
+        for (std::size_t k = ci + 1; k < ir.size(); ++k) {
+          const IRInst& later = ir[k];
+          if (later.op == IROp::FUNC_END) {
+            break;
+          }
+          const bool usedAsSource = (later.src1.isLocalVar() && later.src1.name == value) ||
+                                    (later.src2.isLocalVar() && later.src2.name == value) ||
+                                    ((later.op == IROp::RETURN || later.op == IROp::PARAM) &&
+                                     later.dest.isLocalVar() && later.dest.name == value);
+          if (usedAsSource) {
+            if (later.op == IROp::ASSIGN && later.dest.isLocalVar() && later.src1.isLocalVar() &&
+                later.src1.name == value) {
+              value = later.dest.name;
+              continue;
+            }
+            return true;
+          }
+          const bool definesValue = later.dest.isLocalVar() && later.dest.name == value &&
+                                    later.op != IROp::RETURN && later.op != IROp::PARAM;
+          if (definesValue) {
+            break;
+          }
+        }
+        return false;
+      };
+      if (singleCall && calleeBodySize > kInlineLimit && !callResultIsUsed()) {
+        continue;
+      }
       if (calleeBodySize > inlineLimit)
         continue;
 
