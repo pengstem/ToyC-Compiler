@@ -1585,6 +1585,158 @@ void IRGenerator::optimizePass() {
       }
     }
 
+    // Pass 0bb: 折叠常量条件分支，并删除因此变得不可达的基本块。
+    //
+    // 只做表达式 DCE 不足以消掉 `if (0) { live = expensive(); }`：只要假分支
+    // 仍保留在 CFG 中，`live` 的定义就会被当成可能执行。先把立即数条件改成
+    // 无条件跳转或空操作，再按函数入口做一次精确可达性扫描，后续 DCE 才能
+    // 删除整条昂贵但不可达的计算链。
+    {
+      std::vector<IRInst> folded;
+      folded.reserve(ir.size());
+      bool foldedBranch = false;
+      std::unordered_set<std::string> constantBranchTargets;
+      for (const IRInst& inst : ir) {
+        if ((inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) && inst.src1.isImm()) {
+          if (inst.dest.isLabel()) {
+            constantBranchTargets.insert(inst.dest.name);
+          }
+          const bool taken = inst.op == IROp::BEQZ ? inst.src1.immVal == 0 : inst.src1.immVal != 0;
+          if (taken) {
+            folded.emplace_back(IROp::BRANCH, inst.dest, Operand::none(), Operand::none());
+          }
+          foldedBranch = true;
+          continue;
+        }
+        folded.push_back(inst);
+      }
+      if (foldedBranch) {
+        ir = std::move(folded);
+
+        std::vector<bool> reachable(ir.size(), false);
+        for (std::size_t functionBegin = 0; functionBegin < ir.size(); ++functionBegin) {
+          if (ir[functionBegin].op != IROp::FUNC_BEGIN) {
+            continue;
+          }
+          std::size_t functionEnd = functionBegin + 1;
+          while (functionEnd < ir.size() && ir[functionEnd].op != IROp::FUNC_END) {
+            ++functionEnd;
+          }
+          if (functionEnd >= ir.size()) {
+            break;
+          }
+
+          std::unordered_map<std::string, std::size_t> labels;
+          for (std::size_t index = functionBegin; index <= functionEnd; ++index) {
+            if (ir[index].op == IROp::LABEL && ir[index].dest.isLabel()) {
+              labels[ir[index].dest.name] = index;
+            }
+          }
+
+          std::vector<std::size_t> worklist{functionBegin};
+          while (!worklist.empty()) {
+            const std::size_t index = worklist.back();
+            worklist.pop_back();
+            if (index > functionEnd || reachable[index]) {
+              continue;
+            }
+            reachable[index] = true;
+            const IRInst& inst = ir[index];
+            const auto addTarget = [&](const Operand& target) {
+              if (!target.isLabel()) {
+                return;
+              }
+              const auto found = labels.find(target.name);
+              if (found != labels.end() && !reachable[found->second]) {
+                worklist.push_back(found->second);
+              }
+            };
+            if (inst.op == IROp::BRANCH) {
+              addTarget(inst.dest);
+            } else if (inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) {
+              addTarget(inst.dest);
+              if (index + 1 <= functionEnd) {
+                worklist.push_back(index + 1);
+              }
+            } else if (inst.op != IROp::RETURN && inst.op != IROp::FUNC_END &&
+                       index + 1 <= functionEnd) {
+              worklist.push_back(index + 1);
+            }
+          }
+          // FUNC_END 是结构边界，不要求从一个已返回的路径可达。
+          reachable[functionEnd] = true;
+          functionBegin = functionEnd;
+        }
+
+        std::vector<IRInst> pruned;
+        pruned.reserve(ir.size());
+        bool insideFunction = false;
+        for (std::size_t index = 0; index < ir.size(); ++index) {
+          if (ir[index].op == IROp::FUNC_BEGIN) {
+            insideFunction = true;
+          }
+          if (!insideFunction || reachable[index]) {
+            pruned.push_back(ir[index]);
+          }
+          if (ir[index].op == IROp::FUNC_END) {
+            insideFunction = false;
+          }
+        }
+        ir = std::move(pruned);
+
+        std::unordered_set<std::string> stillReferenced;
+        for (const IRInst& inst : ir) {
+          if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+              inst.dest.isLabel()) {
+            stillReferenced.insert(inst.dest.name);
+          }
+        }
+        std::vector<IRInst> withoutDeadJoins;
+        withoutDeadJoins.reserve(ir.size());
+        for (const IRInst& inst : ir) {
+          if (inst.op == IROp::LABEL && inst.dest.isLabel() &&
+              constantBranchTargets.count(inst.dest.name) != 0 &&
+              stillReferenced.count(inst.dest.name) == 0) {
+            continue;
+          }
+          withoutDeadJoins.push_back(inst);
+        }
+        ir = std::move(withoutDeadJoins);
+        changed = true;
+      }
+    }
+
+    // Pass 0bc: 清理跳到紧邻标签的空跳转。
+    // 常量分支折叠后常留下 `BRANCH L; LABEL L`，它虽然没有动态效果，却会
+    // 让后面的直线循环证明误判为“循环体含控制流”。
+    {
+      std::unordered_map<std::string, int> references;
+      for (const IRInst& inst : ir) {
+        if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+            inst.dest.isLabel()) {
+          ++references[inst.dest.name];
+        }
+      }
+      std::vector<IRInst> cleaned;
+      cleaned.reserve(ir.size());
+      for (std::size_t index = 0; index < ir.size(); ++index) {
+        const IRInst& inst = ir[index];
+        if (inst.op == IROp::BRANCH && inst.dest.isLabel() && index + 1 < ir.size() &&
+            ir[index + 1].op == IROp::LABEL && ir[index + 1].dest.isLabel() &&
+            ir[index + 1].dest.name == inst.dest.name) {
+          changed = true;
+          if (references[inst.dest.name] == 1) {
+            ++index;
+          }
+          continue;
+        }
+        cleaned.push_back(inst);
+      }
+      if (cleaned.size() != ir.size()) {
+        ir = std::move(cleaned);
+      }
+    }
+
     // Pass 0c: 代数简化
     {
       for (auto& inst : ir) {
@@ -4438,19 +4590,11 @@ void IRGenerator::optimizePass() {
                   }
                   accumulators.push_back(std::move(summary));
                 }
+                // 即使累加器初值是常量也在这里生成闭式。Pass 6 只识别直接的
+                // `s += linear(i)` 形状；当增量先经过若干临时量组合时（例如
+                // `t = s + i * 11; s = t + i * 17`），把它推迟给 Pass 6 会让
+                // 一个已经证明安全的仿射循环漏过所有闭式化阶段。
                 bodyOk = bodyOk && !accumulators.empty();
-                bool requiresRuntimeSummary = false;
-                for (const auto& accumulator : accumulators) {
-                  int ignoredInitial = 0;
-                  if (!accumulator.invariantDeltas.empty() ||
-                      !findNearbyConstant(loopStart, accumulator.name, ignoredInitial)) {
-                    requiresRuntimeSummary = true;
-                    break;
-                  }
-                }
-                // 全部累加器都有常量初值时交给后面的 Pass 6；它还能连同循环后
-                // 的纯表达式一起折叠成直接返回值，代码形状更优。
-                bodyOk = bodyOk && requiresRuntimeSummary;
               }
 
               if (bodyOk) {
@@ -4811,6 +4955,7 @@ void IRGenerator::optimizePass() {
           std::unordered_map<std::string, PolynomialExpr> values;
           std::unordered_map<std::string, Polynomial> accumulatorDeltas;
           std::unordered_set<std::string> written;
+          std::unordered_set<std::string> iterationLocals;
           bool bodySupported = true;
           bool inductionIncremented = false;
           int inductionWrites = 0;
@@ -4845,6 +4990,12 @@ void IRGenerator::optimizePass() {
                ++position) {
             const IRInst& inst = ir[position];
             if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+              // 词法上声明在循环体内的局部量每轮重新产生，不是跨回边状态。
+              // 后续对它的赋值应和编译器临时量一样参与多项式代入；否则
+              // `int a = i * 3; sum += a * a` 会被误判成未知递推。
+              if (inst.dest.isLocalVar()) {
+                iterationLocals.insert(inst.dest.name);
+              }
               continue;
             }
             if ((inst.op == IROp::ADD || inst.op == IROp::SUB) && inst.dest.isLocalVar() &&
@@ -4888,7 +5039,7 @@ void IRGenerator::optimizePass() {
               }
             }
 
-            if (isCompilerTemp(inst.dest.name)) {
+            if (isCompilerTemp(inst.dest.name) || iterationLocals.count(inst.dest.name) != 0) {
               values[inst.dest.name] = std::move(expression);
               continue;
             }

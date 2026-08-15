@@ -43,13 +43,16 @@ def backward_edges(assembly: str) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True)
-    parser.add_argument("--case", required=True)
+    parser.add_argument("--case", action="append", required=True)
     parser.add_argument("--must-keep-case", action="append", default=[])
     args = parser.parse_args()
 
-    assembly = compile_case(args.compiler, args.case)
-    if backward_edges(assembly):
-        raise RuntimeError(f"polynomial accumulator still has a backedge:\n{assembly}")
+    for case in args.case:
+        assembly = compile_case(args.compiler, case)
+        if backward_edges(assembly):
+            raise RuntimeError(
+                f"polynomial accumulator still has a backedge ({case}):\n{assembly}"
+            )
     for case in args.must_keep_case:
         fallback = compile_case(args.compiler, case)
         if not backward_edges(fallback):

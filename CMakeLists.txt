@@ -627,6 +627,8 @@ if(TOYCC_BUILD_TESTS)
           --compiler "$<TARGET_FILE:toycc>"
           --case
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_polynomial_accumulator_summary.c"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_straight_loop_cleanup_summary.c"
           --must-keep-case
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/polynomial_geometric_safety.c"
           --must-keep-case

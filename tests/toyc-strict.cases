@@ -93,6 +93,7 @@ perf/t_nested_reset_affine_summary.c
 perf/t_leading_break_affine_summary.c
 perf/t_periodic_affine_branch.c
 perf/t_polynomial_accumulator_summary.c
+perf/t_straight_loop_cleanup_summary.c
 perf/t_quotient_accumulator_summary.c
 perf/t_periodic_accumulator_summary.c
 perf/t_invariant_offset_remainder_summary.c
