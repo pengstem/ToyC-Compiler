@@ -307,6 +307,34 @@ void testIR_arithmetic() {
   }
 }
 
+void testIR_algebraicIdentities() {
+  testHeader("IR: same-value algebraic identities");
+  auto comp = makeCompUnit();
+  auto zeroTerms =
+      makeBinary(BinOp::ADD,
+                 makeBinary(BinOp::ADD, makeBinary(BinOp::SUB, makeVar("x"), makeVar("x")),
+                            makeBinary(BinOp::MOD, makeVar("x"), makeVar("x"))),
+                 makeBinary(BinOp::LT, makeVar("x"), makeVar("x")));
+  auto oneTerms =
+      makeBinary(BinOp::ADD,
+                 makeBinary(BinOp::ADD, makeBinary(BinOp::DIV, makeVar("x"), makeVar("x")),
+                            makeBinary(BinOp::EQ, makeVar("x"), makeVar("x"))),
+                 makeBinary(BinOp::GE, makeVar("x"), makeVar("x")));
+  comp->globalDecls.push_back(makeFuncDef(
+      Type::INT, "f", {makeParam(Type::INT, "x")},
+      makeBlock({makeReturn(makeBinary(BinOp::ADD, std::move(zeroTerms), std::move(oneTerms)))})));
+  SemanticAnalyzer sema;
+  sema.analyze(*comp);
+  IRGenerator irGen(sema.getSymbolTable());
+  auto ir = irGen.generate(*comp, IRStage::OPTIMIZED);
+  if (irContains(ir, "RETURN #3") && !irContains(ir, "DIV") && !irContains(ir, "MOD") &&
+      !irContains(ir, "LT") && !irContains(ir, "EQ") && !irContains(ir, "GE")) {
+    testPass();
+  } else {
+    testFail("algebraic identity folding mismatch:\n" + irToString(ir));
+  }
+}
+
 void testIR_shortCircuitAnd() {
   testHeader("IR: short-circuit && (1 && 0)");
   auto comp = makeCompUnit();
@@ -1417,6 +1445,7 @@ int main() {
   std::cout << "\n--- IR 生成: 基础 ---\n";
   testIR_simpleReturn();
   testIR_arithmetic();
+  testIR_algebraicIdentities();
   testIR_emptyExprStmt();
   testIR_exprAsStmt();
 

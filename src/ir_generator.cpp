@@ -367,6 +367,27 @@ Operand IRGenerator::genExpr(Expr* expr) {
     }
 
     // 代数简化：避免无意义的运行时运算
+    const bool sameValue =
+        lhsVal.type == rhsVal.type && ((lhsVal.isLocalVar() && lhsVal.name == rhsVal.name) ||
+                                       (lhsVal.isGlobalVar() && lhsVal.name == rhsVal.name));
+    if (sameValue) {
+      switch (binaryExpr->op) {
+      case BinOp::SUB:
+      case BinOp::MOD:
+      case BinOp::LT:
+      case BinOp::GT:
+      case BinOp::NE:
+        return Operand::imm(0);
+      case BinOp::DIV:
+      case BinOp::LE:
+      case BinOp::GE:
+      case BinOp::EQ:
+        // ToyC 性能用例保证没有除零等未定义行为，因此执行到 x/x 时 x != 0。
+        return Operand::imm(1);
+      default:
+        break;
+      }
+    }
     switch (binaryExpr->op) {
     case BinOp::ADD:
       // x + 0 = x, 0 + x = x
@@ -391,15 +412,30 @@ Operand IRGenerator::genExpr(Expr* expr) {
         return lhsVal;
       if (lhsVal.isImm() && lhsVal.immVal == 1)
         return rhsVal;
+      // x * -1 = -x, -1 * x = -x
+      if (rhsVal.isImm() && rhsVal.immVal == -1) {
+        Operand result = Operand::localVar(newTemp());
+        emit(IROp::SUB, result, Operand::imm(0), lhsVal);
+        return result;
+      }
+      if (lhsVal.isImm() && lhsVal.immVal == -1) {
+        Operand result = Operand::localVar(newTemp());
+        emit(IROp::SUB, result, Operand::imm(0), rhsVal);
+        return result;
+      }
       break;
     case BinOp::DIV:
       // x / 1 = x
       if (rhsVal.isImm() && rhsVal.immVal == 1)
         return lhsVal;
+      // 0 / x = 0（执行到此处时由 ToyC 的无未定义行为约束知 x != 0）
+      if (lhsVal.isImm() && lhsVal.immVal == 0)
+        return Operand::imm(0);
       break;
     case BinOp::MOD:
-      // x % 1 = 0
-      if (rhsVal.isImm() && rhsVal.immVal == 1)
+      // x % ±1 = 0；0 % x = 0（后者同样依赖除数非零约束）
+      if ((rhsVal.isImm() && (rhsVal.immVal == 1 || rhsVal.immVal == -1)) ||
+          (lhsVal.isImm() && lhsVal.immVal == 0))
         return Operand::imm(0);
       break;
     default:
@@ -1554,6 +1590,38 @@ void IRGenerator::optimizePass() {
         if (!isCombinableOp(inst.op) || inst.op == IROp::NOT) {
           continue;
         }
+        const bool sameValue = inst.src1.type == inst.src2.type &&
+                               ((inst.src1.isLocalVar() && inst.src1.name == inst.src2.name) ||
+                                (inst.src1.isGlobalVar() && inst.src1.name == inst.src2.name));
+        if (sameValue) {
+          int result = 0;
+          bool foldIdentity = true;
+          switch (inst.op) {
+          case IROp::SUB:
+          case IROp::MOD:
+          case IROp::LT:
+          case IROp::GT:
+          case IROp::NE:
+            result = 0;
+            break;
+          case IROp::DIV:
+          case IROp::LE:
+          case IROp::GE:
+          case IROp::EQ:
+            result = 1;
+            break;
+          default:
+            foldIdentity = false;
+            break;
+          }
+          if (foldIdentity) {
+            inst.op = IROp::ASSIGN;
+            inst.src1 = Operand::imm(result);
+            inst.src2 = Operand::none();
+            changed = true;
+            continue;
+          }
+        }
         // x + 0 = x, 0 + x = x
         if (inst.op == IROp::ADD) {
           if (inst.src2.isImm() && inst.src2.immVal == 0) {
@@ -1590,10 +1658,25 @@ void IRGenerator::optimizePass() {
             inst.src1 = inst.src2;
             inst.src2 = Operand::none();
             changed = true;
+          } else if (inst.src2.isImm() && inst.src2.immVal == -1) {
+            inst.op = IROp::SUB;
+            inst.src2 = inst.src1;
+            inst.src1 = Operand::imm(0);
+            changed = true;
+          } else if (inst.src1.isImm() && inst.src1.immVal == -1) {
+            inst.op = IROp::SUB;
+            inst.src1 = Operand::imm(0);
+            changed = true;
           }
         }
         // x / 1 = x
         if (inst.op == IROp::DIV && inst.src2.isImm() && inst.src2.immVal == 1) {
+          inst.op = IROp::ASSIGN;
+          inst.src2 = Operand::none();
+          changed = true;
+        }
+        // 0 / x = 0；输入程序保证执行路径上除数非零。
+        if (inst.op == IROp::DIV && inst.src1.isImm() && inst.src1.immVal == 0) {
           inst.op = IROp::ASSIGN;
           inst.src2 = Operand::none();
           changed = true;
@@ -1609,6 +1692,11 @@ void IRGenerator::optimizePass() {
         if (inst.op == IROp::MOD && inst.src2.isImm() && inst.src2.immVal == -1) {
           inst.op = IROp::ASSIGN;
           inst.src1 = Operand::imm(0);
+          inst.src2 = Operand::none();
+          changed = true;
+        }
+        if (inst.op == IROp::MOD && inst.src1.isImm() && inst.src1.immVal == 0) {
+          inst.op = IROp::ASSIGN;
           inst.src2 = Operand::none();
           changed = true;
         }
