@@ -27,6 +27,8 @@ def main() -> int:
         raise RuntimeError(process.stderr.decode(errors="replace"))
 
     assembly = process.stdout.decode(errors="replace")
+    if re.search(r"(?m)^\s*(?:sw|lw)\s+ra\b", assembly):
+        raise RuntimeError("leaf matrix function still saves an unmodified return address")
     match = re.search(r"(?ms)^L1:\n(.*?)^L0:\n", assembly)
     if match is None:
         raise RuntimeError("matrix stress case no longer contains its runtime loop")
