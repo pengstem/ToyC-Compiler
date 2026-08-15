@@ -101,6 +101,7 @@ perf/t_periodic_affine_branch_large_period.c
 perf/t_threshold_affine_branch.c
 perf/t_loop_weighted_regalloc.c
 perf/t_large_hot_helper.c
+perf/t_local_value_numbering.c
 perf/t_matrix_register_pressure.c
 perf/t_dead_recurrence_loop.c
 perf/t_dead_pure_call_loop.c

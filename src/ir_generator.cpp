@@ -1710,21 +1710,33 @@ void IRGenerator::optimizePass() {
 
     // Pass 1.5: 公共子表达式消除（基本块内）
     // 在无控制流的直线代码段内，若 (op, src1, src2) 已计算过且操作数未在块内被重新定义，
-    // 则复用之前的结果。用户变量可被重新赋值，须跟踪重定义并使相关条目失效。
+    // 则复用之前的结果。Pass 1 会把 `OP tmp; ASSIGN local, tmp` 合并为直接写
+    // local，因此这里不能只缓存 t%d 临时；用户局部变量同样可以承载可复用值。
+    // 对 ADD/MUL/EQ/NE 规范化操作数顺序，使 `x+y` 与 `y+x` 共享同一值编号。
     {
       std::unordered_map<std::string, std::string> rename;   // 原名 → 复用名（仅临时变量）
       std::unordered_map<std::string, std::string> valueMap; // (op,src1,src2) → 结果变量
       std::unordered_map<std::string, std::vector<std::string>> varKeys; // 变量 → 引用它的 key
       std::vector<IRInst> optimized;
+      bool cseChanged = false;
       auto invalidateVar = [&](const std::string& name) {
         auto it = varKeys.find(name);
-        if (it == varKeys.end()) {
-          return;
+        if (it != varKeys.end()) {
+          for (const auto& key : it->second) {
+            valueMap.erase(key);
+          }
+          varKeys.erase(it);
         }
-        for (const auto& key : it->second) {
-          valueMap.erase(key);
+
+        // name 也可能是某个已缓存表达式的结果。结果寄存位置被覆盖后，
+        // 即使表达式的输入都没变，也不能继续从 name 取旧值。
+        for (auto value = valueMap.begin(); value != valueMap.end();) {
+          if (value->second == name) {
+            value = valueMap.erase(value);
+          } else {
+            ++value;
+          }
         }
-        varKeys.erase(it);
       };
       for (const auto& inst : ir) {
         // 控制流/调用/内存边界：重置所有映射（保守处理）
@@ -1733,6 +1745,7 @@ void IRGenerator::optimizePass() {
             inst.op == IROp::STORE || inst.op == IROp::RETURN || inst.op == IROp::PARAM) {
           valueMap.clear();
           varKeys.clear();
+          rename.clear();
         }
         IRInst cur = inst;
         // 源操作数重命名
@@ -1740,31 +1753,60 @@ void IRGenerator::optimizePass() {
           auto it = rename.find(cur.src1.name);
           if (it != rename.end()) {
             cur.src1 = Operand::localVar(it->second);
+            cseChanged = true;
           }
         }
         if (cur.src2.isLocalVar()) {
           auto it = rename.find(cur.src2.name);
           if (it != rename.end()) {
             cur.src2 = Operand::localVar(it->second);
+            cseChanged = true;
           }
         }
         // 本指令定义变量：使引用该变量的 CSE 条目失效（其值已变化）
-        if (cur.dest.isLocalVar()) {
+        const bool definesLocal =
+            cur.dest.isLocalVar() && cur.op != IROp::RETURN && cur.op != IROp::PARAM;
+        if (definesLocal) {
+          rename.erase(cur.dest.name);
+          for (auto alias = rename.begin(); alias != rename.end();) {
+            if (alias->second == cur.dest.name) {
+              alias = rename.erase(alias);
+            } else {
+              ++alias;
+            }
+          }
           invalidateVar(cur.dest.name);
         }
-        if (isCombinableOp(cur.op) && cur.dest.isLocalVar() && isTempName(cur.dest.name) &&
-            cur.op != IROp::NOT && cur.src1.type != OperandType::NONE &&
-            cur.src2.type != OperandType::NONE && (cur.src1.isLocalVar() || cur.src1.isImm()) &&
+        if (isCombinableOp(cur.op) && cur.dest.isLocalVar() && cur.op != IROp::NOT &&
+            cur.src1.type != OperandType::NONE && cur.src2.type != OperandType::NONE &&
+            (cur.src1.isLocalVar() || cur.src1.isImm()) &&
             (cur.src2.isLocalVar() || cur.src2.isImm())) {
-          const std::string key =
-              std::string(irOpToString(cur.op)) + "|" +
-              (cur.src1.isImm() ? std::to_string(cur.src1.immVal) : cur.src1.name) + "|" +
-              (cur.src2.isImm() ? std::to_string(cur.src2.immVal) : cur.src2.name);
+          const auto operandKey = [](const Operand& operand) {
+            return operand.isImm() ? "#" + std::to_string(operand.immVal) : "%" + operand.name;
+          };
+          std::string lhsKey = operandKey(cur.src1);
+          std::string rhsKey = operandKey(cur.src2);
+          const bool commutative = cur.op == IROp::ADD || cur.op == IROp::MUL ||
+                                   cur.op == IROp::EQ || cur.op == IROp::NE;
+          if (commutative && rhsKey < lhsKey) {
+            std::swap(lhsKey, rhsKey);
+          }
+          const std::string key = std::string(irOpToString(cur.op)) + "|" + lhsKey + "|" + rhsKey;
           auto it = valueMap.find(key);
           if (it != valueMap.end()) {
-            rename[cur.dest.name] = it->second;
+            // 保留一条显式复制，避免已有结果变量在冗余表达式的使用点之前
+            // 被覆盖时留下悬垂别名。下一轮块内复制传播会把紧随的使用直接
+            // 改到已有结果，并由 DCE 删除这条 ASSIGN。
+            cur.op = IROp::ASSIGN;
+            cur.src1 = Operand::localVar(it->second);
+            cur.src2 = Operand::none();
+            if (isTempName(cur.dest.name)) {
+              rename[cur.dest.name] = it->second;
+            }
+            optimized.push_back(std::move(cur));
             changed = true;
-            continue; // 冗余指令不再发射
+            cseChanged = true;
+            continue;
           }
           valueMap[key] = cur.dest.name;
           if (cur.src1.isLocalVar()) {
@@ -1776,7 +1818,7 @@ void IRGenerator::optimizePass() {
         }
         optimized.push_back(cur);
       }
-      if (ir.size() != optimized.size()) {
+      if (cseChanged || ir.size() != optimized.size()) {
         ir = std::move(optimized);
       }
     }
