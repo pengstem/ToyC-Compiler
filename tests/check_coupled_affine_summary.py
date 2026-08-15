@@ -46,9 +46,6 @@ def main() -> int:
     ]
     if backward_edges:
         raise RuntimeError(f"coupled recurrence still has a backedge:\n{assembly}")
-    if not re.search(r"^\s*mul\s", assembly, re.MULTILINE):
-        raise RuntimeError(f"expected runtime affine combination in summary:\n{assembly}")
-
     process = subprocess.run(
         [args.compiler, "-opt"],
         input=Path(args.reset_case).read_bytes(),

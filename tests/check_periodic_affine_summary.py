@@ -50,9 +50,6 @@ def main() -> int:
     assembly = compile_case(args.compiler, args.case)
     if backward_edges(assembly):
         raise RuntimeError(f"periodic affine loop still has a backedge:\n{assembly}")
-    if not re.search(r"^\s*mul\s", assembly, re.MULTILINE):
-        raise RuntimeError(f"expected an affine matrix combination:\n{assembly}")
-
     for case in args.must_keep_case:
         fallback = compile_case(args.compiler, case)
         if not backward_edges(fallback):

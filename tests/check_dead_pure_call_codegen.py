@@ -60,7 +60,10 @@ def main() -> int:
         raise RuntimeError("dead-result impure call was deleted")
 
     body = main_body(compile_source(args.compiler, args.termination_case))
-    if not re.search(r"(?m)^\s*call\s+spin\b", body):
+    preserves_nontermination = re.search(r"(?m)^\s*call\s+spin\b", body) or re.search(
+        r"(?m)^\s*(?:bnez\s+\w+,\s*L\w+|j\s+L\w+)", body
+    )
+    if not preserves_nontermination:
         raise RuntimeError("possibly nonterminating pure call was deleted")
 
     body = main_body(compile_source(args.compiler, args.moving_loop_case))

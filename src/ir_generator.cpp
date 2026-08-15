@@ -74,6 +74,10 @@ std::vector<IRInst> IRGenerator::generate(CompUnit& compUnit, IRStage stage) {
   }
   if (stage == IRStage::OPTIMIZED) {
     optimizePass();
+    // 首轮传播会把 `int n = 1000000; helper(n)` 的 PARAM 化成立即数；再做
+    // 一轮受预算内联，可让多个常量调用点获得专门化后的循环摘要机会。
+    inlinePass();
+    optimizePass();
   }
 
   return ir;
@@ -679,6 +683,7 @@ void IRGenerator::inlinePass() {
   // 单一调用点的非递归 helper 内联后不会复制代码，却能把 main 中的常量
   // 实参送进其循环条件，继而触发循环摘要和其它跨调用优化。
   constexpr std::size_t kSingleCallInlineLimit = 512;
+  constexpr std::size_t kConstantCallInlineLimit = 256;
 
   // 多轮迭代：内联可能引入新的可内联调用（如 f(g(x))）。
   // 每轮重新收集函数区间，因为前一轮的内联替换会使旧下标失效。
@@ -823,7 +828,18 @@ void IRGenerator::inlinePass() {
         continue;
       const bool hotCall = isLoopCall(ci);
       const bool singleCall = callCounts[callee] == 1;
+      std::size_t argumentStart = ci;
+      while (argumentStart > 0 && ir[argumentStart - 1].op == IROp::PARAM) {
+        --argumentStart;
+      }
+      bool constantCall = ci - argumentStart == static_cast<std::size_t>(f.paramCount);
+      for (std::size_t k = argumentStart; k < ci && constantCall; ++k) {
+        constantCall = ir[k].dest.isImm();
+      }
       std::size_t inlineLimit = singleCall ? kSingleCallInlineLimit : kInlineLimit;
+      if (constantCall) {
+        inlineLimit = std::max(inlineLimit, kConstantCallInlineLimit);
+      }
       if (hotCall) {
         inlineLimit = std::max(inlineLimit, kLoopInlineLimit);
       }
@@ -839,7 +855,9 @@ void IRGenerator::inlinePass() {
           break;
         }
       }
-      if (singleCall && calleeBodySize > kInlineLimit && hasUnconditionalBackedge) {
+      const bool expandedInlining =
+          calleeBodySize > kInlineLimit && (singleCall || constantCall || hotCall);
+      if (expandedInlining && hasUnconditionalBackedge) {
         continue;
       }
       const auto callResultIsUsed = [&]() {
@@ -872,7 +890,7 @@ void IRGenerator::inlinePass() {
         }
         return false;
       };
-      if (singleCall && calleeBodySize > kInlineLimit && !callResultIsUsed()) {
+      if (expandedInlining && !callResultIsUsed()) {
         continue;
       }
       if (calleeBodySize > inlineLimit)
