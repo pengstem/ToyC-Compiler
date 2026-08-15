@@ -15,5 +15,20 @@ int main() {
     c = next_c;
     i = i + 3;
   }
-  return (a + b + c + i) % 251;
+  int first = (a + b + c + i) % 251;
+
+  a = 4;
+  b = 5;
+  c = 6;
+  int j = 10000000;
+  while (j > 1) {
+    int next_a = (a * 7 + b * 11 + c * 13) % 10007;
+    int next_b = (a * 17 + b * 19 + c * 23) % 10007;
+    int next_c = (a * 29 + b * 31 + c * 37) % 10007;
+    a = next_a;
+    b = next_b;
+    c = next_c;
+    j = j - 3;
+  }
+  return (first + a + b + c + j) % 251;
 }

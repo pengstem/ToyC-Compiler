@@ -6485,7 +6485,8 @@ void IRGenerator::optimizePass() {
           }
           const IRInst& condition = ir[condIndex + 1];
           const IRInst& backedge = ir[condIndex + 2];
-          if ((condition.op != IROp::LT && condition.op != IROp::LE) ||
+          if ((condition.op != IROp::LT && condition.op != IROp::LE &&
+               condition.op != IROp::GT && condition.op != IROp::GE) ||
               !condition.dest.isLocalVar() || !condition.src1.isLocalVar() ||
               backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
               backedge.dest.name != bodyLabel || !backedge.src1.isLocalVar() ||
@@ -6819,22 +6820,35 @@ void IRGenerator::optimizePass() {
             continue;
           }
 
-          // 常量正步长的单调循环。按源比较关系精确计算迭代次数，并验证最后一次
+          // 常量步长的单调循环。按源比较关系精确计算迭代次数，并验证最后一次
           // 归纳更新仍在 int32 范围内；越过边界会溢出的循环必须保留原形。
-          if (inductionStep <= 0) {
+          const bool increasingRelation = condition.op == IROp::LT || condition.op == IROp::LE;
+          const bool decreasingRelation = condition.op == IROp::GT || condition.op == IROp::GE;
+          if ((increasingRelation && inductionStep <= 0) ||
+              (decreasingRelation && inductionStep >= 0)) {
             continue;
           }
           const std::int64_t startValue = *initial;
           const std::int64_t boundValue = *upper;
-          const bool loopRuns = condition.op == IROp::LT ? startValue < boundValue
-                                                         : startValue <= boundValue;
+          const bool loopRuns = condition.op == IROp::LT   ? startValue < boundValue
+                                : condition.op == IROp::LE ? startValue <= boundValue
+                                : condition.op == IROp::GT ? startValue > boundValue
+                                                          : startValue >= boundValue;
           std::uint64_t trips = 0;
           if (loopRuns) {
-            const std::uint64_t distance =
-                static_cast<std::uint64_t>(boundValue - startValue);
-            const std::uint64_t step = static_cast<std::uint64_t>(inductionStep);
-            trips = condition.op == IROp::LT ? (distance + step - 1) / step
-                                             : distance / step + 1;
+            if (increasingRelation) {
+              const std::uint64_t distance =
+                  static_cast<std::uint64_t>(boundValue - startValue);
+              const std::uint64_t step = static_cast<std::uint64_t>(inductionStep);
+              trips = condition.op == IROp::LT ? (distance + step - 1) / step
+                                               : distance / step + 1;
+            } else {
+              const std::uint64_t distance =
+                  static_cast<std::uint64_t>(startValue - boundValue);
+              const std::uint64_t step = static_cast<std::uint64_t>(-inductionStep);
+              trips = condition.op == IROp::GT ? (distance + step - 1) / step
+                                               : distance / step + 1;
+            }
           }
           const std::int64_t finalInduction =
               startValue + static_cast<std::int64_t>(trips) * inductionStep;
