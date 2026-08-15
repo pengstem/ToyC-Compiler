@@ -718,8 +718,8 @@ void IRGenerator::inlinePass() {
   constexpr std::size_t kLoopInlineLimit = 160;
   // 单一调用点的非递归 helper 内联后不会复制代码，却能把 main 中的常量
   // 实参送进其循环条件，继而触发循环摘要和其它跨调用优化。
-  constexpr std::size_t kSingleCallInlineLimit = 512;
-  constexpr std::size_t kConstantCallInlineLimit = 256;
+  constexpr std::size_t kSingleCallInlineLimit = 2048;
+  constexpr std::size_t kConstantCallInlineLimit = 2048;
 
   // 多轮迭代：内联可能引入新的可内联调用（如 f(g(x))）。
   // 每轮重新收集函数区间，因为前一轮的内联替换会使旧下标失效。
@@ -6411,10 +6411,9 @@ void IRGenerator::optimizePass() {
     // 结果仍是普通的 RV32 三地址算术；循环有分支、调用、全局状态、可变上界，
     // 或归纳变量不是严格 +1 时均不应用。
     {
-      // 覆盖 8x8 一类标量化状态以及少量表达式临时量，同时给 O(n^3)
-      // 矩阵乘法保留明确的编译时上限。96 维在快速幂的编译时预算内，且避免
-      // 宽耦合状态仅因超过旧 48 维阈值而退回执行数百万次源循环。
-      constexpr std::size_t kMaxCoupledAffineVariables = 96;
+      // 覆盖百状态 helper 及其表达式临时量，同时给 O(n^3) 矩阵乘法保留
+      // 明确的编译时上限；超出预算仍保留源循环，避免无界快速幂消耗。
+      constexpr std::size_t kMaxCoupledAffineVariables = 384;
       using AffineRow = std::vector<std::uint32_t>;
       using AffineMatrix = std::vector<AffineRow>;
 

@@ -577,7 +577,7 @@ if(TOYCC_BUILD_TESTS)
       )
       set_tests_properties(toycc.perf.wide-coupled-affine-summary-codegen PROPERTIES
         LABELS "toycc;performance;codegen"
-        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+        TIMEOUT "30"
       )
 
       add_test(
