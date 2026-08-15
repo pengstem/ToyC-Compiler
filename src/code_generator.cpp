@@ -25,6 +25,10 @@ int alignTo(int value, int alignment) {
   return value + alignment - remainder;
 }
 
+bool fitsSigned12(int value) {
+  return value >= -2048 && value <= 2047;
+}
+
 // Hacker's Delight magc：计算正数除数 d（2 <= d <= 2^31-1，非 2 的幂）的
 // magic number M 与 shift s，使 q = (mulh(x,M) [+ x]) >> s - (x>>31) 等于 x/d。
 bool computeSignedDivMagic(int32_t d, uint32_t& magic, int32_t& shift) {
@@ -832,16 +836,26 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
     }
   }
 
-  // 已分配寄存器（s 或 t）的局部变量无需栈槽：紧凑重编号，只统计未分配寄存器的变量
-  int stackSlotCount = 0;
+  // 已分配寄存器（s 或 t）的局部变量无需栈槽。其余变量按动态使用权重重排：
+  // 最热的溢出值靠近 s0，既稳定输出，也尽量让循环内访存使用单条 12 位 lw/sw。
+  std::vector<std::pair<std::string, int>> spilledLocals;
   for (auto& entry : frame.localOffsets) {
     if (frame.regAlloc.find(entry.first) != frame.regAlloc.end() ||
         frame.tempRegs.find(entry.first) != frame.tempRegs.end() ||
         frame.leafRegAlloc.find(entry.first) != frame.leafRegAlloc.end()) {
       entry.second = -1; // 标记：无栈槽
     } else {
-      entry.second = stackSlotCount++;
+      spilledLocals.emplace_back(entry.first, entry.second);
     }
+  }
+  std::stable_sort(
+      spilledLocals.begin(), spilledLocals.end(), [&](const auto& lhs, const auto& rhs) {
+        const std::uint64_t lhsWeight = useWeight[lhs.first];
+        const std::uint64_t rhsWeight = useWeight[rhs.first];
+        return lhsWeight != rhsWeight ? lhsWeight > rhsWeight : lhs.second < rhs.second;
+      });
+  for (std::size_t index = 0; index < spilledLocals.size(); ++index) {
+    frame.localOffsets[spilledLocals[index].first] = static_cast<int>(index);
   }
 
   // 统计实际被指令引用的 s 寄存器（避免保存未使用的寄存器，精简 prologue/epilogue）
@@ -888,7 +902,7 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
     }
   }
 
-  frame.localBytes = stackSlotCount * kWordBytes;
+  frame.localBytes = static_cast<int>(spilledLocals.size()) * kWordBytes;
   frame.outgoingArgumentBytes = maxOverflowArgs * kWordBytes;
   return frame;
 }
@@ -1049,9 +1063,9 @@ std::size_t CodeGenerator::generateInstruction(std::size_t index, std::size_t en
           const int stackOffset = (currentParamIndex_ - 8) * kWordBytes;
           const std::string destReg = regForVar(inst.dest.name);
           if (!destReg.empty()) {
-            emit(out, "lw", destReg + ", " + std::to_string(stackOffset) + "(s0)");
+            emitLoadFromAddress(destReg, "s0", stackOffset, out);
           } else {
-            emit(out, "lw", "t0, " + std::to_string(stackOffset) + "(s0)");
+            emitLoadFromAddress("t0", "s0", stackOffset, out);
             storeOperand("t0", inst.dest, out);
           }
         }
@@ -1111,7 +1125,7 @@ std::size_t CodeGenerator::generateInstruction(std::size_t index, std::size_t en
       } else {
         loadOperand(inst.dest, "t0", out);
       }
-      emit(out, "sw", "t0, " + std::to_string(stackOffset) + "(sp)");
+      emitStoreToAddress("t0", "sp", stackOffset, out);
     }
     break;
   }
@@ -1226,14 +1240,19 @@ void CodeGenerator::emitPrologue(const StackFrame& frame, std::ostream& out) con
   if (frameSize == 0) {
     return;
   }
-  emit(out, "addi", "sp, sp, -" + std::to_string(frameSize));
+  adjustStackPointer(-frameSize, out);
   // 在更新 s0 之前保存 ra 和旧 s0（使用 sp 相对偏移）
   if (frame.hasCall) {
-    emit(out, "sw", "ra, " + std::to_string(frameSize - 4) + "(sp)");
+    emitStoreToAddress("ra", "sp", frameSize - 4, out);
   }
-  emit(out, "sw", "s0, " + std::to_string(frameSize - 8) + "(sp)");
+  emitStoreToAddress("s0", "sp", frameSize - 8, out);
   // 设置新帧指针
-  emit(out, "addi", "s0, sp, " + std::to_string(frameSize));
+  if (fitsSigned12(frameSize)) {
+    emit(out, "addi", "s0, sp, " + std::to_string(frameSize));
+  } else {
+    emit(out, "li", "t2, " + std::to_string(frameSize));
+    emit(out, "add", "s0, sp, t2");
+  }
 
   int saveOffset = -12;
   for (const auto& reg : frame.usedCalleeSavedRegisters) {
@@ -1256,7 +1275,7 @@ void CodeGenerator::emitEpilogue(const StackFrame& frame, std::ostream& out) con
     emit(out, "lw", "ra, -4(s0)");
   }
   emit(out, "lw", "s0, -8(s0)");
-  emit(out, "addi", "sp, sp, " + std::to_string(frame.frameSizeBytes()));
+  adjustStackPointer(frame.frameSizeBytes(), out);
   emit(out, "ret", "");
 }
 
@@ -1550,6 +1569,41 @@ void CodeGenerator::emitLoadImmediate(int value, std::string_view reg, std::ostr
   emit(out, "li", std::string(reg) + ", " + std::to_string(value));
 }
 
+void CodeGenerator::emitLoadFromAddress(std::string_view reg, std::string_view base, int offset,
+                                        std::ostream& out) const {
+  if (fitsSigned12(offset)) {
+    emit(out, "lw",
+         std::string(reg) + ", " + std::to_string(offset) + "(" + std::string(base) + ")");
+    return;
+  }
+  const std::string scratch = reg == "t2" ? "t1" : "t2";
+  emit(out, "li", scratch + ", " + std::to_string(offset));
+  emit(out, "add", scratch + ", " + std::string(base) + ", " + scratch);
+  emit(out, "lw", std::string(reg) + ", 0(" + scratch + ")");
+}
+
+void CodeGenerator::emitStoreToAddress(std::string_view reg, std::string_view base, int offset,
+                                       std::ostream& out) const {
+  if (fitsSigned12(offset)) {
+    emit(out, "sw",
+         std::string(reg) + ", " + std::to_string(offset) + "(" + std::string(base) + ")");
+    return;
+  }
+  const std::string scratch = reg == "t2" ? "t1" : "t2";
+  emit(out, "li", scratch + ", " + std::to_string(offset));
+  emit(out, "add", scratch + ", " + std::string(base) + ", " + scratch);
+  emit(out, "sw", std::string(reg) + ", 0(" + scratch + ")");
+}
+
+void CodeGenerator::adjustStackPointer(int amount, std::ostream& out) const {
+  if (fitsSigned12(amount)) {
+    emit(out, "addi", "sp, sp, " + std::to_string(amount));
+    return;
+  }
+  emit(out, "li", "t2, " + std::to_string(amount));
+  emit(out, "add", "sp, sp, t2");
+}
+
 void CodeGenerator::loadOperand(const Operand& operand, std::string_view reg, std::ostream& out) {
   if (operand.type == OperandType::IMM) {
     emitLoadImmediate(operand.immVal, reg, out);
@@ -1567,7 +1621,7 @@ void CodeGenerator::loadOperand(const Operand& operand, std::string_view reg, st
     }
     // 否则从栈上加载
     const int offset = ensureLocalOffset(operand);
-    emit(out, "lw", std::string(reg) + ", " + std::to_string(offset) + "(s0)");
+    emitLoadFromAddress(reg, "s0", offset, out);
     return;
   }
 
@@ -1608,7 +1662,7 @@ void CodeGenerator::storeOperand(std::string_view reg, const Operand& operand, s
     }
     // 否则存到栈上
     const int offset = ensureLocalOffset(operand);
-    emit(out, "sw", std::string(reg) + ", " + std::to_string(offset) + "(s0)");
+    emitStoreToAddress(reg, "s0", offset, out);
     return;
   }
 
@@ -2392,7 +2446,7 @@ void CodeGenerator::emitTailCall(const TailCallInfo& tailCall, std::ostream& out
   }
   emit(out, "lw", "ra, -4(s0)");
   emit(out, "lw", "s0, -8(s0)");
-  emit(out, "addi", "sp, sp, " + std::to_string(frame_.frameSizeBytes()));
+  adjustStackPointer(frame_.frameSizeBytes(), out);
   emit(out, "j", tailCall.target);
 }
 

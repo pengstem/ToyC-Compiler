@@ -815,6 +815,20 @@ if(TOYCC_BUILD_TESTS)
       )
 
       add_test(
+        NAME toycc.large-stack-frame-regression
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_large_stack_frame.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --riscv-cc "${TOYCC_RISCV_CC}"
+          --qemu "${TOYCC_QEMU_RISCV32}"
+      )
+      set_tests_properties(toycc.large-stack-frame-regression PROPERTIES
+        LABELS "toycc;codegen;regression"
+        TIMEOUT 30
+      )
+
+      add_test(
         NAME toycc.perf.dead-loop-codegen
         COMMAND
           "${Python3_EXECUTABLE}"

@@ -99,6 +99,11 @@ private:
   void storeOperand(std::string_view reg, const Operand& operand, std::ostream& out);
   std::string regForConstant(int value) const;
   void emitLoadImmediate(int value, std::string_view reg, std::ostream& out) const;
+  void emitLoadFromAddress(std::string_view reg, std::string_view base, int offset,
+                           std::ostream& out) const;
+  void emitStoreToAddress(std::string_view reg, std::string_view base, int offset,
+                          std::ostream& out) const;
+  void adjustStackPointer(int amount, std::ostream& out) const;
   void emitBinaryOp(const IRInst& inst, std::ostream& out);
   // 比较指令：若结果临时仅被紧随其后的 BEQZ/BNEZ 使用，融合为条件分支（不落栈）
   std::size_t emitCompareOrFuse(std::size_t index, std::size_t end, std::ostream& out);
