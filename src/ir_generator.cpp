@@ -6411,9 +6411,10 @@ void IRGenerator::optimizePass() {
     // 结果仍是普通的 RV32 三地址算术；循环有分支、调用、全局状态、可变上界，
     // 或归纳变量不是严格 +1 时均不应用。
     {
-      // 覆盖 5x5/6x6 一类标量化状态以及少量表达式临时量，同时给 O(n^3)
-      // 矩阵乘法保留明确的编译时上限。
-      constexpr std::size_t kMaxCoupledAffineVariables = 48;
+      // 覆盖 8x8 一类标量化状态以及少量表达式临时量，同时给 O(n^3)
+      // 矩阵乘法保留明确的编译时上限。96 维在快速幂的编译时预算内，且避免
+      // 宽耦合状态仅因超过旧 48 维阈值而退回执行数百万次源循环。
+      constexpr std::size_t kMaxCoupledAffineVariables = 96;
       using AffineRow = std::vector<std::uint32_t>;
       using AffineMatrix = std::vector<AffineRow>;
 
