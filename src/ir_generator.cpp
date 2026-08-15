@@ -6550,17 +6550,7 @@ void IRGenerator::optimizePass() {
               upper = findUniqueConstant(condition.src2.name);
             }
           }
-          if (!initial || !upper ||
-              (condition.op == IROp::LE && *upper == INT32_MAX && *initial <= *upper)) {
-            continue;
-          }
-          std::int64_t trips = static_cast<std::int64_t>(*upper) - *initial;
-          if (condition.op == IROp::LE) {
-            ++trips;
-          }
-          trips = std::max<std::int64_t>(0, trips);
-          const std::int64_t finalInduction = static_cast<std::int64_t>(*initial) + trips;
-          if (trips < 2 || trips > INT32_MAX || finalInduction > INT32_MAX) {
+          if (!initial || !upper) {
             continue;
           }
 
@@ -6819,11 +6809,36 @@ void IRGenerator::optimizePass() {
 
           const std::size_t inductionIndex = variableIndex.at(induction);
           const AffineRow& inductionRow = transform[inductionIndex];
-          bool canonicalInduction = inductionRow[constantColumn] == 1;
+          const std::int64_t inductionStep =
+              static_cast<std::int32_t>(inductionRow[constantColumn]);
+          bool canonicalInduction = inductionStep != 0;
           for (std::size_t column = 0; column < constantColumn && canonicalInduction; ++column) {
             canonicalInduction = inductionRow[column] == (column == inductionIndex ? 1u : 0u);
           }
           if (!canonicalInduction) {
+            continue;
+          }
+
+          // 常量正步长的单调循环。按源比较关系精确计算迭代次数，并验证最后一次
+          // 归纳更新仍在 int32 范围内；越过边界会溢出的循环必须保留原形。
+          if (inductionStep <= 0) {
+            continue;
+          }
+          const std::int64_t startValue = *initial;
+          const std::int64_t boundValue = *upper;
+          const bool loopRuns = condition.op == IROp::LT ? startValue < boundValue
+                                                         : startValue <= boundValue;
+          std::uint64_t trips = 0;
+          if (loopRuns) {
+            const std::uint64_t distance =
+                static_cast<std::uint64_t>(boundValue - startValue);
+            const std::uint64_t step = static_cast<std::uint64_t>(inductionStep);
+            trips = condition.op == IROp::LT ? (distance + step - 1) / step
+                                             : distance / step + 1;
+          }
+          const std::int64_t finalInduction =
+              startValue + static_cast<std::int64_t>(trips) * inductionStep;
+          if (trips < 2 || finalInduction < INT32_MIN || finalInduction > INT32_MAX) {
             continue;
           }
 
