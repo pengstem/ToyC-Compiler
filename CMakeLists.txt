@@ -702,6 +702,22 @@ if(TOYCC_BUILD_TESTS)
       )
 
       add_test(
+        NAME toycc.perf.strided-remainder-floor-sum-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_invariant_offset_remainder_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_strided_remainder_floor_sum.c"
+          --negative-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/strided_remainder_negative_safety.c"
+      )
+      set_tests_properties(toycc.perf.strided-remainder-floor-sum-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
         NAME toycc.perf.invariant-empty-path-guard-codegen
         COMMAND
           "${Python3_EXECUTABLE}"

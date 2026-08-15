@@ -6558,6 +6558,662 @@ void IRGenerator::optimizePass() {
       }
     }
 
+    // Pass 5.566: 汇总等差数列取模的直线累加循环。
+    //
+    // 对 `sum += P(i) + (base + stride * i) % m`，先用 Faulhaber 的一次式
+    // 前缀和汇总 P，再用 Euclidean floor-sum 在 O(log m) 次运行时迭代内计算
+    // 余数和。base/stride 可以来自外层非负变量；不满足非负、无溢出、单一
+    // 累加器和规范 +1 归纳证明时保留原循环。
+    {
+      struct ProgressionExpr {
+        std::int64_t constant = 0;
+        std::int64_t induction = 0;
+        std::unordered_map<std::string, std::int64_t> invariants;
+        std::unordered_map<std::string, std::int64_t> invariantInduction;
+        std::int64_t remainder = 0;
+      };
+
+      const auto variableKey = [](const Operand& operand) -> std::optional<std::string> {
+        if (operand.isLocalVar())
+          return "L:" + operand.name;
+        if (operand.isGlobalVar())
+          return "G:" + operand.name;
+        return std::nullopt;
+      };
+      const auto addScaled = [](ProgressionExpr& destination, const ProgressionExpr& source,
+                                std::int64_t scale) {
+        const auto addMap = [scale](auto& target, const auto& values) {
+          for (const auto& [name, coefficient] : values) {
+            target[name] += coefficient * scale;
+            if (target[name] == 0)
+              target.erase(name);
+          }
+        };
+        destination.constant += source.constant * scale;
+        destination.induction += source.induction * scale;
+        destination.remainder += source.remainder * scale;
+        addMap(destination.invariants, source.invariants);
+        addMap(destination.invariantInduction, source.invariantInduction);
+      };
+      const auto isConstantExpr = [](const ProgressionExpr& expression) {
+        return expression.induction == 0 && expression.invariants.empty() &&
+               expression.invariantInduction.empty() && expression.remainder == 0;
+      };
+      const auto isPureInduction = [](const ProgressionExpr& expression) {
+        return expression.constant == 0 && expression.induction == 1 &&
+               expression.invariants.empty() && expression.invariantInduction.empty() &&
+               expression.remainder == 0;
+      };
+      const auto singleInvariant = [](const ProgressionExpr& expression)
+          -> std::optional<std::pair<std::string, std::int64_t>> {
+        if (expression.constant != 0 || expression.induction != 0 ||
+            expression.invariants.size() != 1 || !expression.invariantInduction.empty() ||
+            expression.remainder != 0) {
+          return std::nullopt;
+        }
+        return *expression.invariants.begin();
+      };
+
+      for (int summaryRound = 0; summaryRound < 8; ++summaryRound) {
+        std::unordered_map<std::string, std::size_t> labelPositions;
+        std::unordered_map<std::string, int> labelReferences;
+        for (std::size_t index = 0; index < ir.size(); ++index) {
+          if (ir[index].op == IROp::LABEL && ir[index].dest.isLabel()) {
+            labelPositions[ir[index].dest.name] = index;
+          }
+          if ((ir[index].op == IROp::BRANCH || ir[index].op == IROp::BEQZ ||
+               ir[index].op == IROp::BNEZ) &&
+              ir[index].dest.isLabel()) {
+            ++labelReferences[ir[index].dest.name];
+          }
+        }
+
+        bool summarized = false;
+        for (std::size_t loopStart = ir.size(); loopStart-- > 0 && !summarized;) {
+          if (ir[loopStart].op != IROp::BRANCH || !ir[loopStart].dest.isLabel() ||
+              loopStart + 1 >= ir.size() || ir[loopStart + 1].op != IROp::LABEL ||
+              !ir[loopStart + 1].dest.isLabel()) {
+            continue;
+          }
+          const std::string condLabel = ir[loopStart].dest.name;
+          const std::string bodyLabel = ir[loopStart + 1].dest.name;
+          if (labelReferences[condLabel] != 1 || labelReferences[bodyLabel] != 1)
+            continue;
+          const auto condFound = labelPositions.find(condLabel);
+          if (condFound == labelPositions.end() || condFound->second <= loopStart + 2)
+            continue;
+          const std::size_t condIndex = condFound->second;
+          if (condIndex + 2 >= ir.size())
+            continue;
+          const IRInst& condition = ir[condIndex + 1];
+          const IRInst& backedge = ir[condIndex + 2];
+          if ((condition.op != IROp::LT && condition.op != IROp::LE) ||
+              !condition.dest.isLocalVar() || !condition.src1.isLocalVar() ||
+              backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
+              backedge.dest.name != bodyLabel || !backedge.src1.isLocalVar() ||
+              backedge.src1.name != condition.dest.name) {
+            continue;
+          }
+          const std::string induction = condition.src1.name;
+          std::size_t functionBegin = loopStart;
+          while (functionBegin > 0 && ir[functionBegin].op != IROp::FUNC_BEGIN)
+            --functionBegin;
+          std::size_t functionEnd = condIndex + 3;
+          while (functionEnd < ir.size() && ir[functionEnd].op != IROp::FUNC_END)
+            ++functionEnd;
+
+          const auto findConstant = [&](const Operand& operand) -> std::optional<int> {
+            if (operand.isImm())
+              return operand.immVal;
+            const auto key = variableKey(operand);
+            if (!key)
+              return std::nullopt;
+            for (std::size_t position = loopStart; position > 0; --position) {
+              const IRInst& candidate = ir[position - 1];
+              if (variableKey(candidate.dest) == key && candidate.op != IROp::RETURN &&
+                  candidate.op != IROp::PARAM) {
+                if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL ||
+                     candidate.op == IROp::GLOBAL_VAR_DECL) &&
+                    candidate.src1.isImm()) {
+                  return candidate.src1.immVal;
+                }
+                return std::nullopt;
+              }
+              if (operand.isLocalVar() && candidate.op == IROp::FUNC_BEGIN)
+                break;
+            }
+            return std::nullopt;
+          };
+          const auto initial = findConstant(Operand::localVar(induction));
+          const auto upper = findConstant(condition.src2);
+          if (!initial || !upper || *initial < 0 ||
+              (condition.op == IROp::LE && *upper == INT32_MAX)) {
+            continue;
+          }
+          const std::int64_t trips = std::max<std::int64_t>(
+              0, static_cast<std::int64_t>(*upper) - *initial + (condition.op == IROp::LE ? 1 : 0));
+          if (trips < 4 || trips > INT32_MAX || trips * (trips - 1) > INT32_MAX) {
+            continue;
+          }
+
+          std::unordered_set<std::string> written;
+          std::unordered_set<std::string> iterationLocals;
+          for (std::size_t position = loopStart + 2; position < condIndex; ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone() && inst.dest.isLocalVar()) {
+              iterationLocals.insert(*variableKey(inst.dest));
+            }
+            if ((inst.dest.isLocalVar() || inst.dest.isGlobalVar()) && inst.op != IROp::RETURN &&
+                inst.op != IROp::PARAM && inst.op != IROp::LABEL && inst.op != IROp::BRANCH &&
+                inst.op != IROp::BEQZ && inst.op != IROp::BNEZ) {
+              written.insert(*variableKey(inst.dest));
+            }
+          }
+          if (condition.src2.isLocalVar() && written.count(*variableKey(condition.src2)) != 0) {
+            continue;
+          }
+
+          std::unordered_map<std::string, Operand> symbolOperands;
+          std::unordered_map<std::string, ProgressionExpr> values;
+          std::unordered_set<std::string> accumulatorCandidates;
+          std::optional<ProgressionExpr> remainderNumerator;
+          int modulus = 0;
+          bool bodySupported = true;
+          bool inductionIncremented = false;
+          int inductionWrites = 0;
+          const auto expressionOf = [&](const Operand& operand) -> ProgressionExpr {
+            ProgressionExpr expression;
+            if (operand.isImm()) {
+              expression.constant = operand.immVal;
+              return expression;
+            }
+            if (operand.isLocalVar() && operand.name == induction) {
+              expression.induction = 1;
+              return expression;
+            }
+            const auto key = variableKey(operand);
+            if (!key)
+              return expression;
+            const auto found = values.find(*key);
+            if (found != values.end())
+              return found->second;
+            expression.invariants[*key] = 1;
+            symbolOperands[*key] = operand;
+            return expression;
+          };
+
+          for (std::size_t position = loopStart + 2; position < condIndex && bodySupported;) {
+            const IRInst& inst = ir[position];
+            if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+              ++position;
+              continue;
+            }
+            if (position + 2 < condIndex && inst.op == IROp::DIV && inst.dest.isLocalVar() &&
+                inst.src2.isImm() && inst.src2.immVal > 1) {
+              const IRInst& product = ir[position + 1];
+              const IRInst& remainder = ir[position + 2];
+              const bool chain = product.op == IROp::MUL && product.dest.isLocalVar() &&
+                                 product.src1.isLocalVar() && product.src1.name == inst.dest.name &&
+                                 product.src2.isImm() && product.src2.immVal == inst.src2.immVal &&
+                                 remainder.op == IROp::SUB && remainder.dest.isLocalVar() &&
+                                 variableKey(remainder.src1) == variableKey(inst.src1) &&
+                                 remainder.src2.isLocalVar() &&
+                                 remainder.src2.name == product.dest.name;
+              if (chain && !remainderNumerator) {
+                ProgressionExpr numerator = expressionOf(inst.src1);
+                if (numerator.remainder == 0) {
+                  remainderNumerator = numerator;
+                  modulus = inst.src2.immVal;
+                  ProgressionExpr remainderValue;
+                  remainderValue.remainder = 1;
+                  const std::string remainderDestination = *variableKey(remainder.dest);
+                  values[remainderDestination] = remainderValue;
+                  if ((remainder.dest.isGlobalVar() ||
+                       (remainder.dest.isLocalVar() && !isCompilerTemp(remainder.dest.name))) &&
+                      iterationLocals.count(remainderDestination) == 0) {
+                    accumulatorCandidates.insert(remainderDestination);
+                    symbolOperands[remainderDestination] = remainder.dest;
+                  }
+                  position += 3;
+                  continue;
+                }
+              }
+            }
+            if ((inst.op == IROp::ADD || inst.op == IROp::SUB) && inst.dest.isLocalVar() &&
+                inst.dest.name == induction && inst.src1.isLocalVar() &&
+                inst.src1.name == induction && inst.src2.isImm()) {
+              ++inductionWrites;
+              inductionIncremented = inst.op == IROp::ADD && inst.src2.immVal == 1;
+              ++position;
+              continue;
+            }
+            if (inductionIncremented || !variableKey(inst.dest) ||
+                (inst.op != IROp::ASSIGN && inst.op != IROp::LOCAL_VAR_DECL &&
+                 inst.op != IROp::ADD && inst.op != IROp::SUB && inst.op != IROp::MUL)) {
+              bodySupported = false;
+              break;
+            }
+            const ProgressionExpr lhs = expressionOf(inst.src1);
+            ProgressionExpr result;
+            if (inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL) {
+              result = lhs;
+            } else {
+              const ProgressionExpr rhs = expressionOf(inst.src2);
+              if (inst.op == IROp::ADD || inst.op == IROp::SUB) {
+                result = lhs;
+                addScaled(result, rhs, inst.op == IROp::ADD ? 1 : -1);
+              } else if (isConstantExpr(lhs)) {
+                addScaled(result, rhs, lhs.constant);
+              } else if (isConstantExpr(rhs)) {
+                addScaled(result, lhs, rhs.constant);
+              } else if (isPureInduction(lhs)) {
+                const auto invariant = singleInvariant(rhs);
+                if (!invariant) {
+                  bodySupported = false;
+                  break;
+                }
+                result.invariantInduction[invariant->first] = invariant->second;
+              } else if (isPureInduction(rhs)) {
+                const auto invariant = singleInvariant(lhs);
+                if (!invariant) {
+                  bodySupported = false;
+                  break;
+                }
+                result.invariantInduction[invariant->first] = invariant->second;
+              } else {
+                bodySupported = false;
+                break;
+              }
+            }
+            const std::string destination = *variableKey(inst.dest);
+            values[destination] = result;
+            if ((inst.dest.isGlobalVar() ||
+                 (inst.dest.isLocalVar() && !isCompilerTemp(inst.dest.name))) &&
+                iterationLocals.count(destination) == 0 && destination != "L:" + induction) {
+              accumulatorCandidates.insert(destination);
+              symbolOperands[destination] = inst.dest;
+            }
+            ++position;
+          }
+          if (!bodySupported || inductionWrites != 1 || !inductionIncremented ||
+              !remainderNumerator || modulus <= 1) {
+            continue;
+          }
+
+          const std::size_t loopEnd = condIndex + 3;
+          const auto usedAfterLoop = [&](const std::string& key) {
+            for (std::size_t position = loopEnd; position < functionEnd; ++position) {
+              const IRInst& inst = ir[position];
+              if (variableKey(inst.src1) == key || variableKey(inst.src2) == key ||
+                  ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) &&
+                   variableKey(inst.dest) == key)) {
+                return true;
+              }
+            }
+            return false;
+          };
+          std::optional<std::string> accumulator;
+          ProgressionExpr delta;
+          for (const std::string& candidate : accumulatorCandidates) {
+            if (!usedAfterLoop(candidate))
+              continue;
+            const auto final = values.find(candidate);
+            if (final == values.end()) {
+              bodySupported = false;
+              break;
+            }
+            ProgressionExpr candidateDelta = final->second;
+            const auto self = candidateDelta.invariants.find(candidate);
+            if (self == candidateDelta.invariants.end() || self->second != 1 || accumulator) {
+              bodySupported = false;
+              break;
+            }
+            candidateDelta.invariants.erase(self);
+            for (const auto& [name, coefficient] : candidateDelta.invariants) {
+              (void) coefficient;
+              if (written.count(name) != 0)
+                bodySupported = false;
+            }
+            for (const auto& [name, coefficient] : candidateDelta.invariantInduction) {
+              (void) coefficient;
+              if (written.count(name) != 0)
+                bodySupported = false;
+            }
+            accumulator = candidate;
+            delta = std::move(candidateDelta);
+          }
+          if (!bodySupported || !accumulator || delta.remainder == 0)
+            continue;
+
+          std::unordered_map<std::string, int> nonNegativeMemo;
+          std::function<bool(const Operand&)> proveNonNegative;
+          proveNonNegative = [&](const Operand& operand) {
+            if (operand.isImm())
+              return operand.immVal >= 0;
+            const auto key = variableKey(operand);
+            if (!key)
+              return false;
+            const auto memo = nonNegativeMemo.find(*key);
+            if (memo != nonNegativeMemo.end())
+              return memo->second == 2;
+            nonNegativeMemo[*key] = 1;
+            bool ground = false;
+            bool saw = false;
+            for (std::size_t position = functionBegin; position < functionEnd; ++position) {
+              const IRInst& inst = ir[position];
+              if (variableKey(inst.dest) != key || inst.op == IROp::RETURN ||
+                  inst.op == IROp::PARAM ||
+                  (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone())) {
+                continue;
+              }
+              saw = true;
+              const auto safeOperand = [&](const Operand& value) {
+                if (variableKey(value) == key)
+                  return std::pair<bool, bool>{true, true};
+                return std::pair<bool, bool>{proveNonNegative(value), false};
+              };
+              const auto lhs = safeOperand(inst.src1);
+              const auto rhs = safeOperand(inst.src2);
+              bool safe = false;
+              bool self = lhs.second || rhs.second;
+              if (inst.op == IROp::ASSIGN || inst.op == IROp::LOCAL_VAR_DECL ||
+                  inst.op == IROp::GLOBAL_VAR_DECL) {
+                safe = lhs.first;
+                self = lhs.second;
+              } else if (inst.op == IROp::ADD || inst.op == IROp::MUL) {
+                safe = lhs.first && rhs.first;
+              } else if ((inst.op == IROp::DIV || inst.op == IROp::MOD) && lhs.first &&
+                         inst.src2.isImm() && inst.src2.immVal > 0) {
+                safe = true;
+              } else if (inst.op == IROp::LT || inst.op == IROp::GT || inst.op == IROp::LE ||
+                         inst.op == IROp::GE || inst.op == IROp::EQ || inst.op == IROp::NE ||
+                         inst.op == IROp::NOT) {
+                safe = true;
+                self = false;
+              }
+              if (!safe) {
+                nonNegativeMemo[*key] = 3;
+                return false;
+              }
+              if (!self)
+                ground = true;
+            }
+            const bool proven = saw && ground;
+            nonNegativeMemo[*key] = proven ? 2 : 3;
+            return proven;
+          };
+          const auto nonNegativeLinear = [&](const ProgressionExpr& expression) {
+            if (expression.constant < 0 || expression.induction < 0 || expression.remainder != 0)
+              return false;
+            for (const auto& [name, coefficient] : expression.invariants) {
+              if (coefficient < 0 || !proveNonNegative(symbolOperands[name]))
+                return false;
+            }
+            for (const auto& [name, coefficient] : expression.invariantInduction) {
+              if (coefficient < 0 || !proveNonNegative(symbolOperands[name]))
+                return false;
+            }
+            return true;
+          };
+          if (!nonNegativeLinear(*remainderNumerator) || trips * (modulus - 1LL) > INT32_MAX ||
+              (trips * (trips - 1) / 2) * (modulus - 1LL) > INT32_MAX) {
+            continue;
+          }
+
+          std::vector<IRInst> replacement;
+          const auto appendLinear = [&](std::int64_t constant,
+                                        const std::unordered_map<std::string, std::int64_t>& terms)
+              -> std::optional<Operand> {
+            if (constant < INT32_MIN || constant > INT32_MAX)
+              return std::nullopt;
+            Operand result = Operand::imm(static_cast<int>(constant));
+            bool hasValue = constant != 0;
+            for (const auto& [name, coefficient] : terms) {
+              if (coefficient == 0)
+                continue;
+              if (coefficient < INT32_MIN || coefficient > INT32_MAX)
+                return std::nullopt;
+              Operand term = symbolOperands[name];
+              if (coefficient != 1) {
+                const std::string product = newTemp();
+                replacement.emplace_back(IROp::MUL, Operand::localVar(product), term,
+                                         Operand::imm(static_cast<int>(coefficient)));
+                term = Operand::localVar(product);
+              }
+              if (!hasValue) {
+                result = term;
+                hasValue = true;
+              } else {
+                const std::string sum = newTemp();
+                replacement.emplace_back(IROp::ADD, Operand::localVar(sum), result, term);
+                result = Operand::localVar(sum);
+              }
+            }
+            return result;
+          };
+
+          ProgressionExpr baseExpression;
+          baseExpression.constant =
+              remainderNumerator->constant + remainderNumerator->induction * *initial;
+          baseExpression.invariants = remainderNumerator->invariants;
+          for (const auto& [name, coefficient] : remainderNumerator->invariantInduction) {
+            const std::int64_t shifted = coefficient * *initial;
+            if (shifted != 0) {
+              baseExpression.invariants[name] += shifted;
+            }
+          }
+          ProgressionExpr strideExpression;
+          strideExpression.constant = remainderNumerator->induction;
+          strideExpression.invariants = remainderNumerator->invariantInduction;
+          const auto base = appendLinear(baseExpression.constant, baseExpression.invariants);
+          const auto stride = appendLinear(strideExpression.constant, strideExpression.invariants);
+          if (!base || !stride)
+            continue;
+
+          const std::string a = newTemp();
+          replacement.emplace_back(IROp::MOD, Operand::localVar(a), *stride, Operand::imm(modulus));
+          const std::string remainderSum = newTemp();
+          const bool useResidueLookup = baseExpression.constant == 0 &&
+                                        baseExpression.invariants.empty() && modulus <= 257 &&
+                                        trips <= 4096;
+          if (useResidueLookup) {
+            std::vector<int> residueSums(static_cast<std::size_t>(modulus), 0);
+            for (int residue = 0; residue < modulus; ++residue) {
+              std::int64_t sum = 0;
+              for (std::int64_t index = 0; index < trips; ++index) {
+                sum += (static_cast<std::int64_t>(residue) * index) % modulus;
+              }
+              residueSums[static_cast<std::size_t>(residue)] = static_cast<int>(sum);
+            }
+            const std::string lookupDone = newLabel();
+            std::function<void(int, int)> emitLookup = [&](int begin, int end) {
+              if (end - begin == 1) {
+                replacement.emplace_back(IROp::ASSIGN, Operand::localVar(remainderSum),
+                                         Operand::imm(residueSums[static_cast<std::size_t>(begin)]),
+                                         Operand::none());
+                replacement.emplace_back(IROp::BRANCH, Operand::label(lookupDone), Operand::none(),
+                                         Operand::none());
+                return;
+              }
+              const int middle = begin + (end - begin) / 2;
+              const std::string rightLabel = newLabel();
+              const std::string chooseLeft = newTemp();
+              replacement.emplace_back(IROp::LT, Operand::localVar(chooseLeft),
+                                       Operand::localVar(a), Operand::imm(middle));
+              replacement.emplace_back(IROp::BEQZ, Operand::label(rightLabel),
+                                       Operand::localVar(chooseLeft), Operand::none());
+              emitLookup(begin, middle);
+              replacement.emplace_back(IROp::LABEL, Operand::label(rightLabel), Operand::none(),
+                                       Operand::none());
+              emitLookup(middle, end);
+            };
+            emitLookup(0, modulus);
+            replacement.emplace_back(IROp::LABEL, Operand::label(lookupDone), Operand::none(),
+                                     Operand::none());
+          } else {
+            const std::string b = newTemp();
+            replacement.emplace_back(IROp::MOD, Operand::localVar(b), *base, Operand::imm(modulus));
+            const std::int64_t triangular = trips * (trips - 1) / 2;
+            const std::string rawA = newTemp();
+            const std::string rawB = newTemp();
+            const std::string raw = newTemp();
+            replacement.emplace_back(IROp::MUL, Operand::localVar(rawA), Operand::localVar(a),
+                                     Operand::imm(static_cast<int>(triangular)));
+            replacement.emplace_back(IROp::MUL, Operand::localVar(rawB), Operand::localVar(b),
+                                     Operand::imm(static_cast<int>(trips)));
+            replacement.emplace_back(IROp::ADD, Operand::localVar(raw), Operand::localVar(rawA),
+                                     Operand::localVar(rawB));
+
+            const std::string floorN = newTemp();
+            const std::string floorM = newTemp();
+            const std::string floorA = newTemp();
+            const std::string floorB = newTemp();
+            const std::string floorAns = newTemp();
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(floorN),
+                                     Operand::imm(static_cast<int>(trips)), Operand::none());
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(floorM), Operand::imm(modulus),
+                                     Operand::none());
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(floorA), Operand::localVar(a),
+                                     Operand::none());
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(floorB), Operand::localVar(b),
+                                     Operand::none());
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(floorAns), Operand::imm(0),
+                                     Operand::none());
+            const std::string floorTop = newLabel();
+            const std::string skipA = newLabel();
+            const std::string skipB = newLabel();
+            const std::string floorDone = newLabel();
+            replacement.emplace_back(IROp::LABEL, Operand::label(floorTop), Operand::none(),
+                                     Operand::none());
+            const std::string hasA = newTemp();
+            replacement.emplace_back(IROp::GE, Operand::localVar(hasA), Operand::localVar(floorA),
+                                     Operand::localVar(floorM));
+            replacement.emplace_back(IROp::BEQZ, Operand::label(skipA), Operand::localVar(hasA),
+                                     Operand::none());
+            const std::string quotientA = newTemp();
+            const std::string nMinusOne = newTemp();
+            const std::string pairCount = newTemp();
+            const std::string halfPairs = newTemp();
+            const std::string contributionA = newTemp();
+            replacement.emplace_back(IROp::DIV, Operand::localVar(quotientA),
+                                     Operand::localVar(floorA), Operand::localVar(floorM));
+            replacement.emplace_back(IROp::SUB, Operand::localVar(nMinusOne),
+                                     Operand::localVar(floorN), Operand::imm(1));
+            replacement.emplace_back(IROp::MUL, Operand::localVar(pairCount),
+                                     Operand::localVar(floorN), Operand::localVar(nMinusOne));
+            replacement.emplace_back(IROp::DIV, Operand::localVar(halfPairs),
+                                     Operand::localVar(pairCount), Operand::imm(2));
+            replacement.emplace_back(IROp::MUL, Operand::localVar(contributionA),
+                                     Operand::localVar(halfPairs), Operand::localVar(quotientA));
+            replacement.emplace_back(IROp::ADD, Operand::localVar(floorAns),
+                                     Operand::localVar(floorAns), Operand::localVar(contributionA));
+            replacement.emplace_back(IROp::MOD, Operand::localVar(floorA),
+                                     Operand::localVar(floorA), Operand::localVar(floorM));
+            replacement.emplace_back(IROp::LABEL, Operand::label(skipA), Operand::none(),
+                                     Operand::none());
+            const std::string hasB = newTemp();
+            replacement.emplace_back(IROp::GE, Operand::localVar(hasB), Operand::localVar(floorB),
+                                     Operand::localVar(floorM));
+            replacement.emplace_back(IROp::BEQZ, Operand::label(skipB), Operand::localVar(hasB),
+                                     Operand::none());
+            const std::string quotientB = newTemp();
+            const std::string contributionB = newTemp();
+            replacement.emplace_back(IROp::DIV, Operand::localVar(quotientB),
+                                     Operand::localVar(floorB), Operand::localVar(floorM));
+            replacement.emplace_back(IROp::MUL, Operand::localVar(contributionB),
+                                     Operand::localVar(floorN), Operand::localVar(quotientB));
+            replacement.emplace_back(IROp::ADD, Operand::localVar(floorAns),
+                                     Operand::localVar(floorAns), Operand::localVar(contributionB));
+            replacement.emplace_back(IROp::MOD, Operand::localVar(floorB),
+                                     Operand::localVar(floorB), Operand::localVar(floorM));
+            replacement.emplace_back(IROp::LABEL, Operand::label(skipB), Operand::none(),
+                                     Operand::none());
+            const std::string y = newTemp();
+            replacement.emplace_back(IROp::MUL, Operand::localVar(y), Operand::localVar(floorA),
+                                     Operand::localVar(floorN));
+            replacement.emplace_back(IROp::ADD, Operand::localVar(y), Operand::localVar(y),
+                                     Operand::localVar(floorB));
+            const std::string finish = newTemp();
+            replacement.emplace_back(IROp::LT, Operand::localVar(finish), Operand::localVar(y),
+                                     Operand::localVar(floorM));
+            replacement.emplace_back(IROp::BNEZ, Operand::label(floorDone),
+                                     Operand::localVar(finish), Operand::none());
+            const std::string nextN = newTemp();
+            const std::string nextB = newTemp();
+            const std::string oldM = newTemp();
+            replacement.emplace_back(IROp::DIV, Operand::localVar(nextN), Operand::localVar(y),
+                                     Operand::localVar(floorM));
+            replacement.emplace_back(IROp::MOD, Operand::localVar(nextB), Operand::localVar(y),
+                                     Operand::localVar(floorM));
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(oldM),
+                                     Operand::localVar(floorM), Operand::none());
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(floorM),
+                                     Operand::localVar(floorA), Operand::none());
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(floorA),
+                                     Operand::localVar(oldM), Operand::none());
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(floorN),
+                                     Operand::localVar(nextN), Operand::none());
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(floorB),
+                                     Operand::localVar(nextB), Operand::none());
+            replacement.emplace_back(IROp::BRANCH, Operand::label(floorTop), Operand::none(),
+                                     Operand::none());
+            replacement.emplace_back(IROp::LABEL, Operand::label(floorDone), Operand::none(),
+                                     Operand::none());
+            const std::string floorProduct = newTemp();
+            replacement.emplace_back(IROp::MUL, Operand::localVar(floorProduct),
+                                     Operand::localVar(floorAns), Operand::imm(modulus));
+            replacement.emplace_back(IROp::SUB, Operand::localVar(remainderSum),
+                                     Operand::localVar(raw), Operand::localVar(floorProduct));
+          }
+
+          const std::int64_t inductionSum = trips * *initial + trips * (trips - 1) / 2;
+          std::int64_t constantDelta = delta.constant * trips + delta.induction * inductionSum;
+          std::unordered_map<std::string, std::int64_t> runtimeTerms;
+          for (const auto& [name, coefficient] : delta.invariants) {
+            runtimeTerms[name] += coefficient * trips;
+          }
+          for (const auto& [name, coefficient] : delta.invariantInduction) {
+            runtimeTerms[name] += coefficient * inductionSum;
+          }
+          const auto polynomialDelta = appendLinear(constantDelta, runtimeTerms);
+          if (!polynomialDelta)
+            continue;
+          Operand totalDelta = *polynomialDelta;
+          Operand scaledRemainder = Operand::localVar(remainderSum);
+          if (delta.remainder != 1) {
+            const std::string scaled = newTemp();
+            replacement.emplace_back(IROp::MUL, Operand::localVar(scaled), scaledRemainder,
+                                     Operand::imm(static_cast<int>(delta.remainder)));
+            scaledRemainder = Operand::localVar(scaled);
+          }
+          const std::string combined = newTemp();
+          replacement.emplace_back(IROp::ADD, Operand::localVar(combined), totalDelta,
+                                   scaledRemainder);
+          replacement.emplace_back(IROp::ADD, symbolOperands[*accumulator],
+                                   symbolOperands[*accumulator], Operand::localVar(combined));
+          if (usedAfterLoop("L:" + induction)) {
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(induction),
+                                     Operand::imm(static_cast<int>(*initial + trips)),
+                                     Operand::none());
+          }
+
+          std::size_t eraseEnd = loopEnd;
+          if (eraseEnd < ir.size() && ir[eraseEnd].op == IROp::LABEL &&
+              ir[eraseEnd].dest.isLabel() && labelReferences[ir[eraseEnd].dest.name] == 0) {
+            ++eraseEnd;
+          }
+          ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(loopStart),
+                   ir.begin() + static_cast<std::ptrdiff_t>(eraseEnd));
+          ir.insert(ir.begin() + static_cast<std::ptrdiff_t>(loopStart), replacement.begin(),
+                    replacement.end());
+          summarized = true;
+          changed = true;
+        }
+        if (!summarized)
+          break;
+      }
+    }
+
     // Pass 5.57: 汇总单个有界模状态驱动的自主循环。
     //
     // `state = transition(state) % m; sum += f(state)` 不是归纳变量周期，也不是
