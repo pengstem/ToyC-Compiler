@@ -1777,9 +1777,12 @@ void IRGenerator::optimizePass() {
           }
           invalidateVar(cur.dest.name);
         }
-        if (isCombinableOp(cur.op) && cur.dest.isLocalVar() && cur.op != IROp::NOT &&
-            cur.src1.type != OperandType::NONE && cur.src2.type != OperandType::NONE &&
-            (cur.src1.isLocalVar() || cur.src1.isImm()) &&
+        const bool readsDestination =
+            cur.dest.isLocalVar() && ((cur.src1.isLocalVar() && cur.src1.name == cur.dest.name) ||
+                                      (cur.src2.isLocalVar() && cur.src2.name == cur.dest.name));
+        if (isCombinableOp(cur.op) && cur.dest.isLocalVar() && !readsDestination &&
+            cur.op != IROp::NOT && cur.src1.type != OperandType::NONE &&
+            cur.src2.type != OperandType::NONE && (cur.src1.isLocalVar() || cur.src1.isImm()) &&
             (cur.src2.isLocalVar() || cur.src2.isImm())) {
           const auto operandKey = [](const Operand& operand) {
             return operand.isImm() ? "#" + std::to_string(operand.immVal) : "%" + operand.name;
