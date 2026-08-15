@@ -33,7 +33,7 @@ def main() -> int:
     loop_body = match.group(1)
     if re.search(r"(?m)^\s*(?:lw|sw)\b", loop_body):
         raise RuntimeError(f"matrix loop still spills live state:\n{loop_body}")
-    if len(assembly.splitlines()) > 255:
+    if len(assembly.splitlines()) > 235:
         raise RuntimeError("matrix assembly regressed beyond the coloring budget")
     return 0
 

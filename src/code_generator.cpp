@@ -1698,13 +1698,32 @@ void CodeGenerator::emitBinaryOp(const IRInst& inst, std::ostream& out) {
     }
   }
 
-  // 若 `x = invariant - x` 的左值已在另一寄存器，RISC-V 允许 rd 与 rs2
-  // 相同，可直接原地读取旧 x 后写回，避免通用路径先 mv 备份右操作数。
-  if (inst.op == IROp::SUB && inst.src1.isLocalVar() && inst.src2.isLocalVar()) {
+  // 两个源都已在寄存器时可直接使用三地址指令。RISC-V 在写 rd 前读取
+  // rs1/rs2，因此 rd 与任一源相同都安全；通用路径把 `d = a op d` 的 d
+  // 先搬到 t1，会在宽表达式图和矩阵内层产生大量无意义 mv。
+  if (inst.src1.isLocalVar() && inst.src2.isLocalVar()) {
     const std::string lhsReg = regForVar(inst.src1.name);
     const std::string rhsReg = regForVar(inst.src2.name);
-    if (!lhsReg.empty() && rhsReg == destReg && lhsReg != destReg) {
-      emit(out, "sub", destReg + ", " + lhsReg + ", " + rhsReg);
+    if (!lhsReg.empty() && !rhsReg.empty()) {
+      switch (inst.op) {
+      case IROp::ADD:
+        emit(out, "add", destReg + ", " + lhsReg + ", " + rhsReg);
+        break;
+      case IROp::SUB:
+        emit(out, "sub", destReg + ", " + lhsReg + ", " + rhsReg);
+        break;
+      case IROp::MUL:
+        emit(out, "mul", destReg + ", " + lhsReg + ", " + rhsReg);
+        break;
+      case IROp::DIV:
+        emit(out, "div", destReg + ", " + lhsReg + ", " + rhsReg);
+        break;
+      case IROp::MOD:
+        emit(out, "rem", destReg + ", " + lhsReg + ", " + rhsReg);
+        break;
+      default:
+        break;
+      }
       if (!destInReg) {
         storeOperand(destReg, inst.dest, out);
       }
