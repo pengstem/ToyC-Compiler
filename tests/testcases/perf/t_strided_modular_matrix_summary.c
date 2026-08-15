@@ -30,5 +30,35 @@ int main() {
     c = next_c;
     j = j - 3;
   }
-  return (first + a + b + c + j) % 251;
+  int second = (a + b + c + j) % 251;
+
+  a = 7;
+  b = 8;
+  c = 9;
+  int k = 1;
+  while (10000000 > k) {
+    int next_a = (a * 7 + b * 11 + c * 13) % 10007;
+    int next_b = (a * 17 + b * 19 + c * 23) % 10007;
+    int next_c = (a * 29 + b * 31 + c * 37) % 10007;
+    a = next_a;
+    b = next_b;
+    c = next_c;
+    k = k + 3;
+  }
+  int third = (a + b + c + k) % 251;
+
+  a = 10;
+  b = 11;
+  c = 12;
+  int l = 10000000;
+  while (1 <= l) {
+    int next_a = (a * 7 + b * 11 + c * 13) % 10007;
+    int next_b = (a * 17 + b * 19 + c * 23) % 10007;
+    int next_c = (a * 29 + b * 31 + c * 37) % 10007;
+    a = next_a;
+    b = next_b;
+    c = next_c;
+    l = l - 3;
+  }
+  return (first + second + third + a + b + c + l) % 251;
 }

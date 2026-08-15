@@ -6487,14 +6487,53 @@ void IRGenerator::optimizePass() {
           const IRInst& backedge = ir[condIndex + 2];
           if ((condition.op != IROp::LT && condition.op != IROp::LE &&
                condition.op != IROp::GT && condition.op != IROp::GE) ||
-              !condition.dest.isLocalVar() || !condition.src1.isLocalVar() ||
+              !condition.dest.isLocalVar() ||
               backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
               backedge.dest.name != bodyLabel || !backedge.src1.isLocalVar() ||
               backedge.src1.name != condition.dest.name) {
             continue;
           }
 
-          const std::string induction = condition.src1.name;
+          const auto writtenInBody = [&](const Operand& operand) {
+            if (!operand.isLocalVar()) {
+              return false;
+            }
+            for (std::size_t position = loopStart + 2; position < condIndex; ++position) {
+              const IRInst& candidate = ir[position];
+              if (candidate.dest.isLocalVar() && candidate.dest.name == operand.name &&
+                  candidate.op != IROp::RETURN && candidate.op != IROp::PARAM) {
+                return true;
+              }
+            }
+            return false;
+          };
+          IROp relation = condition.op;
+          Operand inductionOperand = condition.src1;
+          Operand boundOperand = condition.src2;
+          if (!writtenInBody(inductionOperand) && writtenInBody(boundOperand)) {
+            std::swap(inductionOperand, boundOperand);
+            switch (relation) {
+            case IROp::LT:
+              relation = IROp::GT;
+              break;
+            case IROp::LE:
+              relation = IROp::GE;
+              break;
+            case IROp::GT:
+              relation = IROp::LT;
+              break;
+            case IROp::GE:
+              relation = IROp::LE;
+              break;
+            default:
+              break;
+            }
+          }
+          if (!inductionOperand.isLocalVar() || !writtenInBody(inductionOperand)) {
+            continue;
+          }
+
+          const std::string induction = inductionOperand.name;
           const auto findNearbyConstant = [&](const std::string& name) -> std::optional<int> {
             for (std::size_t position = loopStart; position > 0; --position) {
               const IRInst& candidate = ir[position - 1];
@@ -6543,12 +6582,12 @@ void IRGenerator::optimizePass() {
 
           const auto initial = findNearbyConstant(induction);
           std::optional<int> upper;
-          if (condition.src2.isImm()) {
-            upper = condition.src2.immVal;
-          } else if (condition.src2.isLocalVar()) {
-            upper = findNearbyConstant(condition.src2.name);
+          if (boundOperand.isImm()) {
+            upper = boundOperand.immVal;
+          } else if (boundOperand.isLocalVar()) {
+            upper = findNearbyConstant(boundOperand.name);
             if (!upper) {
-              upper = findUniqueConstant(condition.src2.name);
+              upper = findUniqueConstant(boundOperand.name);
             }
           }
           if (!initial || !upper) {
@@ -6588,10 +6627,10 @@ void IRGenerator::optimizePass() {
             addVariable(inst.src2);
             written.insert(inst.dest.name);
           }
-          addVariable(condition.src1);
+          addVariable(inductionOperand);
           if (!bodySupported || variables.empty() ||
               variables.size() > kMaxCoupledAffineVariables || written.count(induction) == 0 ||
-              (condition.src2.isLocalVar() && written.count(condition.src2.name) != 0)) {
+              (boundOperand.isLocalVar() && written.count(boundOperand.name) != 0)) {
             continue;
           }
 
@@ -6822,32 +6861,32 @@ void IRGenerator::optimizePass() {
 
           // 常量步长的单调循环。按源比较关系精确计算迭代次数，并验证最后一次
           // 归纳更新仍在 int32 范围内；越过边界会溢出的循环必须保留原形。
-          const bool increasingRelation = condition.op == IROp::LT || condition.op == IROp::LE;
-          const bool decreasingRelation = condition.op == IROp::GT || condition.op == IROp::GE;
+          const bool increasingRelation = relation == IROp::LT || relation == IROp::LE;
+          const bool decreasingRelation = relation == IROp::GT || relation == IROp::GE;
           if ((increasingRelation && inductionStep <= 0) ||
               (decreasingRelation && inductionStep >= 0)) {
             continue;
           }
           const std::int64_t startValue = *initial;
           const std::int64_t boundValue = *upper;
-          const bool loopRuns = condition.op == IROp::LT   ? startValue < boundValue
-                                : condition.op == IROp::LE ? startValue <= boundValue
-                                : condition.op == IROp::GT ? startValue > boundValue
-                                                          : startValue >= boundValue;
+          const bool loopRuns = relation == IROp::LT   ? startValue < boundValue
+                                : relation == IROp::LE ? startValue <= boundValue
+                                : relation == IROp::GT ? startValue > boundValue
+                                                      : startValue >= boundValue;
           std::uint64_t trips = 0;
           if (loopRuns) {
             if (increasingRelation) {
               const std::uint64_t distance =
                   static_cast<std::uint64_t>(boundValue - startValue);
               const std::uint64_t step = static_cast<std::uint64_t>(inductionStep);
-              trips = condition.op == IROp::LT ? (distance + step - 1) / step
-                                               : distance / step + 1;
+              trips = relation == IROp::LT ? (distance + step - 1) / step
+                                           : distance / step + 1;
             } else {
               const std::uint64_t distance =
                   static_cast<std::uint64_t>(startValue - boundValue);
               const std::uint64_t step = static_cast<std::uint64_t>(-inductionStep);
-              trips = condition.op == IROp::GT ? (distance + step - 1) / step
-                                               : distance / step + 1;
+              trips = relation == IROp::GT ? (distance + step - 1) / step
+                                           : distance / step + 1;
             }
           }
           const std::int64_t finalInduction =
