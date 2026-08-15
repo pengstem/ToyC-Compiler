@@ -674,7 +674,8 @@ void IRGenerator::inlinePass() {
   constexpr std::size_t kInlineLimit = 24;
   // 循环中的调用会按迭代次数重复支付调用、参数搬运和被调函数帧开销。
   // 对热调用点使用更高但仍有上限的预算；循环外仍保持保守阈值，避免无谓膨胀。
-  constexpr std::size_t kLoopInlineLimit = 96;
+  constexpr std::size_t kBaseLoopInlineLimit = 96;
+  constexpr std::size_t kLoopInlineLimit = 160;
 
   // 多轮迭代：内联可能引入新的可内联调用（如 f(g(x))）。
   // 每轮重新收集函数区间，因为前一轮的内联替换会使旧下标失效。
@@ -810,9 +811,45 @@ void IRGenerator::inlinePass() {
       // 递归（含相互递归）不内联；经 callee 可达 caller（会产生调用环）不内联
       if (reach[callee].count(callee) || reach[callee].count(curFunc))
         continue;
-      const std::size_t inlineLimit = isLoopCall(ci) ? kLoopInlineLimit : kInlineLimit;
-      if (bodySize(f) > inlineLimit)
+      const bool hotCall = isLoopCall(ci);
+      const std::size_t inlineLimit = hotCall ? kLoopInlineLimit : kInlineLimit;
+      const std::size_t calleeBodySize = bodySize(f);
+      if (calleeBodySize > inlineLimit)
         continue;
+
+      // The wider hot-call budget is for values that contribute to observable
+      // loop state.  If the result is merely copied into a local that is never
+      // read, keep the call intact: the later purity/DCE pass can remove the
+      // entire call, whereas inlining a large helper would hide that opportunity
+      // inside a much larger loop body.
+      if (hotCall && calleeBodySize > kBaseLoopInlineLimit && ir[ci].dest.isLocalVar() &&
+          ci + 1 < ir.size()) {
+        const IRInst& copy = ir[ci + 1];
+        if (copy.op == IROp::ASSIGN && copy.dest.isLocalVar() && copy.src1.isLocalVar() &&
+            copy.src1.name == ir[ci].dest.name) {
+          bool copiedValueUsed = false;
+          for (std::size_t k = ci + 2; k < ir.size(); ++k) {
+            const IRInst& later = ir[k];
+            if (later.op == IROp::FUNC_END) {
+              break;
+            }
+            copiedValueUsed = (later.src1.isLocalVar() && later.src1.name == copy.dest.name) ||
+                              (later.src2.isLocalVar() && later.src2.name == copy.dest.name) ||
+                              ((later.op == IROp::RETURN || later.op == IROp::PARAM) &&
+                               later.dest.isLocalVar() && later.dest.name == copy.dest.name);
+            if (copiedValueUsed) {
+              break;
+            }
+            if (later.dest.isLocalVar() && later.dest.name == copy.dest.name &&
+                later.op != IROp::RETURN && later.op != IROp::PARAM) {
+              break;
+            }
+          }
+          if (!copiedValueUsed) {
+            continue;
+          }
+        }
+      }
 
       // 收集紧邻 CALL 之前的 PARAM 指令（应连续，索引 0..n-1）
       std::vector<Operand> argVals;
