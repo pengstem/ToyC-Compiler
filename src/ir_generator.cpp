@@ -6608,6 +6608,10 @@ void IRGenerator::optimizePass() {
           const std::size_t dimension = variables.size() + 1;
           AffineMatrix transform = identityMatrix(dimension);
           std::vector<std::optional<std::uint32_t>> normalizedModulus(variables.size());
+          // 当前迭代内的非负值上界。模运算会把结果收紧到 [0, modulus)，
+          // 后续正数乘加据此证明不会发生有符号溢出；这比反复把表达式展开到
+          // 循环入口状态更精确，长模仿射链也不会因膨胀系数而误回退。
+          std::vector<std::optional<std::uint64_t>> nonnegativeUpper(variables.size());
           std::optional<std::uint32_t> loopModulus;
           std::unordered_set<std::size_t> modularInputColumns;
           const auto rowForOperand = [&](const Operand& operand) -> std::optional<AffineRow> {
@@ -6625,35 +6629,60 @@ void IRGenerator::optimizePass() {
             }
             return transform[found->second];
           };
+          const auto upperForOperand = [&](const Operand& operand)
+              -> std::optional<std::uint64_t> {
+            if (operand.isImm()) {
+              if (operand.immVal < 0) {
+                return std::nullopt;
+              }
+              return static_cast<std::uint64_t>(operand.immVal);
+            }
+            if (!operand.isLocalVar()) {
+              return std::nullopt;
+            }
+            const auto found = variableIndex.find(operand.name);
+            return found == variableIndex.end() ? std::nullopt
+                                                : nonnegativeUpper[found->second];
+          };
           const auto sameOperand = [](const Operand& lhs, const Operand& rhs) {
             if (lhs.type != rhs.type) {
               return false;
             }
             return lhs.isImm() ? lhs.immVal == rhs.immVal : lhs.name == rhs.name;
           };
-          const auto applyPositiveModulus = [&](std::size_t destination, const AffineRow& dividend,
-                                                std::uint32_t modulus) {
+          const auto applyPositiveModulus =
+              [&](std::size_t destination, const AffineRow& dividend, std::uint32_t modulus,
+                  std::optional<std::uint64_t> currentUpper) {
             if (loopModulus && *loopModulus != modulus) {
               return false;
             }
 
             // C 的有符号余数只有在被除数非负时等同数学模运算。这里按每个
-            // 入口状态位于 [0, modulus) 估算本次被除数的最大值；若乘加链
-            // 可能越过 INT32_MAX（或含负系数），就保留原循环。
-            std::uint64_t upperBound = dividend[constantColumn];
-            bool nonnegativeAndBounded = upperBound <= INT32_MAX;
-            for (std::size_t column = 0; column < constantColumn && nonnegativeAndBounded;
-                 ++column) {
+            // 入口状态位于 [0, modulus) 估算第一次被除数；链中后续被除数优先
+            // 使用上一条模运算传播出的当前值上界，避免展开系数虚高。
+            for (std::size_t column = 0; column < constantColumn; ++column) {
               const std::uint32_t coefficient = dividend[column];
-              if (coefficient == 0) {
-                continue;
+              if (coefficient != 0) {
+                modularInputColumns.insert(column);
               }
-              modularInputColumns.insert(column);
-              const std::uint64_t term =
-                  static_cast<std::uint64_t>(coefficient) * static_cast<std::uint64_t>(modulus - 1);
-              nonnegativeAndBounded = term <= INT32_MAX && upperBound <= INT32_MAX - term;
-              if (nonnegativeAndBounded) {
-                upperBound += term;
+            }
+            bool nonnegativeAndBounded = currentUpper && *currentUpper <= INT32_MAX;
+            if (!currentUpper) {
+              std::uint64_t expandedUpper = dividend[constantColumn];
+              nonnegativeAndBounded = expandedUpper <= INT32_MAX;
+              for (std::size_t column = 0; column < constantColumn && nonnegativeAndBounded;
+                   ++column) {
+                const std::uint32_t coefficient = dividend[column];
+                if (coefficient == 0) {
+                  continue;
+                }
+                const std::uint64_t term = static_cast<std::uint64_t>(coefficient) *
+                                           static_cast<std::uint64_t>(modulus - 1);
+                nonnegativeAndBounded =
+                    term <= INT32_MAX && expandedUpper <= INT32_MAX - term;
+                if (nonnegativeAndBounded) {
+                  expandedUpper += term;
+                }
               }
             }
             if (!nonnegativeAndBounded) {
@@ -6666,6 +6695,7 @@ void IRGenerator::optimizePass() {
             }
             transform[destination] = std::move(result);
             normalizedModulus[destination] = modulus;
+            nonnegativeUpper[destination] = static_cast<std::uint64_t>(modulus - 1);
             loopModulus = modulus;
             return true;
           };
@@ -6695,7 +6725,8 @@ void IRGenerator::optimizePass() {
                 const auto dividend = rowForOperand(inst.src1);
                 if (destination == variableIndex.end() || !dividend ||
                     !applyPositiveModulus(destination->second, *dividend,
-                                          static_cast<std::uint32_t>(inst.src2.immVal))) {
+                                          static_cast<std::uint32_t>(inst.src2.immVal),
+                                          upperForOperand(inst.src1))) {
                   bodySupported = false;
                   break;
                 }
@@ -6716,6 +6747,7 @@ void IRGenerator::optimizePass() {
             }
             if (inst.op == IROp::LOCAL_VAR_DECL || inst.op == IROp::ASSIGN) {
               transform[destination->second] = *lhs;
+              nonnegativeUpper[destination->second] = upperForOperand(inst.src1);
               if (inst.src1.isLocalVar()) {
                 normalizedModulus[destination->second] =
                     normalizedModulus[variableIndex.at(inst.src1.name)];
@@ -6731,7 +6763,8 @@ void IRGenerator::optimizePass() {
                 break;
               }
               if (!applyPositiveModulus(destination->second, *lhs,
-                                        static_cast<std::uint32_t>(inst.src2.immVal))) {
+                                        static_cast<std::uint32_t>(inst.src2.immVal),
+                                        upperForOperand(inst.src1))) {
                 bodySupported = false;
                 break;
               }
@@ -6743,6 +6776,8 @@ void IRGenerator::optimizePass() {
               bodySupported = false;
               break;
             }
+            const std::optional<std::uint64_t> lhsUpper = upperForOperand(inst.src1);
+            const std::optional<std::uint64_t> rhsUpper = upperForOperand(inst.src2);
             AffineRow result(dimension, 0);
             if (inst.op == IROp::ADD || inst.op == IROp::SUB) {
               for (std::size_t column = 0; column < dimension; ++column) {
@@ -6765,6 +6800,18 @@ void IRGenerator::optimizePass() {
             }
             transform[destination->second] = std::move(result);
             normalizedModulus[destination->second].reset();
+            std::optional<std::uint64_t> resultUpper;
+            if (inst.op == IROp::ADD && lhsUpper && rhsUpper && *rhsUpper <= INT32_MAX &&
+                *lhsUpper <= static_cast<std::uint64_t>(INT32_MAX) - *rhsUpper) {
+              resultUpper = *lhsUpper + *rhsUpper;
+            } else if (inst.op == IROp::SUB && lhsUpper && rhsUpper && *rhsUpper == 0) {
+              resultUpper = lhsUpper;
+            } else if (inst.op == IROp::MUL && lhsUpper && rhsUpper &&
+                       (*lhsUpper == 0 ||
+                        *rhsUpper <= static_cast<std::uint64_t>(INT32_MAX) / *lhsUpper)) {
+              resultUpper = *lhsUpper * *rhsUpper;
+            }
+            nonnegativeUpper[destination->second] = resultUpper;
           }
           if (!bodySupported) {
             continue;
