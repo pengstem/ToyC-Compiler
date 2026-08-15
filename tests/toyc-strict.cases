@@ -98,6 +98,8 @@ perf/t_quotient_accumulator_summary.c
 perf/t_periodic_accumulator_summary.c
 perf/t_invariant_offset_remainder_summary.c
 perf/t_strided_remainder_floor_sum.c
+perf/t_signed_mod_periodic_summary.c
+perf/t_sparse_guarded_iteration.c
 perf/t_invariant_empty_path_guard.c
 perf/t_bounded_helper_summary.c
 perf/t_modular_state_cycle_summary.c
@@ -160,6 +162,8 @@ regression/periodic_escape_safety.c
 regression/periodic_negative_range_safety.c
 regression/invariant_offset_remainder_negative_safety.c
 regression/strided_remainder_negative_safety.c
+regression/signed_mod_periodic_cross_state_safety.c
+regression/sparse_guarded_prefix_escape_safety.c
 regression/invariant_empty_path_live_induction_safety.c
 regression/periodic_large_period_safety.c
 regression/threshold_state_guard_safety.c

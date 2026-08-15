@@ -7214,6 +7214,1196 @@ void IRGenerator::optimizePass() {
       }
     }
 
+    // Pass 5.568: 汇总带周期增量的有符号模递推。
+    //
+    // 常见的长循环会把小模数余数送入一个大模数累加器：
+    //
+    //   acc = (acc + periodic(i) + c * i) % M;
+    //
+    // `periodic(i)` 的周期很小，但 C 的有符号余数在累计和跨过 0 时不满足
+    // 朴素的结合律，不能直接把所有增量相加后只取一次余数。这里先用符号表达式
+    // 证明循环体确实只有一个这种模累加器，并枚举至多 65536 个余数相位；随后
+    // 精确执行至增量恒为同号的有限前缀，再用单调前缀和定位唯一的符号转换点，
+    // 最终汇总同号长尾。循环含控制流、调用、全局写、溢出风险、多个可观察状态
+    // 或不兼容模数时均保守回退。
+    {
+      constexpr std::uint64_t kMaxPeriodicPhases = 65536;
+      constexpr std::uint64_t kMaxSignTransitionPrefix = 1048576;
+      __extension__ typedef __int128 WideInt;
+
+      enum class SignedRemainderShape {
+        NONE,
+        ACCUMULATOR,
+        ACCUMULATOR_PLUS_PERIODIC,
+        INNER_REMAINDER,
+        INNER_REMAINDER_MINUS_INDUCTION,
+        FINAL_REMAINDER,
+      };
+
+      struct PeriodicAffineValue {
+        bool valid = false;
+        std::int64_t accumulator = 0;
+        std::int64_t induction = 0;
+        std::vector<std::int64_t> phase;
+        std::optional<std::int64_t> congruenceModulus;
+        std::int64_t minimum = 0;
+        std::int64_t maximum = 0;
+        SignedRemainderShape signedShape = SignedRemainderShape::NONE;
+      };
+
+      const auto gcd64 = [](std::uint64_t lhs, std::uint64_t rhs) {
+        while (rhs != 0) {
+          const std::uint64_t remainder = lhs % rhs;
+          lhs = rhs;
+          rhs = remainder;
+        }
+        return lhs;
+      };
+      const auto combinePeriod = [&](std::uint64_t lhs,
+                                     std::uint64_t rhs) -> std::optional<std::uint64_t> {
+        if (lhs == 0 || rhs == 0) {
+          return std::nullopt;
+        }
+        const std::uint64_t divisor = gcd64(lhs, rhs);
+        const std::uint64_t factor = rhs / divisor;
+        if (lhs > kMaxPeriodicPhases / factor) {
+          return std::nullopt;
+        }
+        const std::uint64_t result = lhs * factor;
+        return result <= kMaxPeriodicPhases ? std::optional<std::uint64_t>(result) : std::nullopt;
+      };
+      const auto sameOperand = [](const Operand& lhs, const Operand& rhs) {
+        if (lhs.type != rhs.type) {
+          return false;
+        }
+        if (lhs.isImm()) {
+          return lhs.immVal == rhs.immVal;
+        }
+        return lhs.name == rhs.name;
+      };
+      const auto truncRemainder = [](WideInt value, std::int64_t modulus) {
+        return value % static_cast<WideInt>(modulus);
+      };
+
+      for (int summaryRound = 0; summaryRound < 8; ++summaryRound) {
+        std::unordered_map<std::string, int> labelReferences;
+        std::unordered_map<std::string, std::size_t> labelPositions;
+        for (std::size_t index = 0; index < ir.size(); ++index) {
+          const IRInst& inst = ir[index];
+          if (inst.op == IROp::LABEL && inst.dest.isLabel()) {
+            labelPositions[inst.dest.name] = index;
+          }
+          if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+              inst.dest.isLabel()) {
+            ++labelReferences[inst.dest.name];
+          }
+        }
+
+        bool summarized = false;
+        for (std::size_t loopStart = ir.size(); loopStart-- > 0 && !summarized;) {
+          if (ir[loopStart].op != IROp::BRANCH || !ir[loopStart].dest.isLabel() ||
+              loopStart + 1 >= ir.size() || ir[loopStart + 1].op != IROp::LABEL ||
+              !ir[loopStart + 1].dest.isLabel()) {
+            continue;
+          }
+          const std::string condLabel = ir[loopStart].dest.name;
+          const std::string bodyLabel = ir[loopStart + 1].dest.name;
+          if (labelReferences[condLabel] != 1 || labelReferences[bodyLabel] != 1) {
+            continue;
+          }
+          const auto condPosition = labelPositions.find(condLabel);
+          if (condPosition == labelPositions.end() || condPosition->second <= loopStart + 2) {
+            continue;
+          }
+          const std::size_t condIndex = condPosition->second;
+          if (condIndex + 2 >= ir.size()) {
+            continue;
+          }
+          const IRInst& condition = ir[condIndex + 1];
+          const IRInst& backedge = ir[condIndex + 2];
+          if ((condition.op != IROp::LT && condition.op != IROp::LE) ||
+              !condition.dest.isLocalVar() || !condition.src1.isLocalVar() ||
+              backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
+              backedge.dest.name != bodyLabel || !backedge.src1.isLocalVar() ||
+              backedge.src1.name != condition.dest.name) {
+            continue;
+          }
+          const std::string inductionName = condition.src1.name;
+
+          const auto findNearbyConstant = [&](const std::string& name) -> std::optional<int> {
+            for (std::size_t position = loopStart; position > 0; --position) {
+              const IRInst& candidate = ir[position - 1];
+              if (candidate.dest.isLocalVar() && candidate.dest.name == name) {
+                if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                    candidate.src1.isImm()) {
+                  return candidate.src1.immVal;
+                }
+                return std::nullopt;
+              }
+              if (candidate.op == IROp::LABEL || candidate.op == IROp::BRANCH ||
+                  candidate.op == IROp::BEQZ || candidate.op == IROp::BNEZ ||
+                  candidate.op == IROp::CALL || candidate.op == IROp::FUNC_BEGIN) {
+                break;
+              }
+            }
+            return std::nullopt;
+          };
+          const auto findUniqueConstant = [&](const std::string& name) -> std::optional<int> {
+            std::size_t functionBegin = loopStart;
+            while (functionBegin > 0 && ir[functionBegin - 1].op != IROp::FUNC_BEGIN) {
+              --functionBegin;
+            }
+            int definitions = 0;
+            std::optional<int> value;
+            for (std::size_t position = functionBegin; position < ir.size(); ++position) {
+              const IRInst& candidate = ir[position];
+              if (candidate.op == IROp::FUNC_END) {
+                break;
+              }
+              if (!candidate.dest.isLocalVar() || candidate.dest.name != name ||
+                  candidate.op == IROp::RETURN || candidate.op == IROp::PARAM ||
+                  (candidate.op == IROp::LOCAL_VAR_DECL && candidate.src1.isNone())) {
+                continue;
+              }
+              ++definitions;
+              if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                  candidate.src1.isImm()) {
+                value = candidate.src1.immVal;
+              } else {
+                value.reset();
+              }
+            }
+            return definitions == 1 ? value : std::nullopt;
+          };
+
+          const auto initialInduction = findNearbyConstant(inductionName);
+          std::optional<int> upper;
+          if (condition.src2.isImm()) {
+            upper = condition.src2.immVal;
+          } else if (condition.src2.isLocalVar()) {
+            upper = findNearbyConstant(condition.src2.name);
+            if (!upper) {
+              upper = findUniqueConstant(condition.src2.name);
+            }
+          }
+          if (!initialInduction || !upper || *initialInduction < 0 ||
+              (condition.op == IROp::LE && *upper == INT32_MAX && *initialInduction <= *upper)) {
+            continue;
+          }
+          std::int64_t trips = static_cast<std::int64_t>(*upper) - *initialInduction;
+          if (condition.op == IROp::LE) {
+            ++trips;
+          }
+          trips = std::max<std::int64_t>(0, trips);
+          const std::int64_t finalInduction = static_cast<std::int64_t>(*initialInduction) + trips;
+          if (trips < 2 || trips > INT32_MAX || finalInduction > INT32_MAX) {
+            continue;
+          }
+
+          const std::size_t loopEnd = condIndex + 3;
+          const auto usedAfterLoop = [&](const std::string& name) {
+            for (std::size_t position = loopEnd; position < ir.size(); ++position) {
+              const IRInst& inst = ir[position];
+              if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
+                break;
+              }
+              if ((inst.src1.isLocalVar() && inst.src1.name == name) ||
+                  (inst.src2.isLocalVar() && inst.src2.name == name) ||
+                  ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) && inst.dest.isLocalVar() &&
+                   inst.dest.name == name)) {
+                return true;
+              }
+            }
+            return false;
+          };
+
+          std::unordered_set<std::string> written;
+          bool straightLocalBody = true;
+          int inductionWrites = 0;
+          bool inductionIncremented = false;
+          for (std::size_t position = loopStart + 2; position < condIndex; ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+              continue;
+            }
+            if (!inst.dest.isLocalVar() ||
+                (inst.op != IROp::LOCAL_VAR_DECL && inst.op != IROp::ASSIGN &&
+                 inst.op != IROp::ADD && inst.op != IROp::SUB && inst.op != IROp::MUL &&
+                 inst.op != IROp::DIV && inst.op != IROp::MOD && inst.op != IROp::NOT)) {
+              straightLocalBody = false;
+              break;
+            }
+            written.insert(inst.dest.name);
+            if (inst.dest.name == inductionName) {
+              ++inductionWrites;
+              inductionIncremented = inductionWrites == 1 && inst.op == IROp::ADD &&
+                                     inst.src1.isLocalVar() && inst.src1.name == inductionName &&
+                                     inst.src2.isImm() && inst.src2.immVal == 1;
+              if (!inductionIncremented || position + 1 != condIndex) {
+                straightLocalBody = false;
+                break;
+              }
+            }
+          }
+          if (!straightLocalBody || inductionWrites != 1 || !inductionIncremented ||
+              (condition.src2.isLocalVar() && written.count(condition.src2.name) != 0)) {
+            continue;
+          }
+
+          std::vector<std::string> observableCandidates;
+          for (const std::string& name : written) {
+            if (name != inductionName && !isCompilerTemp(name) && usedAfterLoop(name)) {
+              observableCandidates.push_back(name);
+            }
+          }
+          if (observableCandidates.size() != 1) {
+            continue;
+          }
+          const std::string accumulatorName = observableCandidates.front();
+          const auto initialAccumulator = findNearbyConstant(accumulatorName);
+          if (!initialAccumulator) {
+            continue;
+          }
+          bool otherObservableWrite = false;
+          for (const std::string& name : written) {
+            if (name != inductionName && name != accumulatorName && usedAfterLoop(name)) {
+              otherObservableWrite = true;
+              break;
+            }
+          }
+          if (otherObservableWrite) {
+            continue;
+          }
+
+          std::optional<std::int64_t> accumulatorModulus;
+          bool inconsistentAccumulatorModulus = false;
+          for (std::size_t position = loopStart + 2; position + 2 < condIndex; ++position) {
+            const IRInst& quotient = ir[position];
+            const IRInst& product = ir[position + 1];
+            const IRInst& remainder = ir[position + 2];
+            if (quotient.op != IROp::DIV || !quotient.dest.isLocalVar() || !quotient.src2.isImm() ||
+                quotient.src2.immVal <= 1 || product.op != IROp::MUL ||
+                !product.dest.isLocalVar() || remainder.op != IROp::SUB ||
+                !remainder.dest.isLocalVar() || remainder.dest.name != accumulatorName ||
+                !sameOperand(remainder.src1, quotient.src1) ||
+                !sameOperand(remainder.src2, product.dest) ||
+                !((sameOperand(product.src1, quotient.dest) &&
+                   sameOperand(product.src2, quotient.src2)) ||
+                  (sameOperand(product.src2, quotient.dest) &&
+                   sameOperand(product.src1, quotient.src2)))) {
+              continue;
+            }
+            if (accumulatorModulus && *accumulatorModulus != quotient.src2.immVal) {
+              inconsistentAccumulatorModulus = true;
+              break;
+            }
+            accumulatorModulus = quotient.src2.immVal;
+          }
+          if (!accumulatorModulus || inconsistentAccumulatorModulus ||
+              *initialAccumulator <= -*accumulatorModulus ||
+              *initialAccumulator >= *accumulatorModulus) {
+            continue;
+          }
+
+          const std::int64_t accumulatorMinimum = -*accumulatorModulus + 1;
+          const std::int64_t accumulatorMaximum = *accumulatorModulus - 1;
+          const auto constantValue = [](std::int64_t value) {
+            PeriodicAffineValue result;
+            result.valid = value >= INT32_MIN && value <= INT32_MAX;
+            result.phase = {value};
+            result.minimum = value;
+            result.maximum = value;
+            return result;
+          };
+          const auto phaseAt = [](const PeriodicAffineValue& value, std::uint64_t phase) {
+            return value.phase[static_cast<std::size_t>(phase % value.phase.size())];
+          };
+          const auto inInt32 = [](WideInt value) {
+            return value >= INT32_MIN && value <= INT32_MAX;
+          };
+          const auto compatibleCongruence = [](const PeriodicAffineValue& lhs,
+                                               const PeriodicAffineValue& rhs) {
+            return !lhs.congruenceModulus || !rhs.congruenceModulus ||
+                   lhs.congruenceModulus == rhs.congruenceModulus;
+          };
+
+          std::unordered_map<std::string, PeriodicAffineValue> values;
+          PeriodicAffineValue inductionValue = constantValue(0);
+          inductionValue.induction = 1;
+          inductionValue.minimum = *initialInduction;
+          inductionValue.maximum = finalInduction - 1;
+          values[inductionName] = inductionValue;
+          PeriodicAffineValue accumulatorValue = constantValue(0);
+          accumulatorValue.accumulator = 1;
+          accumulatorValue.congruenceModulus = accumulatorModulus;
+          accumulatorValue.minimum = accumulatorMinimum;
+          accumulatorValue.maximum = accumulatorMaximum;
+          accumulatorValue.signedShape = SignedRemainderShape::ACCUMULATOR;
+          values[accumulatorName] = accumulatorValue;
+
+          const auto valueOf = [&](const Operand& operand) {
+            if (operand.isImm()) {
+              return constantValue(operand.immVal);
+            }
+            if (operand.isLocalVar()) {
+              const auto found = values.find(operand.name);
+              if (found != values.end()) {
+                return found->second;
+              }
+              const auto constant = findUniqueConstant(operand.name);
+              if (constant) {
+                return constantValue(*constant);
+              }
+            }
+            return PeriodicAffineValue{};
+          };
+
+          const auto combineAddSub = [&](const PeriodicAffineValue& lhs,
+                                         const PeriodicAffineValue& rhs, bool subtract) {
+            PeriodicAffineValue result;
+            if (!lhs.valid || !rhs.valid || !compatibleCongruence(lhs, rhs)) {
+              return result;
+            }
+            const auto period = combinePeriod(lhs.phase.size(), rhs.phase.size());
+            if (!period) {
+              return result;
+            }
+            const WideInt minimum = subtract ? static_cast<WideInt>(lhs.minimum) - rhs.maximum
+                                             : static_cast<WideInt>(lhs.minimum) + rhs.minimum;
+            const WideInt maximum = subtract ? static_cast<WideInt>(lhs.maximum) - rhs.minimum
+                                             : static_cast<WideInt>(lhs.maximum) + rhs.maximum;
+            if (!inInt32(minimum) || !inInt32(maximum)) {
+              return result;
+            }
+            result.valid = true;
+            result.accumulator = lhs.accumulator + (subtract ? -rhs.accumulator : rhs.accumulator);
+            result.induction = lhs.induction + (subtract ? -rhs.induction : rhs.induction);
+            result.phase.resize(static_cast<std::size_t>(*period));
+            for (std::uint64_t phase = 0; phase < *period; ++phase) {
+              const WideInt value = static_cast<WideInt>(phaseAt(lhs, phase)) +
+                                    (subtract ? -static_cast<WideInt>(phaseAt(rhs, phase))
+                                              : static_cast<WideInt>(phaseAt(rhs, phase)));
+              if (value < INT64_MIN || value > INT64_MAX) {
+                return PeriodicAffineValue{};
+              }
+              result.phase[static_cast<std::size_t>(phase)] = static_cast<std::int64_t>(value);
+            }
+            result.congruenceModulus =
+                lhs.congruenceModulus ? lhs.congruenceModulus : rhs.congruenceModulus;
+            result.minimum = static_cast<std::int64_t>(minimum);
+            result.maximum = static_cast<std::int64_t>(maximum);
+            const auto independentPeriodic = [](const PeriodicAffineValue& value) {
+              return value.accumulator == 0 && value.induction == 0 && !value.congruenceModulus;
+            };
+            if (!subtract && ((lhs.signedShape == SignedRemainderShape::ACCUMULATOR &&
+                               independentPeriodic(rhs)) ||
+                              (rhs.signedShape == SignedRemainderShape::ACCUMULATOR &&
+                               independentPeriodic(lhs)))) {
+              result.signedShape = SignedRemainderShape::ACCUMULATOR_PLUS_PERIODIC;
+            } else if (subtract && lhs.signedShape == SignedRemainderShape::INNER_REMAINDER &&
+                       rhs.accumulator == 0 && rhs.induction == 1 && rhs.phase.size() == 1 &&
+                       rhs.phase.front() == 0 && !rhs.congruenceModulus) {
+              result.signedShape = SignedRemainderShape::INNER_REMAINDER_MINUS_INDUCTION;
+            }
+            return result;
+          };
+
+          const auto multiplyValues = [&](const PeriodicAffineValue& lhs,
+                                          const PeriodicAffineValue& rhs) {
+            PeriodicAffineValue result;
+            if (!lhs.valid || !rhs.valid) {
+              return result;
+            }
+            const bool lhsConstant = lhs.accumulator == 0 && lhs.induction == 0 &&
+                                     lhs.phase.size() == 1 && !lhs.congruenceModulus;
+            const bool rhsConstant = rhs.accumulator == 0 && rhs.induction == 0 &&
+                                     rhs.phase.size() == 1 && !rhs.congruenceModulus;
+            if (lhsConstant || rhsConstant) {
+              const std::int64_t factor = lhsConstant ? lhs.phase.front() : rhs.phase.front();
+              const PeriodicAffineValue& source = lhsConstant ? rhs : lhs;
+              const WideInt candidate1 = static_cast<WideInt>(source.minimum) * factor;
+              const WideInt candidate2 = static_cast<WideInt>(source.maximum) * factor;
+              const WideInt minimum = std::min(candidate1, candidate2);
+              const WideInt maximum = std::max(candidate1, candidate2);
+              if (!inInt32(minimum) || !inInt32(maximum)) {
+                return result;
+              }
+              result = source;
+              result.accumulator *= factor;
+              result.induction *= factor;
+              for (std::int64_t& value : result.phase) {
+                const WideInt product = static_cast<WideInt>(value) * factor;
+                if (product < INT64_MIN || product > INT64_MAX) {
+                  return PeriodicAffineValue{};
+                }
+                value = static_cast<std::int64_t>(product);
+              }
+              result.minimum = static_cast<std::int64_t>(minimum);
+              result.maximum = static_cast<std::int64_t>(maximum);
+              return result;
+            }
+            if (lhs.accumulator != 0 || lhs.induction != 0 || lhs.congruenceModulus ||
+                rhs.accumulator != 0 || rhs.induction != 0 || rhs.congruenceModulus) {
+              return result;
+            }
+            const auto period = combinePeriod(lhs.phase.size(), rhs.phase.size());
+            if (!period) {
+              return result;
+            }
+            result.valid = true;
+            result.phase.resize(static_cast<std::size_t>(*period));
+            result.minimum = INT32_MAX;
+            result.maximum = INT32_MIN;
+            for (std::uint64_t phase = 0; phase < *period; ++phase) {
+              const WideInt product =
+                  static_cast<WideInt>(phaseAt(lhs, phase)) * phaseAt(rhs, phase);
+              if (!inInt32(product)) {
+                return PeriodicAffineValue{};
+              }
+              const auto value = static_cast<std::int64_t>(product);
+              result.phase[static_cast<std::size_t>(phase)] = value;
+              result.minimum = std::min(result.minimum, value);
+              result.maximum = std::max(result.maximum, value);
+            }
+            return result;
+          };
+
+          const auto divideValue = [&](const PeriodicAffineValue& dividend, std::int64_t divisor) {
+            PeriodicAffineValue result;
+            if (!dividend.valid || divisor == 0 ||
+                (dividend.minimum <= INT32_MIN && dividend.maximum >= INT32_MIN && divisor == -1)) {
+              return result;
+            }
+            if (dividend.accumulator == 0 && dividend.induction == 0 &&
+                !dividend.congruenceModulus) {
+              result.valid = true;
+              result.phase.resize(dividend.phase.size());
+              result.minimum = INT32_MAX;
+              result.maximum = INT32_MIN;
+              for (std::size_t phase = 0; phase < dividend.phase.size(); ++phase) {
+                const std::int64_t value = dividend.phase[phase] / divisor;
+                result.phase[phase] = value;
+                result.minimum = std::min(result.minimum, value);
+                result.maximum = std::max(result.maximum, value);
+              }
+              return result;
+            }
+            if (!dividend.congruenceModulus && dividend.minimum > -std::abs(divisor) &&
+                dividend.maximum < std::abs(divisor)) {
+              return constantValue(0);
+            }
+            return result;
+          };
+
+          const auto applyRemainder = [&](const PeriodicAffineValue& dividend,
+                                          std::int64_t modulus) {
+            PeriodicAffineValue result;
+            if (!dividend.valid || modulus <= 1) {
+              return result;
+            }
+            if (!dividend.congruenceModulus && dividend.minimum > -modulus &&
+                dividend.maximum < modulus) {
+              return dividend;
+            }
+            if (dividend.accumulator == 0 && !dividend.congruenceModulus && dividend.minimum >= 0) {
+              const std::uint64_t coefficient = static_cast<std::uint64_t>(
+                  dividend.induction < 0 ? -dividend.induction : dividend.induction);
+              const std::uint64_t inductionPeriod =
+                  coefficient == 0
+                      ? 1
+                      : static_cast<std::uint64_t>(modulus) / gcd64(coefficient, modulus);
+              const auto period = combinePeriod(dividend.phase.size(), inductionPeriod);
+              if (!period) {
+                return result;
+              }
+              result.valid = true;
+              result.phase.resize(static_cast<std::size_t>(*period));
+              result.minimum = modulus - 1;
+              result.maximum = 0;
+              for (std::uint64_t phase = 0; phase < *period; ++phase) {
+                const WideInt numerator =
+                    static_cast<WideInt>(dividend.induction) * phase + phaseAt(dividend, phase);
+                std::int64_t value = static_cast<std::int64_t>(truncRemainder(numerator, modulus));
+                if (value < 0) {
+                  value += modulus;
+                }
+                result.phase[static_cast<std::size_t>(phase)] = value;
+                result.minimum = std::min(result.minimum, value);
+                result.maximum = std::max(result.maximum, value);
+              }
+              return result;
+            }
+            if (dividend.congruenceModulus && *dividend.congruenceModulus != modulus) {
+              return result;
+            }
+            result = dividend;
+            result.congruenceModulus = modulus;
+            result.minimum = dividend.minimum >= 0   ? 0
+                             : dividend.maximum <= 0 ? -modulus + 1
+                                                     : -modulus + 1;
+            result.maximum = dividend.maximum <= 0   ? 0
+                             : dividend.minimum >= 0 ? modulus - 1
+                                                     : modulus - 1;
+            if (modulus == *accumulatorModulus &&
+                dividend.signedShape == SignedRemainderShape::ACCUMULATOR_PLUS_PERIODIC) {
+              result.signedShape = SignedRemainderShape::INNER_REMAINDER;
+            } else if (modulus == *accumulatorModulus &&
+                       dividend.signedShape ==
+                           SignedRemainderShape::INNER_REMAINDER_MINUS_INDUCTION) {
+              result.signedShape = SignedRemainderShape::FINAL_REMAINDER;
+            } else {
+              result.signedShape = SignedRemainderShape::NONE;
+            }
+            return result;
+          };
+
+          bool bodySupported = true;
+          for (std::size_t position = loopStart + 2; position < condIndex && bodySupported;
+               ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+              continue;
+            }
+            if (inst.dest.name == inductionName) {
+              continue;
+            }
+
+            if (inst.op == IROp::DIV && inst.dest.isLocalVar() && inst.src2.isImm() &&
+                inst.src2.immVal > 1 && position + 2 < condIndex) {
+              const IRInst& product = ir[position + 1];
+              const IRInst& remainder = ir[position + 2];
+              const bool normalized =
+                  product.op == IROp::MUL && product.dest.isLocalVar() &&
+                  ((sameOperand(product.src1, inst.dest) && sameOperand(product.src2, inst.src2)) ||
+                   (sameOperand(product.src2, inst.dest) &&
+                    sameOperand(product.src1, inst.src2))) &&
+                  remainder.op == IROp::SUB && remainder.dest.isLocalVar() &&
+                  sameOperand(remainder.src1, inst.src1) &&
+                  sameOperand(remainder.src2, product.dest);
+              if (normalized) {
+                const PeriodicAffineValue dividend = valueOf(inst.src1);
+                PeriodicAffineValue result = applyRemainder(dividend, inst.src2.immVal);
+                if (!result.valid) {
+                  bodySupported = false;
+                  break;
+                }
+                values[remainder.dest.name] = std::move(result);
+                position += 2;
+                continue;
+              }
+            }
+
+            const PeriodicAffineValue lhs = valueOf(inst.src1);
+            PeriodicAffineValue result;
+            if (inst.op == IROp::LOCAL_VAR_DECL || inst.op == IROp::ASSIGN) {
+              result = lhs;
+            } else if (inst.op == IROp::NOT) {
+              if (lhs.valid && lhs.accumulator == 0 && lhs.induction == 0 &&
+                  !lhs.congruenceModulus) {
+                result = lhs;
+                result.minimum = 1;
+                result.maximum = 0;
+                for (std::int64_t& value : result.phase) {
+                  value = value == 0 ? 1 : 0;
+                  result.minimum = std::min(result.minimum, value);
+                  result.maximum = std::max(result.maximum, value);
+                }
+              }
+            } else if (inst.op == IROp::ADD || inst.op == IROp::SUB) {
+              result = combineAddSub(lhs, valueOf(inst.src2), inst.op == IROp::SUB);
+            } else if (inst.op == IROp::MUL) {
+              result = multiplyValues(lhs, valueOf(inst.src2));
+            } else if (inst.op == IROp::DIV && inst.src2.isImm()) {
+              result = divideValue(lhs, inst.src2.immVal);
+            } else if (inst.op == IROp::MOD && inst.src2.isImm()) {
+              result = applyRemainder(lhs, inst.src2.immVal);
+            }
+            if (!result.valid || !inst.dest.isLocalVar()) {
+              bodySupported = false;
+              break;
+            }
+            values[inst.dest.name] = std::move(result);
+          }
+          const auto finalValueFound = values.find(accumulatorName);
+          if (!bodySupported || finalValueFound == values.end()) {
+            continue;
+          }
+          const PeriodicAffineValue& recurrence = finalValueFound->second;
+          if (!recurrence.valid || recurrence.accumulator != 1 ||
+              recurrence.congruenceModulus != accumulatorModulus || recurrence.phase.empty() ||
+              recurrence.phase.size() <= 1 || recurrence.phase.size() > kMaxPeriodicPhases ||
+              trips < 1024 || recurrence.signedShape != SignedRemainderShape::FINAL_REMAINDER ||
+              recurrence.induction != -1) {
+            continue;
+          }
+
+          const std::uint64_t period = recurrence.phase.size();
+          const auto sumDeltas = [&](std::int64_t start, std::uint64_t count) {
+            const WideInt arithmetic = static_cast<WideInt>(recurrence.induction) * count *
+                                       (static_cast<WideInt>(2) * start + count - 1) / 2;
+            const std::uint64_t offset = static_cast<std::uint64_t>(start) % period;
+            const std::uint64_t first = std::min<std::uint64_t>(count, period - offset);
+            WideInt periodic = 0;
+            for (std::uint64_t index = 0; index < first; ++index) {
+              periodic += recurrence.phase[static_cast<std::size_t>(offset + index)];
+            }
+            std::uint64_t remaining = count - first;
+            WideInt cycle = 0;
+            for (const std::int64_t value : recurrence.phase) {
+              cycle += value;
+            }
+            periodic += cycle * (remaining / period);
+            remaining %= period;
+            for (std::uint64_t index = 0; index < remaining; ++index) {
+              periodic += recurrence.phase[static_cast<std::size_t>(index)];
+            }
+            return arithmetic + periodic;
+          };
+
+          // 符号转换前必须执行真实的两层余数链；只用同余式替代会在跨 0 时
+          // 选到相反符号的 C 余数代表值。这里解释的仍是已证明直线、无副作用
+          // 的单轮循环体，并且总执行轮数受固定预算限制。
+          const auto evaluateIteration =
+              [&](std::int64_t accumulator, std::int64_t induction) -> std::optional<std::int64_t> {
+            std::unordered_map<std::string, std::int64_t> concrete;
+            concrete[accumulatorName] = accumulator;
+            concrete[inductionName] = induction;
+            const auto resolve = [&](const Operand& operand) -> std::optional<std::int64_t> {
+              if (operand.isImm()) {
+                return operand.immVal;
+              }
+              if (operand.isLocalVar()) {
+                const auto found = concrete.find(operand.name);
+                if (found != concrete.end()) {
+                  return found->second;
+                }
+                const auto constant = findUniqueConstant(operand.name);
+                if (constant) {
+                  return *constant;
+                }
+              }
+              return std::nullopt;
+            };
+            for (std::size_t position = loopStart + 2; position < condIndex; ++position) {
+              const IRInst& inst = ir[position];
+              if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
+                continue;
+              }
+              if (!inst.dest.isLocalVar()) {
+                return std::nullopt;
+              }
+              const auto lhs = resolve(inst.src1);
+              if (!lhs) {
+                return std::nullopt;
+              }
+              std::optional<std::int64_t> value;
+              if (inst.op == IROp::LOCAL_VAR_DECL || inst.op == IROp::ASSIGN) {
+                value = *lhs;
+              } else if (inst.op == IROp::NOT) {
+                value = *lhs == 0 ? 1 : 0;
+              } else {
+                const auto rhs = resolve(inst.src2);
+                if (!rhs) {
+                  return std::nullopt;
+                }
+                WideInt wide = 0;
+                if (inst.op == IROp::ADD) {
+                  wide = static_cast<WideInt>(*lhs) + *rhs;
+                } else if (inst.op == IROp::SUB) {
+                  wide = static_cast<WideInt>(*lhs) - *rhs;
+                } else if (inst.op == IROp::MUL) {
+                  wide = static_cast<WideInt>(*lhs) * *rhs;
+                } else if (inst.op == IROp::DIV) {
+                  if (*rhs == 0 || (*lhs == INT32_MIN && *rhs == -1)) {
+                    return std::nullopt;
+                  }
+                  wide = *lhs / *rhs;
+                } else if (inst.op == IROp::MOD) {
+                  if (*rhs == 0 || (*lhs == INT32_MIN && *rhs == -1)) {
+                    return std::nullopt;
+                  }
+                  wide = *lhs % *rhs;
+                } else {
+                  return std::nullopt;
+                }
+                if (!inInt32(wide)) {
+                  return std::nullopt;
+                }
+                value = static_cast<std::int64_t>(wide);
+              }
+              concrete[inst.dest.name] = *value;
+            }
+            const auto result = concrete.find(accumulatorName);
+            return result == concrete.end() ? std::nullopt
+                                            : std::optional<std::int64_t>(result->second);
+          };
+
+          std::int64_t tailStart = *initialInduction;
+          int tailSign = 0;
+          const auto [minimumPhase, maximumPhase] =
+              std::minmax_element(recurrence.phase.begin(), recurrence.phase.end());
+          if (*minimumPhase <= -*accumulatorModulus || *maximumPhase >= *accumulatorModulus) {
+            continue;
+          }
+          if (recurrence.induction < 0) {
+            const std::int64_t slope = -recurrence.induction;
+            const std::int64_t threshold =
+                *maximumPhase <= 0 ? 0 : (*maximumPhase + slope - 1) / slope;
+            tailStart = std::max<std::int64_t>(tailStart, threshold);
+            tailSign = -1;
+          } else if (recurrence.induction > 0) {
+            const std::int64_t slope = recurrence.induction;
+            const std::int64_t threshold =
+                *minimumPhase >= 0 ? 0 : (-*minimumPhase + slope - 1) / slope;
+            tailStart = std::max<std::int64_t>(tailStart, threshold);
+            tailSign = 1;
+          } else if (*maximumPhase <= 0) {
+            tailSign = -1;
+          } else if (*minimumPhase >= 0) {
+            tailSign = 1;
+          }
+          tailStart = std::min<std::int64_t>(tailStart, finalInduction);
+          const std::uint64_t prefixCount =
+              static_cast<std::uint64_t>(tailStart - *initialInduction);
+          if (tailSign == 0 || prefixCount > kMaxSignTransitionPrefix) {
+            continue;
+          }
+
+          std::int64_t accumulator = *initialAccumulator;
+          bool recurrenceSafe = true;
+          std::uint64_t interpretedIterations = 0;
+          for (std::int64_t induction = *initialInduction; induction < tailStart; ++induction) {
+            const auto next = evaluateIteration(accumulator, induction);
+            if (!next) {
+              recurrenceSafe = false;
+              break;
+            }
+            accumulator = *next;
+            ++interpretedIterations;
+          }
+          if (!recurrenceSafe) {
+            continue;
+          }
+
+          std::int64_t tailInduction = tailStart;
+          std::uint64_t tailCount = static_cast<std::uint64_t>(finalInduction - tailInduction);
+          while (tailCount != 0 && accumulator > 0 && recurrenceSafe) {
+            if (interpretedIterations >= kMaxSignTransitionPrefix) {
+              recurrenceSafe = false;
+              break;
+            }
+            const auto next = evaluateIteration(accumulator, tailInduction);
+            if (!next) {
+              recurrenceSafe = false;
+              break;
+            }
+            accumulator = *next;
+            ++tailInduction;
+            --tailCount;
+            ++interpretedIterations;
+          }
+          if (!recurrenceSafe) {
+            continue;
+          }
+          if (tailCount != 0) {
+            const WideInt total =
+                static_cast<WideInt>(accumulator) + sumDeltas(tailInduction, tailCount);
+            accumulator = static_cast<std::int64_t>(truncRemainder(total, *accumulatorModulus));
+          }
+          if (accumulator < INT32_MIN || accumulator > INT32_MAX) {
+            continue;
+          }
+
+          std::vector<IRInst> replacement;
+          replacement.emplace_back(IROp::ASSIGN, Operand::localVar(accumulatorName),
+                                   Operand::imm(static_cast<int>(accumulator)), Operand::none());
+          if (usedAfterLoop(inductionName)) {
+            replacement.emplace_back(IROp::ASSIGN, Operand::localVar(inductionName),
+                                     Operand::imm(static_cast<int>(finalInduction)),
+                                     Operand::none());
+          }
+          std::size_t eraseEnd = loopEnd;
+          if (eraseEnd < ir.size() && ir[eraseEnd].op == IROp::LABEL &&
+              ir[eraseEnd].dest.isLabel() && labelReferences[ir[eraseEnd].dest.name] == 0) {
+            ++eraseEnd;
+          }
+          ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(loopStart),
+                   ir.begin() + static_cast<std::ptrdiff_t>(eraseEnd));
+          ir.insert(ir.begin() + static_cast<std::ptrdiff_t>(loopStart), replacement.begin(),
+                    replacement.end());
+          summarized = true;
+          changed = true;
+        }
+        if (!summarized) {
+          break;
+        }
+      }
+    }
+
+    // Pass 5.569: 把只在单个归纳值上可观察的循环稀疏化。
+    //
+    // 若循环每轮先计算一个纯前缀，随后仅在 `index == selector` 时把前缀结果
+    // 写入循环外可观察状态，那么除 selector 对应轮次外的前缀都是死计算。这里
+    // 用运行时边界保护把整个循环改成至多执行一次该前缀，并显式写回原循环的
+    // 最终归纳值。纯前缀允许包含完全内嵌的循环，但不得调用、读写全局状态，且
+    // 它定义的值在外层循环后必须全部死亡；任何跨边界控制流都会保守拒绝。
+    {
+      for (int sparseRound = 0; sparseRound < 8; ++sparseRound) {
+        std::unordered_map<std::string, int> labelReferences;
+        std::unordered_map<std::string, std::size_t> labelPositions;
+        for (std::size_t index = 0; index < ir.size(); ++index) {
+          const IRInst& inst = ir[index];
+          if (inst.op == IROp::LABEL && inst.dest.isLabel()) {
+            labelPositions[inst.dest.name] = index;
+          }
+          if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+              inst.dest.isLabel()) {
+            ++labelReferences[inst.dest.name];
+          }
+        }
+
+        bool sparsified = false;
+        for (std::size_t loopStart = ir.size(); loopStart-- > 0 && !sparsified;) {
+          if (ir[loopStart].op != IROp::BRANCH || !ir[loopStart].dest.isLabel() ||
+              loopStart + 1 >= ir.size() || ir[loopStart + 1].op != IROp::LABEL ||
+              !ir[loopStart + 1].dest.isLabel()) {
+            continue;
+          }
+          const std::string conditionLabel = ir[loopStart].dest.name;
+          const std::string bodyLabel = ir[loopStart + 1].dest.name;
+          if (labelReferences[conditionLabel] != 1 || labelReferences[bodyLabel] != 1) {
+            continue;
+          }
+          const auto conditionPosition = labelPositions.find(conditionLabel);
+          if (conditionPosition == labelPositions.end() ||
+              conditionPosition->second <= loopStart + 4) {
+            continue;
+          }
+          const std::size_t conditionIndex = conditionPosition->second;
+          if (conditionIndex + 2 >= ir.size()) {
+            continue;
+          }
+          const IRInst& condition = ir[conditionIndex + 1];
+          const IRInst& backedge = ir[conditionIndex + 2];
+          if ((condition.op != IROp::LT && condition.op != IROp::LE) ||
+              !condition.dest.isLocalVar() || !condition.src1.isLocalVar() ||
+              backedge.op != IROp::BNEZ || !backedge.dest.isLabel() ||
+              backedge.dest.name != bodyLabel || !backedge.src1.isLocalVar() ||
+              backedge.src1.name != condition.dest.name) {
+            continue;
+          }
+          const std::string induction = condition.src1.name;
+          const IRInst& increment = ir[conditionIndex - 1];
+          if (increment.op != IROp::ADD || !increment.dest.isLocalVar() ||
+              increment.dest.name != induction || !increment.src1.isLocalVar() ||
+              increment.src1.name != induction || !increment.src2.isImm() ||
+              increment.src2.immVal != 1) {
+            continue;
+          }
+
+          const auto findNearbyConstant = [&](const std::string& name) -> std::optional<int> {
+            for (std::size_t position = loopStart; position > 0; --position) {
+              const IRInst& candidate = ir[position - 1];
+              if (candidate.dest.isLocalVar() && candidate.dest.name == name) {
+                if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                    candidate.src1.isImm()) {
+                  return candidate.src1.immVal;
+                }
+                return std::nullopt;
+              }
+              if (candidate.op == IROp::LABEL || candidate.op == IROp::BRANCH ||
+                  candidate.op == IROp::BEQZ || candidate.op == IROp::BNEZ ||
+                  candidate.op == IROp::CALL || candidate.op == IROp::FUNC_BEGIN) {
+                break;
+              }
+            }
+            return std::nullopt;
+          };
+          const auto findUniqueConstant = [&](const std::string& name) -> std::optional<int> {
+            std::size_t functionBegin = loopStart;
+            while (functionBegin > 0 && ir[functionBegin - 1].op != IROp::FUNC_BEGIN) {
+              --functionBegin;
+            }
+            int definitions = 0;
+            std::optional<int> value;
+            for (std::size_t position = functionBegin; position < ir.size(); ++position) {
+              const IRInst& candidate = ir[position];
+              if (candidate.op == IROp::FUNC_END) {
+                break;
+              }
+              if (!candidate.dest.isLocalVar() || candidate.dest.name != name ||
+                  candidate.op == IROp::RETURN || candidate.op == IROp::PARAM ||
+                  (candidate.op == IROp::LOCAL_VAR_DECL && candidate.src1.isNone())) {
+                continue;
+              }
+              ++definitions;
+              if ((candidate.op == IROp::ASSIGN || candidate.op == IROp::LOCAL_VAR_DECL) &&
+                  candidate.src1.isImm()) {
+                value = candidate.src1.immVal;
+              } else {
+                value.reset();
+              }
+            }
+            return definitions == 1 ? value : std::nullopt;
+          };
+          const auto initial = findNearbyConstant(induction);
+          std::optional<int> upper;
+          if (condition.src2.isImm()) {
+            upper = condition.src2.immVal;
+          } else if (condition.src2.isLocalVar()) {
+            upper = findNearbyConstant(condition.src2.name);
+            if (!upper) {
+              upper = findUniqueConstant(condition.src2.name);
+            }
+          }
+          if (!initial || !upper ||
+              (condition.op == IROp::LE && *upper == INT32_MAX && *initial <= *upper)) {
+            continue;
+          }
+          const std::int64_t finalInduction =
+              condition.op == IROp::LT
+                  ? std::max<std::int64_t>(*initial, *upper)
+                  : std::max<std::int64_t>(*initial, static_cast<std::int64_t>(*upper) + 1);
+          if (finalInduction <= static_cast<std::int64_t>(*initial) + 1 ||
+              finalInduction > INT32_MAX) {
+            continue;
+          }
+
+          // 规范后缀必须是：EQ selector,index; BEQZ skip; guarded; LABEL skip; index++。
+          std::optional<std::size_t> guardIndex;
+          std::optional<std::size_t> skipIndex;
+          Operand selector = Operand::none();
+          for (std::size_t position = loopStart + 2; position + 1 < conditionIndex - 1;
+               ++position) {
+            const IRInst& equality = ir[position];
+            const IRInst& branch = ir[position + 1];
+            if (equality.op != IROp::EQ || !equality.dest.isLocalVar() || branch.op != IROp::BEQZ ||
+                !branch.dest.isLabel() || !branch.src1.isLocalVar() ||
+                branch.src1.name != equality.dest.name) {
+              continue;
+            }
+            if (equality.src1.isLocalVar() && equality.src1.name == induction &&
+                equality.src2.isLocalVar()) {
+              selector = equality.src2;
+            } else if (equality.src2.isLocalVar() && equality.src2.name == induction &&
+                       equality.src1.isLocalVar()) {
+              selector = equality.src1;
+            } else {
+              continue;
+            }
+            const auto target = labelPositions.find(branch.dest.name);
+            if (target == labelPositions.end() || target->second + 1 != conditionIndex - 1 ||
+                labelReferences[branch.dest.name] != 1 || target->second <= position + 1) {
+              selector = Operand::none();
+              continue;
+            }
+            guardIndex = position;
+            skipIndex = target->second;
+            break;
+          }
+          if (!guardIndex || !skipIndex || !selector.isLocalVar()) {
+            continue;
+          }
+
+          bool selectorWritten = false;
+          for (std::size_t position = loopStart + 2; position < conditionIndex; ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.dest.isLocalVar() && inst.dest.name == selector.name &&
+                inst.op != IROp::RETURN && inst.op != IROp::PARAM) {
+              selectorWritten = true;
+              break;
+            }
+          }
+          if (selectorWritten ||
+              (condition.src2.isLocalVar() && condition.src2.name == selector.name)) {
+            continue;
+          }
+
+          const std::size_t loopEnd = conditionIndex + 3;
+          const auto usedAfterLoop = [&](const std::string& name) {
+            for (std::size_t position = loopEnd; position < ir.size(); ++position) {
+              const IRInst& inst = ir[position];
+              if (inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END) {
+                break;
+              }
+              if ((inst.src1.isLocalVar() && inst.src1.name == name) ||
+                  (inst.src2.isLocalVar() && inst.src2.name == name) ||
+                  ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) && inst.dest.isLocalVar() &&
+                   inst.dest.name == name)) {
+                return true;
+              }
+            }
+            return false;
+          };
+
+          std::unordered_set<std::string> prefixDefinitions;
+          std::unordered_set<std::string> crossIterationDefinitions;
+          std::unordered_set<std::string> prefixLabels;
+          bool prefixIsPure = true;
+          for (std::size_t position = loopStart + 2; position < *guardIndex; ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.op == IROp::LABEL && inst.dest.isLabel()) {
+              prefixLabels.insert(inst.dest.name);
+              continue;
+            }
+            if (inst.op == IROp::CALL || inst.op == IROp::RETURN || inst.op == IROp::PARAM ||
+                inst.op == IROp::FUNC_BEGIN || inst.op == IROp::FUNC_END ||
+                inst.dest.isGlobalVar()) {
+              prefixIsPure = false;
+              break;
+            }
+            if (inst.dest.isLocalVar()) {
+              prefixDefinitions.insert(inst.dest.name);
+              if (!isCompilerTemp(inst.dest.name) &&
+                  !(inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone())) {
+                crossIterationDefinitions.insert(inst.dest.name);
+              }
+            } else if (inst.op != IROp::BRANCH && inst.op != IROp::BEQZ && inst.op != IROp::BNEZ) {
+              prefixIsPure = false;
+              break;
+            }
+          }
+          if (!prefixIsPure) {
+            continue;
+          }
+          for (std::size_t position = loopStart + 2; position < *guardIndex && prefixIsPure;
+               ++position) {
+            const IRInst& inst = ir[position];
+            if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+                (!inst.dest.isLabel() || prefixLabels.count(inst.dest.name) == 0)) {
+              prefixIsPure = false;
+            }
+          }
+          for (std::size_t position = 0; position < ir.size() && prefixIsPure; ++position) {
+            const IRInst& inst = ir[position];
+            if ((inst.op == IROp::BRANCH || inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) &&
+                inst.dest.isLabel() && prefixLabels.count(inst.dest.name) != 0 &&
+                (position < loopStart + 2 || position >= *guardIndex)) {
+              prefixIsPure = false;
+            }
+          }
+          std::unordered_set<std::string> textuallyDefined;
+          for (std::size_t position = loopStart + 2; position < *guardIndex && prefixIsPure;
+               ++position) {
+            const IRInst& inst = ir[position];
+            const auto readsOldPrefixValue = [&](const Operand& operand) {
+              return operand.isLocalVar() && prefixDefinitions.count(operand.name) != 0 &&
+                     textuallyDefined.count(operand.name) == 0;
+            };
+            if (readsOldPrefixValue(inst.src1) || readsOldPrefixValue(inst.src2)) {
+              prefixIsPure = false;
+              break;
+            }
+            if (inst.dest.isLocalVar() &&
+                !(inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone())) {
+              textuallyDefined.insert(inst.dest.name);
+            }
+          }
+          for (const std::string& name : prefixDefinitions) {
+            if (name != induction && usedAfterLoop(name)) {
+              prefixIsPure = false;
+              break;
+            }
+          }
+          if (!prefixIsPure || prefixDefinitions.count(induction) != 0) {
+            continue;
+          }
+
+          // 删除其它归纳值的轮次前，证明用户变量不会把这些轮次的状态带到
+          // selector 轮。所有可能跨轮存在的前缀变量都必须在首个控制流之前，
+          // 且在首次读取之前被无条件重定义；编译器临时量仍由内部 SSA/定义链
+          // 约束。这样 row/product 一类每轮 reset 的状态可安全稀疏化，而真正的
+          // prefix recurrence 会保留原循环。
+          std::unordered_set<std::string> initializedThisIteration;
+          for (std::size_t position = loopStart + 2; position < *guardIndex && prefixIsPure;
+               ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.op == IROp::LABEL || inst.op == IROp::BRANCH || inst.op == IROp::BEQZ ||
+                inst.op == IROp::BNEZ) {
+              break;
+            }
+            const auto readsUninitialized = [&](const Operand& operand) {
+              return operand.isLocalVar() && crossIterationDefinitions.count(operand.name) != 0 &&
+                     initializedThisIteration.count(operand.name) == 0;
+            };
+            if (readsUninitialized(inst.src1) || readsUninitialized(inst.src2)) {
+              prefixIsPure = false;
+              break;
+            }
+            if (inst.dest.isLocalVar() &&
+                !(inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone())) {
+              initializedThisIteration.insert(inst.dest.name);
+            }
+          }
+          for (const std::string& name : crossIterationDefinitions) {
+            if (initializedThisIteration.count(name) == 0) {
+              prefixIsPure = false;
+              break;
+            }
+          }
+          if (!prefixIsPure) {
+            continue;
+          }
+
+          bool guardedRegionIsStraight = true;
+          for (std::size_t position = *guardIndex + 2; position < *skipIndex; ++position) {
+            const IRInst& inst = ir[position];
+            if (inst.op == IROp::LABEL || inst.op == IROp::BRANCH || inst.op == IROp::BEQZ ||
+                inst.op == IROp::BNEZ || inst.op == IROp::CALL || inst.op == IROp::RETURN ||
+                inst.op == IROp::PARAM || inst.op == IROp::FUNC_BEGIN ||
+                inst.op == IROp::FUNC_END || inst.dest.isGlobalVar() ||
+                (inst.dest.isLocalVar() &&
+                 (inst.dest.name == induction || inst.dest.name == selector.name))) {
+              guardedRegionIsStraight = false;
+              break;
+            }
+          }
+          if (!guardedRegionIsStraight) {
+            continue;
+          }
+
+          const std::string sparseExit = ir[*skipIndex].dest.name;
+          const std::string lowerTemp = newTemp();
+          const std::string upperTemp = newTemp();
+          std::vector<IRInst> replacement;
+          replacement.emplace_back(IROp::LT, Operand::localVar(lowerTemp), selector,
+                                   Operand::imm(*initial));
+          replacement.emplace_back(IROp::BNEZ, Operand::label(sparseExit),
+                                   Operand::localVar(lowerTemp), Operand::none());
+          replacement.emplace_back(condition.op, Operand::localVar(upperTemp), selector,
+                                   Operand::imm(*upper));
+          replacement.emplace_back(IROp::BEQZ, Operand::label(sparseExit),
+                                   Operand::localVar(upperTemp), Operand::none());
+          replacement.emplace_back(IROp::ASSIGN, Operand::localVar(induction), selector,
+                                   Operand::none());
+          replacement.insert(replacement.end(),
+                             ir.begin() + static_cast<std::ptrdiff_t>(loopStart + 2),
+                             ir.begin() + static_cast<std::ptrdiff_t>(*guardIndex));
+          replacement.insert(replacement.end(),
+                             ir.begin() + static_cast<std::ptrdiff_t>(*guardIndex + 2),
+                             ir.begin() + static_cast<std::ptrdiff_t>(*skipIndex));
+          replacement.push_back(ir[*skipIndex]);
+          replacement.emplace_back(IROp::ASSIGN, Operand::localVar(induction),
+                                   Operand::imm(static_cast<int>(finalInduction)), Operand::none());
+
+          std::size_t eraseEnd = loopEnd;
+          if (eraseEnd < ir.size() && ir[eraseEnd].op == IROp::LABEL &&
+              ir[eraseEnd].dest.isLabel() && labelReferences[ir[eraseEnd].dest.name] == 0) {
+            ++eraseEnd;
+          }
+          ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(loopStart),
+                   ir.begin() + static_cast<std::ptrdiff_t>(eraseEnd));
+          ir.insert(ir.begin() + static_cast<std::ptrdiff_t>(loopStart), replacement.begin(),
+                    replacement.end());
+          sparsified = true;
+          changed = true;
+        }
+        if (!sparsified) {
+          break;
+        }
+      }
+    }
+
     // Pass 5.57: 汇总单个有界模状态驱动的自主循环。
     //
     // `state = transition(state) % m; sum += f(state)` 不是归纳变量周期，也不是
