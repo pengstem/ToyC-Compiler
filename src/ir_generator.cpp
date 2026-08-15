@@ -6412,7 +6412,8 @@ void IRGenerator::optimizePass() {
               continue;
             }
             if (inst.op != IROp::LOCAL_VAR_DECL && inst.op != IROp::ASSIGN &&
-                inst.op != IROp::ADD && inst.op != IROp::SUB && inst.op != IROp::MUL) {
+                inst.op != IROp::ADD && inst.op != IROp::SUB && inst.op != IROp::MUL &&
+                inst.op != IROp::DIV && inst.op != IROp::MOD) {
               bodySupported = false;
               break;
             }
@@ -6436,6 +6437,9 @@ void IRGenerator::optimizePass() {
           const std::size_t constantColumn = variables.size();
           const std::size_t dimension = variables.size() + 1;
           AffineMatrix transform = identityMatrix(dimension);
+          std::vector<std::optional<std::uint32_t>> normalizedModulus(variables.size());
+          std::optional<std::uint32_t> loopModulus;
+          std::unordered_set<std::size_t> modularInputColumns;
           const auto rowForOperand = [&](const Operand& operand) -> std::optional<AffineRow> {
             AffineRow row(dimension, 0);
             if (operand.isImm()) {
@@ -6451,6 +6455,50 @@ void IRGenerator::optimizePass() {
             }
             return transform[found->second];
           };
+          const auto sameOperand = [](const Operand& lhs, const Operand& rhs) {
+            if (lhs.type != rhs.type) {
+              return false;
+            }
+            return lhs.isImm() ? lhs.immVal == rhs.immVal : lhs.name == rhs.name;
+          };
+          const auto applyPositiveModulus = [&](std::size_t destination, const AffineRow& dividend,
+                                                std::uint32_t modulus) {
+            if (loopModulus && *loopModulus != modulus) {
+              return false;
+            }
+
+            // C 的有符号余数只有在被除数非负时等同数学模运算。这里按每个
+            // 入口状态位于 [0, modulus) 估算本次被除数的最大值；若乘加链
+            // 可能越过 INT32_MAX（或含负系数），就保留原循环。
+            std::uint64_t upperBound = dividend[constantColumn];
+            bool nonnegativeAndBounded = upperBound <= INT32_MAX;
+            for (std::size_t column = 0; column < constantColumn && nonnegativeAndBounded;
+                 ++column) {
+              const std::uint32_t coefficient = dividend[column];
+              if (coefficient == 0) {
+                continue;
+              }
+              modularInputColumns.insert(column);
+              const std::uint64_t term =
+                  static_cast<std::uint64_t>(coefficient) * static_cast<std::uint64_t>(modulus - 1);
+              nonnegativeAndBounded = term <= INT32_MAX && upperBound <= INT32_MAX - term;
+              if (nonnegativeAndBounded) {
+                upperBound += term;
+              }
+            }
+            if (!nonnegativeAndBounded) {
+              return false;
+            }
+
+            AffineRow result = dividend;
+            for (std::uint32_t& coefficient : result) {
+              coefficient %= modulus;
+            }
+            transform[destination] = std::move(result);
+            normalizedModulus[destination] = modulus;
+            loopModulus = modulus;
+            return true;
+          };
 
           for (std::size_t position = loopStart + 2; position < condIndex && bodySupported;
                ++position) {
@@ -6458,6 +6506,38 @@ void IRGenerator::optimizePass() {
             if (inst.op == IROp::LOCAL_VAR_DECL && inst.src1.isNone()) {
               continue;
             }
+
+            // Pass 0d 已把 `x % c` 规范成 `q=x/c; m=q*c; d=x-m`。在这里把
+            // 这个三指令序列重新识别成模仿射行，既保留除法/CSE 的通用优化，
+            // 又让常数次数的模矩阵递推可以被整体摘要。
+            if (inst.op == IROp::DIV && inst.dest.isLocalVar() && inst.src2.isImm() &&
+                inst.src2.immVal > 1 && position + 2 < condIndex) {
+              const IRInst& product = ir[position + 1];
+              const IRInst& remainder = ir[position + 2];
+              const bool productUsesQuotient =
+                  product.op == IROp::MUL && product.dest.isLocalVar() &&
+                  ((sameOperand(product.src1, inst.dest) && sameOperand(product.src2, inst.src2)) ||
+                   (sameOperand(product.src2, inst.dest) && sameOperand(product.src1, inst.src2)));
+              if (productUsesQuotient && remainder.op == IROp::SUB && remainder.dest.isLocalVar() &&
+                  sameOperand(remainder.src1, inst.src1) &&
+                  sameOperand(remainder.src2, product.dest)) {
+                const auto destination = variableIndex.find(remainder.dest.name);
+                const auto dividend = rowForOperand(inst.src1);
+                if (destination == variableIndex.end() || !dividend ||
+                    !applyPositiveModulus(destination->second, *dividend,
+                                          static_cast<std::uint32_t>(inst.src2.immVal))) {
+                  bodySupported = false;
+                  break;
+                }
+                position += 2;
+                continue;
+              }
+            }
+            if (inst.op == IROp::DIV) {
+              bodySupported = false;
+              break;
+            }
+
             const auto destination = variableIndex.find(inst.dest.name);
             const auto lhs = rowForOperand(inst.src1);
             if (destination == variableIndex.end() || !lhs) {
@@ -6466,8 +6546,28 @@ void IRGenerator::optimizePass() {
             }
             if (inst.op == IROp::LOCAL_VAR_DECL || inst.op == IROp::ASSIGN) {
               transform[destination->second] = *lhs;
+              if (inst.src1.isLocalVar()) {
+                normalizedModulus[destination->second] =
+                    normalizedModulus[variableIndex.at(inst.src1.name)];
+              } else {
+                normalizedModulus[destination->second].reset();
+              }
               continue;
             }
+
+            if (inst.op == IROp::MOD) {
+              if (!inst.src2.isImm() || inst.src2.immVal <= 1) {
+                bodySupported = false;
+                break;
+              }
+              if (!applyPositiveModulus(destination->second, *lhs,
+                                        static_cast<std::uint32_t>(inst.src2.immVal))) {
+                bodySupported = false;
+                break;
+              }
+              continue;
+            }
+
             const auto rhs = rowForOperand(inst.src2);
             if (!rhs) {
               bodySupported = false;
@@ -6494,6 +6594,7 @@ void IRGenerator::optimizePass() {
               }
             }
             transform[destination->second] = std::move(result);
+            normalizedModulus[destination->second].reset();
           }
           if (!bodySupported) {
             continue;
@@ -6577,6 +6678,127 @@ void IRGenerator::optimizePass() {
           }
           if (!hasCoupledObservableState) {
             continue; // Pass 5.5/6 对独立累加器会生成更短的闭式。
+          }
+
+          if (loopModulus) {
+            const std::uint32_t modulus = *loopModulus;
+            bool modularSummarySafe = true;
+            std::vector<std::optional<std::uint32_t>> initialValues(variables.size());
+            for (const std::size_t column : modularInputColumns) {
+              std::optional<int> value = findNearbyConstant(variables[column]);
+              if (!value) {
+                value = findUniqueConstant(variables[column]);
+              }
+              if (!value || *value < 0 || static_cast<std::uint32_t>(*value) >= modulus ||
+                  normalizedModulus[column] != loopModulus) {
+                modularSummarySafe = false;
+                break;
+              }
+              initialValues[column] = static_cast<std::uint32_t>(*value);
+            }
+            for (std::size_t rowIndex = 0; rowIndex < variables.size() && modularSummarySafe;
+                 ++rowIndex) {
+              const std::string& name = variables[rowIndex];
+              if (name == induction || !written.count(name) || !usedAfterLoop(name)) {
+                continue;
+              }
+              if (normalizedModulus[rowIndex] != loopModulus ||
+                  transform[rowIndex][inductionIndex] != 0) {
+                modularSummarySafe = false;
+              }
+            }
+            if (!modularSummarySafe) {
+              continue;
+            }
+
+            const auto multiplyMatricesModulo = [modulus](const AffineMatrix& lhs,
+                                                          const AffineMatrix& rhs) {
+              const std::size_t matrixDimension = lhs.size();
+              AffineMatrix product(matrixDimension, AffineRow(matrixDimension, 0));
+              for (std::size_t row = 0; row < matrixDimension; ++row) {
+                for (std::size_t pivot = 0; pivot < matrixDimension; ++pivot) {
+                  if (lhs[row][pivot] == 0) {
+                    continue;
+                  }
+                  for (std::size_t column = 0; column < matrixDimension; ++column) {
+                    const std::uint64_t term =
+                        static_cast<std::uint64_t>(lhs[row][pivot]) * rhs[pivot][column];
+                    product[row][column] = static_cast<std::uint32_t>(
+                        (static_cast<std::uint64_t>(product[row][column]) + term) % modulus);
+                  }
+                }
+              }
+              return product;
+            };
+
+            AffineMatrix modularTransform = transform;
+            for (AffineRow& row : modularTransform) {
+              for (std::uint32_t& coefficient : row) {
+                coefficient %= modulus;
+              }
+            }
+            AffineMatrix modularPower = modularTransform;
+            AffineMatrix modularSummary = identityMatrix(dimension);
+            for (std::uint64_t remaining = static_cast<std::uint64_t>(trips); remaining != 0;
+                 remaining >>= 1) {
+              if ((remaining & 1u) != 0) {
+                modularSummary = multiplyMatricesModulo(modularPower, modularSummary);
+              }
+              if (remaining > 1) {
+                modularPower = multiplyMatricesModulo(modularPower, modularPower);
+              }
+            }
+
+            std::vector<IRInst> replacement;
+            for (std::size_t rowIndex = 0; rowIndex < variables.size(); ++rowIndex) {
+              const std::string& name = variables[rowIndex];
+              if (name == induction || !written.count(name) || !usedAfterLoop(name)) {
+                continue;
+              }
+              std::uint64_t finalValue = modularSummary[rowIndex][constantColumn];
+              for (std::size_t column = 0; column < variables.size(); ++column) {
+                const std::uint32_t coefficient = modularSummary[rowIndex][column];
+                if (coefficient == 0) {
+                  continue;
+                }
+                if (!initialValues[column]) {
+                  modularSummarySafe = false;
+                  break;
+                }
+                finalValue = (finalValue +
+                              static_cast<std::uint64_t>(coefficient) * *initialValues[column]) %
+                             modulus;
+              }
+              if (!modularSummarySafe) {
+                break;
+              }
+              replacement.emplace_back(IROp::ASSIGN, Operand::localVar(name),
+                                       Operand::imm(static_cast<std::int32_t>(finalValue)),
+                                       Operand::none());
+            }
+            if (!modularSummarySafe) {
+              continue;
+            }
+            if (usedAfterLoop(induction)) {
+              replacement.emplace_back(IROp::ASSIGN, Operand::localVar(induction),
+                                       Operand::imm(static_cast<int>(finalInduction)),
+                                       Operand::none());
+            }
+            if (replacement.empty()) {
+              continue;
+            }
+
+            if (loopEnd < ir.size() && ir[loopEnd].op == IROp::LABEL &&
+                ir[loopEnd].dest.isLabel() && labelReferences[ir[loopEnd].dest.name] == 0) {
+              ++loopEnd;
+            }
+            ir.erase(ir.begin() + static_cast<std::ptrdiff_t>(loopStart),
+                     ir.begin() + static_cast<std::ptrdiff_t>(loopEnd));
+            ir.insert(ir.begin() + static_cast<std::ptrdiff_t>(loopStart), replacement.begin(),
+                      replacement.end());
+            summarized = true;
+            changed = true;
+            break;
           }
 
           AffineMatrix power = transform;

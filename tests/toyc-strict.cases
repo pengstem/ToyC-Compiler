@@ -103,6 +103,7 @@ perf/t_loop_weighted_regalloc.c
 perf/t_large_hot_helper.c
 perf/t_local_value_numbering.c
 perf/t_matrix_register_pressure.c
+perf/t_matrix_register_pressure_runtime.c
 perf/t_dead_recurrence_loop.c
 perf/t_dead_pure_call_loop.c
 regression/f19_many_arguments.c
@@ -138,6 +139,7 @@ regression/modular_state_induction_safety.c
 regression/modular_state_large_modulus_safety.c
 regression/modular_state_cross_state_safety.c
 regression/modular_state_short_cycle_safety.c
+regression/modular_matrix_overflow_safety.c
 regression/polynomial_geometric_safety.c
 regression/polynomial_step_safety.c
 regression/polynomial_cross_state_safety.c
