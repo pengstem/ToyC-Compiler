@@ -1,11 +1,13 @@
 #include "code_generator.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <ostream>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <utility>
 
 namespace toycc {
@@ -162,7 +164,6 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
 
   int localIndex = 0;
   int maxOverflowArgs = 0;
-  int nextReg = 2; // s2-s11 可用于局部变量分配
   int incomingParamIndex = 0;
   std::unordered_map<std::string, int> incomingParamRegs;
 
@@ -528,41 +529,172 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
     }
   }
 
-  // 叶函数没有 CALL，不需要跨调用保值。优先把形参固定到其 ABI 输入寄存器，
-  // 其余高频长期值使用空闲的 a0-a7；这既避免参数平行搬运互相覆盖，也免去
-  // s2-s11 的逐调用保存/恢复。块内短生命周期仍由上面的 t4-t6 承担。
-  if (!hasCall) {
-    bool usedArgRegs[8] = {false, false, false, false, false, false, false, false};
-    for (const auto& entry : incomingParamRegs) {
-      if (frame.tempRegs.find(entry.first) == frame.tempRegs.end()) {
-        frame.leafRegAlloc[entry.first] = "a" + std::to_string(entry.second);
-        usedArgRegs[entry.second] = true;
+  // 为剩余局部变量构造指令级活跃性冲突图并着色。旧分配器对每个变量永久
+  // 占用一个寄存器，生命周期互不相交的复制链也会产生 mv，并在图/矩阵类
+  // 大函数中很快耗尽寄存器。冲突图允许不同时存活的变量复用同一物理寄存器；
+  // ASSIGN 的源/目标不建立冲突边，并优先选择复制伙伴的颜色以完成合并。
+  std::unordered_map<std::string, std::unordered_set<std::string>> interference;
+  std::unordered_map<std::string, std::unordered_set<std::string>> copyPartners;
+  {
+    const std::size_t instructionCount = function.end - function.begin;
+    std::vector<std::vector<std::size_t>> successors(instructionCount);
+    for (std::size_t index = function.begin; index < function.end; ++index) {
+      const IRInst& inst = ir_[index];
+      const std::size_t relative = index - function.begin;
+      const auto addTarget = [&](const Operand& target) {
+        if (!target.isLabel()) {
+          return;
+        }
+        const auto found = labelPositions.find(target.name);
+        if (found != labelPositions.end() && found->second >= function.begin &&
+            found->second < function.end) {
+          successors[relative].push_back(found->second - function.begin);
+        }
+      };
+      if (inst.op == IROp::BRANCH) {
+        addTarget(inst.dest);
+      } else if (inst.op == IROp::BEQZ || inst.op == IROp::BNEZ) {
+        addTarget(inst.dest);
+        if (index + 1 < function.end) {
+          successors[relative].push_back(relative + 1);
+        }
+      } else if (inst.op != IROp::RETURN && index + 1 < function.end) {
+        successors[relative].push_back(relative + 1);
       }
     }
-    for (const auto& varName : varOrder) {
-      if (frame.tempRegs.find(varName) != frame.tempRegs.end() ||
-          frame.leafRegAlloc.find(varName) != frame.leafRegAlloc.end()) {
+
+    std::vector<std::unordered_set<std::string>> liveIn(instructionCount);
+    std::vector<std::unordered_set<std::string>> liveOut(instructionCount);
+    bool livenessChanged = true;
+    while (livenessChanged) {
+      livenessChanged = false;
+      for (std::size_t offset = instructionCount; offset-- > 0;) {
+        const IRInst& inst = ir_[function.begin + offset];
+        std::unordered_set<std::string> newOut;
+        for (const std::size_t successor : successors[offset]) {
+          newOut.insert(liveIn[successor].begin(), liveIn[successor].end());
+        }
+        std::unordered_set<std::string> newIn = newOut;
+        const bool definesLocal =
+            inst.dest.isLocalVar() && inst.op != IROp::RETURN && inst.op != IROp::PARAM;
+        if (definesLocal) {
+          newIn.erase(inst.dest.name);
+        }
+        if (inst.src1.isLocalVar()) {
+          newIn.insert(inst.src1.name);
+        }
+        if (inst.src2.isLocalVar()) {
+          newIn.insert(inst.src2.name);
+        }
+        if ((inst.op == IROp::RETURN || inst.op == IROp::PARAM) && inst.dest.isLocalVar()) {
+          newIn.insert(inst.dest.name);
+        }
+        if (newIn != liveIn[offset] || newOut != liveOut[offset]) {
+          liveIn[offset] = std::move(newIn);
+          liveOut[offset] = std::move(newOut);
+          livenessChanged = true;
+        }
+      }
+    }
+
+    const auto addInterference = [&](const std::string& lhs, const std::string& rhs) {
+      if (lhs == rhs || frame.tempRegs.count(lhs) != 0 || frame.tempRegs.count(rhs) != 0) {
+        return;
+      }
+      interference[lhs].insert(rhs);
+      interference[rhs].insert(lhs);
+    };
+    for (std::size_t offset = 0; offset < instructionCount; ++offset) {
+      const IRInst& inst = ir_[function.begin + offset];
+      const bool definesLocal =
+          inst.dest.isLocalVar() && inst.op != IROp::RETURN && inst.op != IROp::PARAM;
+      if (!definesLocal || frame.tempRegs.count(inst.dest.name) != 0) {
         continue;
       }
-      for (int r = 0; r < 8; ++r) {
-        if (!usedArgRegs[r]) {
-          frame.leafRegAlloc[varName] = "a" + std::to_string(r);
-          usedArgRegs[r] = true;
-          break;
+      const bool isCopy = inst.op == IROp::ASSIGN && inst.src1.isLocalVar();
+      if (isCopy && frame.tempRegs.count(inst.src1.name) == 0) {
+        copyPartners[inst.dest.name].insert(inst.src1.name);
+        copyPartners[inst.src1.name].insert(inst.dest.name);
+      }
+      for (const auto& live : liveOut[offset]) {
+        if (isCopy && live == inst.src1.name) {
+          continue;
         }
+        addInterference(inst.dest.name, live);
       }
     }
   }
 
-  // 为前 10 个高频局部变量分配 s2-s11 寄存器
+  std::unordered_map<std::string, std::string> assignedRegisters;
+  if (!hasCall) {
+    // 形参预着色到自己的 ABI 输入寄存器，避免入口处的平行搬运互相覆盖。
+    for (const auto& entry : incomingParamRegs) {
+      if (frame.tempRegs.count(entry.first) == 0) {
+        const std::string reg = "a" + std::to_string(entry.second);
+        frame.leafRegAlloc[entry.first] = reg;
+        assignedRegisters[entry.first] = reg;
+      }
+    }
+  }
+
+  std::vector<std::string> allocatableRegisters;
+  if (!hasCall) {
+    for (int reg = 0; reg < 8; ++reg) {
+      allocatableRegisters.push_back("a" + std::to_string(reg));
+    }
+  }
+  for (int reg = 2; reg <= 11; ++reg) {
+    allocatableRegisters.push_back("s" + std::to_string(reg));
+  }
+
   for (const auto& varName : varOrder) {
-    if (frame.tempRegs.find(varName) != frame.tempRegs.end() ||
-        frame.leafRegAlloc.find(varName) != frame.leafRegAlloc.end()) {
-      continue; // 已分配到 caller-saved 寄存器，不再占用 s 寄存器
+    if (frame.tempRegs.count(varName) != 0 || assignedRegisters.count(varName) != 0) {
+      continue;
     }
-    if (nextReg <= 11) {
-      frame.regAlloc[varName] = nextReg++;
+    std::vector<std::string> preferred;
+    const auto partners = copyPartners.find(varName);
+    if (partners != copyPartners.end()) {
+      for (const auto& partner : partners->second) {
+        const auto assigned = assignedRegisters.find(partner);
+        if (assigned != assignedRegisters.end()) {
+          preferred.push_back(assigned->second);
+        }
+      }
     }
+    preferred.insert(preferred.end(), allocatableRegisters.begin(), allocatableRegisters.end());
+
+    std::string selected;
+    for (const auto& candidate : preferred) {
+      bool conflicts = false;
+      const auto neighbors = interference.find(varName);
+      if (neighbors != interference.end()) {
+        for (const auto& neighbor : neighbors->second) {
+          const auto assigned = assignedRegisters.find(neighbor);
+          if (assigned != assignedRegisters.end() && assigned->second == candidate) {
+            conflicts = true;
+            break;
+          }
+        }
+      }
+      if (!conflicts) {
+        selected = candidate;
+        break;
+      }
+    }
+    if (selected.empty()) {
+      continue;
+    }
+    assignedRegisters[varName] = selected;
+    if (selected[0] == 'a') {
+      frame.leafRegAlloc[varName] = selected;
+    } else {
+      frame.regAlloc[varName] = std::stoi(selected.substr(1));
+    }
+  }
+
+  std::array<bool, 12> occupiedSRegisters{};
+  for (const auto& entry : frame.regAlloc) {
+    occupiedSRegisters[static_cast<std::size_t>(entry.second)] = true;
   }
 
   // 全局变量寄存器分配：仅当函数无函数调用时（调用者可能修改全局变量，寄存器中的
@@ -578,8 +710,12 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
                        return globalUseWeight[a] > globalUseWeight[b];
                      });
     for (const auto& name : globalOrder) {
-      if (nextReg <= 11) {
-        frame.globalRegAlloc[name] = nextReg++;
+      for (int reg = 2; reg <= 11; ++reg) {
+        if (!occupiedSRegisters[static_cast<std::size_t>(reg)]) {
+          frame.globalRegAlloc[name] = reg;
+          occupiedSRegisters[static_cast<std::size_t>(reg)] = true;
+          break;
+        }
       }
     }
   }
@@ -622,8 +758,10 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
         }
       }
     }
-    for (int r = nextReg; r <= 11; ++r) {
-      spareRegisters.push_back("s" + std::to_string(r));
+    for (int reg = 2; reg <= 11; ++reg) {
+      if (!occupiedSRegisters[static_cast<std::size_t>(reg)]) {
+        spareRegisters.push_back("s" + std::to_string(reg));
+      }
     }
 
     const std::size_t hoistCount =

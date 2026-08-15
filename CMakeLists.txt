@@ -444,6 +444,19 @@ if(TOYCC_BUILD_TESTS)
       )
 
       add_test(
+        NAME toycc.perf.matrix-register-coloring-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_matrix_register_coloring.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_matrix_register_pressure.c"
+      )
+      set_tests_properties(toycc.perf.matrix-register-coloring-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
         NAME toycc.perf.hot-constant-codegen
         COMMAND
           "${Python3_EXECUTABLE}"
