@@ -422,6 +422,13 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
   // 这避免把互不同时存活的分支临时各占一个 s 寄存器并在每次叶函数调用时保存。
   frame.tempRegs.clear();
   {
+    bool hasDirectModulo = false;
+    for (std::size_t idx = function.begin; idx < function.end; ++idx) {
+      if (ir_[idx].op == IROp::MOD) {
+        hasDirectModulo = true;
+        break;
+      }
+    }
     // 基本块编号：以控制流/调用为界
     std::unordered_map<std::size_t, int> blockId;
     int curBlock = 0;
@@ -497,14 +504,16 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
     std::sort(candidates.begin(), candidates.end(), [](const VarRanges& a, const VarRanges& b) {
       return a.ranges.front().start < b.ranges.front().start;
     });
-    constexpr const char* kTempRegs[3] = {"t4", "t5", "t6"};
-    std::vector<std::vector<LiveRange>> assigned(3);
+    const std::vector<std::string> tempRegisters =
+        hasDirectModulo ? std::vector<std::string>{"t4", "t5", "t6"}
+                        : std::vector<std::string>{"t3", "t4", "t5", "t6"};
+    std::vector<std::vector<LiveRange>> assigned(tempRegisters.size());
     const auto overlaps = [](const LiveRange& a, const LiveRange& b) {
       return a.start <= b.end && b.start <= a.end;
     };
     for (const auto& candidate : candidates) {
       int color = -1;
-      for (int r = 0; r < 3 && color < 0; ++r) {
+      for (std::size_t r = 0; r < tempRegisters.size() && color < 0; ++r) {
         bool conflicts = false;
         for (const auto& range : candidate.ranges) {
           for (const auto& occupied : assigned[static_cast<std::size_t>(r)]) {
@@ -518,11 +527,11 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
           }
         }
         if (!conflicts) {
-          color = r;
+          color = static_cast<int>(r);
         }
       }
       if (color >= 0) {
-        frame.tempRegs[candidate.name] = kTempRegs[color];
+        frame.tempRegs[candidate.name] = tempRegisters[static_cast<std::size_t>(color)];
         auto& occupied = assigned[static_cast<std::size_t>(color)];
         occupied.insert(occupied.end(), candidate.ranges.begin(), candidate.ranges.end());
       }
@@ -761,7 +770,9 @@ CodeGenerator::StackFrame CodeGenerator::analyzeStackFrame(const FunctionRange& 
       // t3 只在直接 MOD 的被除数落到 t0 时用于保值。常见的优化 IR 已把
       // 余数拆成 DIV/MUL/SUB；若函数中不存在这种冲突，叶函数可把 t3 用作
       // 第 19 个长期寄存器，尤其适合提升常量除法的 magic multiplier。
-      if (!needsRemainderScratch) {
+      const bool t3Occupied = std::any_of(frame.tempRegs.begin(), frame.tempRegs.end(),
+                                          [](const auto& entry) { return entry.second == "t3"; });
+      if (!needsRemainderScratch && !t3Occupied) {
         spareRegisters.push_back("t3");
       }
       bool usedArgRegs[8] = {false, false, false, false, false, false, false, false};
