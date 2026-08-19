@@ -12,6 +12,8 @@
 
 namespace toycc {
 
+enum class IRStage { RAW, INLINED, OPTIMIZED };
+
 // ============================================================
 // IR 生成上下文
 // ============================================================
@@ -29,8 +31,8 @@ class IRGenerator {
 public:
   IRGenerator(SymbolTable& st);
 
-  // 生成 IR，返回指令序列
-  std::vector<IRInst> generate(CompUnit& compUnit);
+  // 生成 IR，返回指令序列。测试和诊断可选择停在内联前后观察三地址码。
+  std::vector<IRInst> generate(CompUnit& compUnit, IRStage stage = IRStage::OPTIMIZED);
 
   // 获取生成的 IR
   const std::vector<IRInst>& getIR() const {

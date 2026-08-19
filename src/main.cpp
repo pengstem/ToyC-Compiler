@@ -42,7 +42,7 @@ bool hasStdinInput() {
   return !std::cin.eof() && std::cin.peek() != std::char_traits<char>::eof();
 }
 
-int compileSource(const std::string& source, std::ostream& out, bool emitIR) {
+int compileSource(const std::string& source, std::ostream& out, bool emitIR, IRStage irStage) {
   ParserDriver driver;
   if (!driver.parse(source)) {
     std::cerr << "Parse error: " << driver.getError() << "\n";
@@ -65,7 +65,7 @@ int compileSource(const std::string& source, std::ostream& out, bool emitIR) {
   }
 
   IRGenerator irGen(sema.getSymbolTable());
-  auto ir = irGen.generate(*ast);
+  auto ir = irGen.generate(*ast, irStage);
 
   if (emitIR) {
     printIR(ir);
@@ -81,6 +81,7 @@ int compileSource(const std::string& source, std::ostream& out, bool emitIR) {
 
 int main(int argc, char* argv[]) {
   bool emitIR = false;
+  IRStage irStage = IRStage::OPTIMIZED;
   std::string inputPath;
 
   for (int i = 1; i < argc; ++i) {
@@ -89,6 +90,8 @@ int main(int argc, char* argv[]) {
       std::cerr << "Usage: " << argv[0] << " [options] <input.c>\n"
                 << "Options:\n"
                 << "  --emit-ir      输出 IR（三地址码）\n"
+                << "  --emit-ir-inline 输出仅内联后的 IR\n"
+                << "  --emit-ir-raw  输出优化前 IR\n"
                 << "  -opt           优化选项（当前接受但暂未实现）\n"
                 << "  --help         显示帮助信息\n"
                 << "源码可通过命令行文件参数或标准输入提供。\n";
@@ -96,6 +99,12 @@ int main(int argc, char* argv[]) {
     }
     if (option == "--emit-ir") {
       emitIR = true;
+    } else if (option == "--emit-ir-inline") {
+      emitIR = true;
+      irStage = IRStage::INLINED;
+    } else if (option == "--emit-ir-raw") {
+      emitIR = true;
+      irStage = IRStage::RAW;
     } else if (option == "-opt") {
       // 性能测试会传 -opt，当前接受但暂未实现优化
     } else if (!option.starts_with("-")) {
@@ -112,13 +121,13 @@ int main(int argc, char* argv[]) {
       return 1;
     }
     std::string source = readAll(input);
-    return compileSource(source, std::cout, emitIR);
+    return compileSource(source, std::cout, emitIR, irStage);
   }
 
   // 无文件参数时回退到 stdin（支持 `toycc [options] < input.c` 调用方式）
   if (hasStdinInput()) {
     std::string source = readAll(std::cin);
-    return compileSource(source, std::cout, emitIR);
+    return compileSource(source, std::cout, emitIR, irStage);
   }
 
   // 既无文件参数也无 stdin 输入（如裸跑 toycc 做 smoke test）：静默退出

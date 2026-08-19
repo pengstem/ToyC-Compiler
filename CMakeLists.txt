@@ -403,6 +403,669 @@ if(TOYCC_BUILD_TESTS)
           TIMEOUT "${TOYCC_TEST_TIMEOUT}"
         )
       endforeach()
+
+      add_test(
+        NAME toycc.perf.hot-call-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_hot_call_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_hot_leaf_calls.c"
+      )
+      set_tests_properties(toycc.perf.hot-call-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.large-hot-helper-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_large_hot_helper_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_large_hot_helper.c"
+      )
+      set_tests_properties(toycc.perf.large-hot-helper-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.loop-weighted-regalloc-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_loop_weighted_regalloc.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_loop_weighted_regalloc.c"
+      )
+      set_tests_properties(toycc.perf.loop-weighted-regalloc-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.matrix-register-coloring-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_matrix_register_coloring.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_matrix_register_pressure_runtime.c"
+      )
+      set_tests_properties(toycc.perf.matrix-register-coloring-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.leaf-global-registers-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_leaf_global_registers.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_leaf_global_register_pressure.c"
+      )
+      set_tests_properties(toycc.perf.leaf-global-registers-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.modular-matrix-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_modular_matrix_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_matrix_register_pressure.c"
+      )
+      set_tests_properties(toycc.perf.modular-matrix-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.strided-modular-matrix-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_modular_matrix_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_strided_modular_matrix_summary.c"
+      )
+      set_tests_properties(toycc.perf.strided-modular-matrix-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.single-call-specialization-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_single_call_specialization.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_single_call_matrix_summary.c"
+      )
+      set_tests_properties(toycc.perf.single-call-specialization-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.constant-call-specialization-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_constant_call_specialization.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_constant_call_matrix_summary.c"
+      )
+      set_tests_properties(toycc.perf.constant-call-specialization-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.hot-constant-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_hot_constant_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_hot_constants.c"
+      )
+      set_tests_properties(toycc.perf.hot-constant-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.nested-affine-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_nested_affine_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_nested_affine_summary.c"
+      )
+      set_tests_properties(toycc.perf.nested-affine-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.coupled-affine-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_coupled_affine_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_coupled_affine_summary.c"
+          --reset-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_nested_reset_affine_summary.c"
+          --must-keep-reset-dependency-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/coupled_reset_dependency_safety.c"
+      )
+      set_tests_properties(toycc.perf.coupled-affine-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.wide-coupled-affine-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_wide_affine_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_wide_coupled_affine_summary.c"
+      )
+      set_tests_properties(toycc.perf.wide-coupled-affine-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "30"
+      )
+
+      add_test(
+        NAME toycc.perf.leading-break-affine-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_leading_break_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_leading_break_affine_summary.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/leading_break_moving_bound_safety.c"
+      )
+      set_tests_properties(toycc.perf.leading-break-affine-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.periodic-affine-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_periodic_affine_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_periodic_affine_branch.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/periodic_negative_start_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/periodic_state_guard_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/periodic_global_effect_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/periodic_reset_state_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/periodic_phase_overflow_safety.c"
+      )
+      set_tests_properties(toycc.perf.periodic-affine-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.polynomial-accumulator-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_polynomial_accumulator_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_polynomial_accumulator_summary.c"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_straight_loop_cleanup_summary.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/polynomial_geometric_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/polynomial_step_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/polynomial_cross_state_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/polynomial_degree_safety.c"
+      )
+      set_tests_properties(toycc.perf.polynomial-accumulator-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.quotient-accumulator-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_quotient_accumulator_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_quotient_accumulator_summary.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/quotient_negative_range_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/quotient_recurrence_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/quotient_moving_divisor_safety.c"
+      )
+      set_tests_properties(toycc.perf.quotient-accumulator-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.periodic-accumulator-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_periodic_accumulator_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_periodic_accumulator_summary.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/periodic_state_recurrence_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/periodic_escape_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/periodic_negative_range_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/periodic_large_period_safety.c"
+      )
+      set_tests_properties(toycc.perf.periodic-accumulator-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.invariant-offset-remainder-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_invariant_offset_remainder_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_invariant_offset_remainder_summary.c"
+          --negative-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/invariant_offset_remainder_negative_safety.c"
+      )
+      set_tests_properties(toycc.perf.invariant-offset-remainder-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.strided-remainder-floor-sum-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_invariant_offset_remainder_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_strided_remainder_floor_sum.c"
+          --negative-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/strided_remainder_negative_safety.c"
+      )
+      set_tests_properties(toycc.perf.strided-remainder-floor-sum-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.signed-mod-periodic-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_periodic_accumulator_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_signed_mod_periodic_summary.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/signed_mod_periodic_cross_state_safety.c"
+      )
+      set_tests_properties(toycc.perf.signed-mod-periodic-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.sparse-guarded-iteration-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_sparse_guarded_iteration.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_sparse_guarded_iteration.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/sparse_guarded_prefix_escape_safety.c"
+      )
+      set_tests_properties(toycc.perf.sparse-guarded-iteration-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.normalized-remainder-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_normalized_remainder_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_normalized_remainder_codegen.c"
+      )
+      set_tests_properties(toycc.perf.normalized-remainder-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.invariant-pure-call-hoist-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_invariant_call_hoist.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_invariant_pure_call_hoist.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/invariant_call_global_read_safety.c"
+      )
+      set_tests_properties(toycc.perf.invariant-pure-call-hoist-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.invariant-empty-path-guard-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_invariant_empty_path_guard.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_invariant_empty_path_guard.c"
+          --live-induction-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/invariant_empty_path_live_induction_safety.c"
+      )
+      set_tests_properties(toycc.perf.invariant-empty-path-guard-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.bounded-helper-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_bounded_helper_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_bounded_helper_summary.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/bounded_helper_moving_bound_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/bounded_helper_negative_outer_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/bounded_helper_recurrence_safety.c"
+          --must-keep-nested-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/bounded_helper_stale_remainder_safety.c"
+      )
+      set_tests_properties(toycc.perf.bounded-helper-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.modular-state-cycle-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_periodic_accumulator_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_modular_state_cycle_summary.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/modular_state_accumulator_recurrence_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/modular_state_induction_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/modular_state_large_modulus_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/modular_state_cross_state_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/modular_state_short_cycle_safety.c"
+      )
+      set_tests_properties(toycc.perf.modular-state-cycle-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.branched-finite-state-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_periodic_accumulator_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_branched_finite_state_summary.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/finite_state_hidden_accumulator_safety.c"
+      )
+      set_tests_properties(toycc.perf.branched-finite-state-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.periodic-affine-large-period-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_periodic_accumulator_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_periodic_affine_branch_large_period.c"
+      )
+      set_tests_properties(toycc.perf.periodic-affine-large-period-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      add_test(
+        NAME toycc.perf.threshold-affine-summary-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_periodic_accumulator_summary.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_threshold_affine_branch.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/threshold_state_guard_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/threshold_reset_safety.c"
+      )
+      set_tests_properties(toycc.perf.threshold-affine-summary-codegen PROPERTIES
+        LABELS "toycc;performance;codegen"
+        TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+      )
+
+      foreach(TOYCC_CLOSED_FORM_CASE IN ITEMS
+          "t_copy_loop.c;15"
+          "t_cse_loop.c;149")
+        list(GET TOYCC_CLOSED_FORM_CASE 0 TOYCC_CLOSED_FORM_FILE)
+        list(GET TOYCC_CLOSED_FORM_CASE 1 TOYCC_CLOSED_FORM_EXPECTED)
+        string(REPLACE ".c" "" TOYCC_CLOSED_FORM_ID "${TOYCC_CLOSED_FORM_FILE}")
+        add_test(
+          NAME "toycc.perf.${TOYCC_CLOSED_FORM_ID}-codegen"
+          COMMAND
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_closed_form_codegen.py"
+            --compiler "$<TARGET_FILE:toycc>"
+            --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/${TOYCC_CLOSED_FORM_FILE}"
+            --expected "${TOYCC_CLOSED_FORM_EXPECTED}"
+        )
+        set_tests_properties("toycc.perf.${TOYCC_CLOSED_FORM_ID}-codegen" PROPERTIES
+          LABELS "toycc;performance;codegen"
+          TIMEOUT "${TOYCC_TEST_TIMEOUT}"
+        )
+      endforeach()
+
+      add_test(
+        NAME toycc.optimizer-codegen-differential
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz_optimizer_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --host-cc "${TOYCC_HOST_CC}"
+          --riscv-cc "${TOYCC_RISCV_CC}"
+          --qemu "${TOYCC_QEMU_RISCV32}"
+          --cases 32
+      )
+      set_tests_properties(toycc.optimizer-codegen-differential PROPERTIES
+        LABELS "toycc;differential;regression"
+        TIMEOUT 30
+      )
+
+      add_test(
+        NAME toycc.many-arguments-differential
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz_many_arguments.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --host-cc "${TOYCC_HOST_CC}"
+          --riscv-cc "${TOYCC_RISCV_CC}"
+          --qemu "${TOYCC_QEMU_RISCV32}"
+          --cases 60
+      )
+      set_tests_properties(toycc.many-arguments-differential PROPERTIES
+        LABELS "toycc;differential;regression"
+        TIMEOUT 30
+      )
+
+      add_test(
+        NAME toycc.large-stack-frame-regression
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_large_stack_frame.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --riscv-cc "${TOYCC_RISCV_CC}"
+          --qemu "${TOYCC_QEMU_RISCV32}"
+      )
+      set_tests_properties(toycc.large-stack-frame-regression PROPERTIES
+        LABELS "toycc;codegen;regression"
+        TIMEOUT 30
+      )
+
+      add_test(
+        NAME toycc.perf.dead-loop-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_dead_loop_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_result_loop.c"
+          --descending-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_descending_loop.c"
+          --reversed-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_reversed_loop.c"
+          --break-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_break_loop.c"
+          --continue-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_continue_loop.c"
+          --live-continue-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_continue_live_state_safety.c"
+          --unsafe-continue-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_continue_termination_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_moving_bound_loop.c"
+          --overflow-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_inclusive_overflow_loop.c"
+      )
+      set_tests_properties(toycc.perf.dead-loop-codegen PROPERTIES
+        LABELS "toycc;codegen;performance"
+        TIMEOUT 10
+      )
+
+      add_test(
+        NAME toycc.perf.dead-global-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_dead_global_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_global_recurrence.c"
+      )
+      set_tests_properties(toycc.perf.dead-global-codegen PROPERTIES
+        LABELS "toycc;codegen;performance"
+        TIMEOUT 10
+      )
+
+      add_test(
+        NAME toycc.perf.dead-strided-loop-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_dead_strided_loop_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_strided_loop.c"
+          --overflow-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_strided_overflow_safety.c"
+      )
+      set_tests_properties(toycc.perf.dead-strided-loop-codegen PROPERTIES
+        LABELS "toycc;codegen;performance"
+        TIMEOUT 10
+      )
+
+      add_test(
+        NAME toycc.perf.dead-recurrence-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_dead_recurrence_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_recurrence_loop.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/live_recurrence_safety.c"
+          --side-effect-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/conditional_side_effect_safety.c"
+      )
+      set_tests_properties(toycc.perf.dead-recurrence-codegen PROPERTIES
+        LABELS "toycc;codegen;performance"
+        TIMEOUT 10
+      )
+
+      add_test(
+        NAME toycc.perf.dead-pure-call-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_dead_pure_call_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_pure_call_loop.c"
+          --loop-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_pure_loop_call.c"
+          --nested-loop-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_dead_nested_pure_loop_call.c"
+          --side-effect-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_call_side_effect_safety.c"
+          --termination-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_call_termination_safety.c"
+          --moving-loop-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/dead_call_moving_loop_safety.c"
+      )
+      set_tests_properties(toycc.perf.dead-pure-call-codegen PROPERTIES
+        LABELS "toycc;codegen;performance"
+        TIMEOUT 10
+      )
+
+      add_test(
+        NAME toycc.perf.dead-store-codegen
+        COMMAND
+          "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_dead_store_codegen.py"
+          --compiler "$<TARGET_FILE:toycc>"
+          --case "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_overwritten_dead_store.c"
+      )
+      set_tests_properties(toycc.perf.dead-store-codegen PROPERTIES
+        LABELS "toycc;codegen;performance"
+        TIMEOUT 10
+      )
     endif()
   endif()
 endif()
