@@ -2037,7 +2037,7 @@ void IRGenerator::optimizePass() {
     // local，因此这里不能只缓存 t%d 临时；用户局部变量同样可以承载可复用值。
     // 对 ADD/MUL/EQ/NE 规范化操作数顺序，使 `x+y` 与 `y+x` 共享同一值编号。
     {
-      std::unordered_map<std::string, std::string> rename;   // 原名 → 复用名（仅临时变量）
+      std::unordered_map<std::string, std::string> rename; // 原名 → 复用名（仅临时变量）
       std::unordered_map<std::string, std::string> valueMap; // (op,src1,src2) → 结果变量
       std::unordered_map<std::string, std::vector<std::string>> varKeys; // 变量 → 引用它的 key
       std::vector<IRInst> optimized;
@@ -7431,17 +7431,12 @@ void IRGenerator::optimizePass() {
 
     // Pass 5.568: 汇总带周期增量的有符号模递推。
     //
-    // 常见的长循环会把小模数余数送入一个大模数累加器：
-    //
-    //   acc = (acc + periodic(i) + c * i) % M;
-    //
-    // `periodic(i)` 的周期很小，但 C 的有符号余数在累计和跨过 0 时不满足
-    // 朴素的结合律，不能直接把所有增量相加后只取一次余数。这里先用符号表达式
-    // 证明循环体确实只有一个这种模累加器，并枚举至多 65536 个余数相位；随后
-    // 精确执行至增量恒为同号的有限前缀，再用单调前缀和定位唯一的符号转换点，
-    // 最终汇总同号长尾。循环含控制流、调用、全局写、溢出风险、多个可观察状态
-    // 或不兼容模数时均保守回退。
+    // [已禁用] 该 Pass 使用 evaluateIteration 逐条解释执行 IR 指令、逐轮模拟
+    // 循环迭代（最多 1,048,576 轮），属于编译期循环解释执行，违反优化规范。
+    // 循环含控制流、调用、全局写、溢出风险、多个可观察状态或不兼容模数时仍
+    // 保守回退至普通循环。
     {
+      goto skip_pass_5_568;
       constexpr std::uint64_t kMaxPeriodicPhases = 65536;
       constexpr std::uint64_t kMaxSignTransitionPrefix = 1048576;
       __extension__ typedef __int128 WideInt;
@@ -8254,6 +8249,7 @@ void IRGenerator::optimizePass() {
         }
       }
     }
+  skip_pass_5_568:;
 
     // Pass 5.569: 把只在单个归纳值上可观察的循环稀疏化。
     //
@@ -8621,11 +8617,12 @@ void IRGenerator::optimizePass() {
 
     // Pass 5.57: 汇总单个有界模状态驱动的自主循环。
     //
-    // `state = transition(state) % m; sum += f(state)` 不是归纳变量周期，也不是
-    // 仿射递推，但更新后的有符号余数只能落在 [-(m-1), m-1]。对小常量 m，
-    // 状态转移必在至多 2*m-1 个状态内进入环。这里解释的是这一有限状态转移，
-    // 而不是按源循环的千万/亿次迭代执行；累加器用符号系数证明仅作独立加法。
+    // [已禁用] 该 Pass 使用 evaluateTransition 逐条解释执行 IR 指令、逐轮模拟
+    // 循环迭代（最多 modulus*2+1 轮），属于编译期循环解释执行，违反优化规范。
+    // 循环含控制流、调用、全局写、溢出风险、多个可观察状态或不兼容模数时仍
+    // 保守回退至普通循环。
     {
+      goto skip_pass_5_57;
       constexpr int kMaxStateModulus = 16384;
       constexpr int kMaxAccumulators = 8;
 
@@ -9225,15 +9222,16 @@ void IRGenerator::optimizePass() {
         }
       }
     }
+  skip_pass_5_57:;
 
     // Pass 5.575: 汇总分支驱动的有限状态循环。
     //
-    // 图遍历/状态机常把一个有界状态直接用于分支，同时只观察另一个增长状态
-    // 的小模数（例如 `distance % 2`）。完整整数状态不会重复，但控制状态会在
-    // 很小的有限空间内成环。这里仅解释单个、常数次数、无调用且只有前向内部
-    // 分支的循环体；所有跨迭代状态都必须参与控制键，且增长状态的周期增量必须
-    // 是其控制模数的倍数。找到周期后按周期增量闭式跳过，绝不按源迭代次数展开。
+    // [已禁用] 该 Pass 使用 executeIteration 逐条解释执行 IR 指令、逐轮模拟
+    // 循环迭代（最多 65536 轮），属于编译期循环解释执行，违反优化规范。
+    // 循环含控制流、调用、全局写、溢出风险、多个可观察状态或不兼容模数时仍
+    // 保守回退至普通循环。
     {
+      goto skip_pass_5_575;
       struct VectorHash {
         std::size_t operator()(const std::vector<std::int32_t>& values) const noexcept {
           std::size_t hash = 1469598103934665603ull;
@@ -9743,6 +9741,7 @@ void IRGenerator::optimizePass() {
         }
       }
     }
+  skip_pass_5_575:;
 
     // Pass 5.6: 汇总耦合仿射状态循环。
     //

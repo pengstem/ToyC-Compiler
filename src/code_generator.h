@@ -35,7 +35,7 @@ private:
     // 无调用叶函数可安全使用 caller-saved 参数寄存器，无需在序言/尾声保存。
     std::unordered_map<std::string, std::string> leafRegAlloc;
     std::unordered_map<std::string, std::string> globalRegAlloc; // 全局变量 → a1-a7/s2-s11
-    std::unordered_map<std::string, std::string> tempRegs;       // 临时变量 → t寄存器 (t4-t6)
+    std::unordered_map<std::string, std::string> tempRegs; // 临时变量 → t寄存器 (t4-t6)
     // 热循环常量 → 空闲寄存器。函数入口只物化一次，循环体直接复用。
     std::unordered_map<int, std::string> constantRegAlloc;
     std::vector<std::string> usedCalleeSavedRegisters;
