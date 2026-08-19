@@ -1487,7 +1487,7 @@ void CodeGenerator::applyPeephole(const std::string& asmText, std::ostream& out)
       if (next.opcode == "lw" && next.args.size() == 2 && next.args[0] == args[0] &&
           next.args[1] == args[1]) {
         out << lines[i] << "\n"; // 保留 sw
-        ++i;                     // 跳过冗余 lw
+        ++i; // 跳过冗余 lw
         continue;
       }
     }

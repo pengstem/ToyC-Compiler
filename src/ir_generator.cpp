@@ -837,8 +837,8 @@ void IRGenerator::inlinePass() {
     };
 
     struct Candidate {
-      std::size_t callIndex;    // CALL 指令下标
-      std::size_t paramStart;   // 该调用点第一个 PARAM 的下标
+      std::size_t callIndex; // CALL 指令下标
+      std::size_t paramStart; // 该调用点第一个 PARAM 的下标
       std::vector<IRInst> body; // 变换后的内联体
     };
     std::vector<Candidate> cands;
@@ -3788,8 +3788,8 @@ void IRGenerator::optimizePass() {
     };
 
     std::unordered_map<std::string, std::string> renameMap; // old -> new
-    std::unordered_map<std::string, int> activeCount;       // new 名字的活跃引用数
-    std::vector<std::string> freePool;                      // activeCount==0 的可复用名字
+    std::unordered_map<std::string, int> activeCount; // new 名字的活跃引用数
+    std::vector<std::string> freePool; // activeCount==0 的可复用名字
     // 当前基本块内被定义的名字。只有块内定义的名字才能进入 freePool 复用：
     // 循环不变提升（LICM 外提）的临时定义在循环前的基本块，却在循环体内被消费；
     // 若将其名字复用给循环体内新临时，会在循环内重新定义该名字，覆盖外提值，
@@ -5793,11 +5793,10 @@ void IRGenerator::optimizePass() {
 
     // Pass 5.56: 汇总由归纳变量余数驱动的直线累加循环。
     //
-    // `i % k`（以及由它组合出的算术表达式）在非负、无回绕的 `i += 1`
-    // 循环中至多每 |k| 轮重复。这里只枚举不同的余数相位，再把一个周期的
-    // 增量乘以完整周期数；不会按源程序的迭代次数执行循环。累加器之外的可观察
-    // 状态、运行时除数、过大的组合周期、非规范归纳或控制流都会保守回退。
+    // [已禁用] 该 Pass 使用 concrete[] 逐相位解释执行 IR 指令（最多 1024 个
+    // 相位），属于编译期循环解释执行，违反优化规范。
     {
+      goto skip_pass_5_56;
       constexpr std::uint64_t kMaxPeriodicPhases = 1024;
 
       struct PeriodicValue {
@@ -6325,6 +6324,7 @@ void IRGenerator::optimizePass() {
         }
       }
     }
+  skip_pass_5_56:;
 
     // Pass 5.565: 汇总带非负循环不变偏移的余数累加。
     //
@@ -9745,12 +9745,10 @@ void IRGenerator::optimizePass() {
 
     // Pass 5.6: 汇总耦合仿射状态循环。
     //
-    // Pass 5.5 只接受 `x' = x + affine(invariants, induction)`，因此会保守拒绝
-    // Fibonacci/线性状态机一类交叉递推。这里对同样严格的常数次数直线循环构造
-    // 一次迭代的增广矩阵 state' = M * state，并用二进制快速幂得到 M^N。变换
-    // 结果仍是普通的 RV32 三地址算术；循环有分支、调用、全局状态、可变上界，
-    // 或归纳变量不是严格 +1 时均不应用。
+    // [已禁用] 该 Pass 使用矩阵快速幂在编译期计算整个循环的最终状态，
+    // 将循环替换为常量赋值，属于编译期整程序求值，违反优化规范。
     {
+      goto skip_pass_5_6;
       // 覆盖百状态 helper 及其表达式临时量，同时给 O(n^3) 矩阵乘法保留
       // 明确的编译时上限；超出预算仍保留源循环，避免无界快速幂消耗。
       constexpr std::size_t kMaxCoupledAffineVariables = 384;
@@ -10576,14 +10574,14 @@ void IRGenerator::optimizePass() {
         }
       }
     }
+  skip_pass_5_6:;
 
     // Pass 5.7: 汇总由归纳变量余数控制的仿射分支循环。
     //
-    // Pass 5.6 只接受直线循环体，但 `if (i % k == r)` 的选择以 k 为周期重复。
-    // 当两个分支及公共后缀都是局部仿射变换时，先合成一个完整周期的矩阵，再
-    // 对周期矩阵做快速幂。该变换只依赖符号证明，不迭代执行源循环；条件不是
-    // 已证明的余数周期、存在外部跳转/调用/全局状态或任一分支非仿射时均回退。
+    // [已禁用] 该 Pass 使用 evaluatePrefix 逐条解释执行 IR 指令（最多 256 个
+    // 相位），属于编译期循环解释执行，违反优化规范。
     {
+      goto skip_pass_5_7;
       using AffineRow = std::vector<std::uint32_t>;
       using AffineMatrix = std::vector<AffineRow>;
       constexpr std::uint64_t kMaxPeriodicBranchPhases = 256;
@@ -11595,6 +11593,7 @@ void IRGenerator::optimizePass() {
         }
       }
     }
+  skip_pass_5_7:;
 
     // Pass 6: 常数迭代循环消除（闭合形式）
     // 模式（循环反转后）：
@@ -11794,7 +11793,7 @@ void IRGenerator::optimizePass() {
               // 临时变量必须是循环变量的线性函数：t = i*c, t = i+c, t = i, t = c 等。
               struct AccVar {
                 std::string name;
-                int step;     // 每次迭代的常量增量（可正可负）
+                int step; // 每次迭代的常量增量（可正可负）
                 int indCoeff; // 循环变量系数（0=不加循环变量, +1/-1=加/减循环变量）
               };
               // 临时变量的线性表示：value = indCoeff * i + constOffset
