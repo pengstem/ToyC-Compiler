@@ -727,6 +727,8 @@ if(TOYCC_BUILD_TESTS)
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/perf/t_signed_mod_periodic_summary.c"
           --must-keep-case
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/signed_mod_periodic_cross_state_safety.c"
+          --must-keep-case
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/testcases/regression/signed_mod_periodic_sign_transition_safety.c"
       )
       set_tests_properties(toycc.perf.signed-mod-periodic-summary-codegen PROPERTIES
         LABELS "toycc;performance;codegen"

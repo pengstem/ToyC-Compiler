@@ -165,6 +165,7 @@ regression/periodic_negative_range_safety.c
 regression/invariant_offset_remainder_negative_safety.c
 regression/strided_remainder_negative_safety.c
 regression/signed_mod_periodic_cross_state_safety.c
+regression/signed_mod_periodic_sign_transition_safety.c
 regression/sparse_guarded_prefix_escape_safety.c
 regression/normalized_remainder_negative_safety.c
 regression/invariant_call_global_read_safety.c
